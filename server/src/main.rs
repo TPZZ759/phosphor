@@ -58,7 +58,7 @@ async fn main() {
         meta_running: Default::default(), meta_progress: Default::default(), memo: Default::default(), epg: Default::default(),
         syncing: Default::default(), sync_error: Default::default(), stream: stream::Streamer::new(&data), fixtures: Default::default(),
         omdb: extras::Omdb::new(data.join("omdb.json")), kw_cache: Default::default(), acct: Default::default(), events_raw: Default::default(),
-        net_idx: Default::default(), xinfo: Default::default(), tri: Default::default(), skips: intro::Skips::new(&data), online_skips: intro::OnlineSkips::new(&data), remote: remote::Remote::new(), jobs: Default::default(), cast: Default::default(), display: display::DisplayCtl::load(&data), stream_gen: Default::default(), mpv: mpv::Mpv::new(), dubs: anime::DubCache::load(&data), http, cfg, data,
+        net_idx: Default::default(), xinfo: Default::default(), tri: Default::default(), skips: intro::Skips::new(&data), remote: remote::Remote::new(), jobs: Default::default(), cast: Default::default(), display: display::DisplayCtl::load(&data), stream_gen: Default::default(), mpv: mpv::Mpv::new(), dubs: anime::DubCache::load(&data), http, cfg, data,
     });
 
     tokio::spawn(startup(app.clone()));
@@ -478,7 +478,7 @@ async fn episodes_watched(State(app): A, Json(b): Json<Value>) -> Response {
 async fn prefs_get(State(app): A) -> Response { j(app.state.read(|st| st["prefs"].clone())) }
 async fn prefs_post(State(app): A, Json(b): Json<Value>) -> Response {
     if let Some(h) = b["hide"].as_array() { let h: Vec<Value> = h.iter().filter(|x| x.is_string()).cloned().collect(); app.state.with(|st| st["prefs"]["hide"] = json!(h)); }
-    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "autoplay", "autoskip", "autoSkipCredits"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
+    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     for k in ["display", "pro", "oledPeak", "mpvShaders"] { if let Some(v) = b[k].as_str() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     app.state.save(); app.memo.clear(); tokio::spawn(prewarm(app.clone()));
     j(json!({ "ok": true, "prefs": app.state.read(|st| st["prefs"].clone()) }))
@@ -1083,134 +1083,12 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
         let has_en = anime::record_probe(&app, &kind, nid, aud);
         p["hasEnAudio"] = json!(has_en);
     }
-    let dur = p["duration"].as_f64().unwrap_or(0.0);
-    let mut fp_entry: Option<Value> = None;
-    let mut sid = q.get("sid").and_then(|x| x.parse::<i64>().ok()).filter(|&x| x > 0);
-    let mut season = q.get("s").and_then(|x| x.parse::<i64>().ok()).filter(|&x| x >= 0);
-    let mut ep_num = q.get("n").and_then(|x| x.parse::<i64>().ok()).filter(|&x| x > 0);
-    if kind == "series" {
-        if let Ok(ep) = id.parse::<i64>() {
-            let prev = app.skips.entry(ep);
-            if sid.is_none() { sid = prev["sid"].as_i64().filter(|&x| x > 0); }
-            if season.is_none() { season = prev["season"].as_i64().filter(|&x| x > 0); }
-            if ep_num.is_none() { ep_num = prev["n"].as_i64().filter(|&x| x > 0); }
-            if let Some(s_id) = sid {
-                app.skips.register(ep, s_id, season.unwrap_or(0), ep_num.unwrap_or(0), dur);
-            }
-            let e = app.skips.entry(ep);
-            p["intro"] = e["intro"].clone();
-            fp_entry = Some(e);
-        }
-    }
-    if kind == "series" || kind == "movie" {
-        let (mut imdb, mut title, is_anime) = {
-            let cat = app.catalog();
-            let item = if kind == "series" {
-                sid.and_then(|s_id| cat.series_item(s_id))
-            } else {
-                id.parse::<i64>().ok().and_then(|mid| cat.movie(mid))
-            };
-            if let Some(it) = item {
-                let im = app.meta_of(it).map(|m| m.im).unwrap_or_default();
-                let an = anime::is_anime_item(&app, it);
-                (im, it.title.clone(), an)
-            } else {
-                (String::new(), String::new(), false)
-            }
-        };
-        if imdb.is_empty() { if let Some(q_im) = q.get("imdb") { imdb = q_im.clone(); } }
-        if title.is_empty() { if let Some(q_t) = q.get("title") { title = q_t.clone(); } }
-        let online = intro::lookup_online(&app, &kind, &imdb, &title, season, ep_num, dur, is_anime).await;
-        merge_probe_skips(&mut p, fp_entry.as_ref(), online.as_ref(), dur);
-    }
+    if kind == "series" { if let Ok(ep) = id.parse::<i64>() {
+        let num = |k: &str| q.get(k).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+        if num("sid") > 0 { app.skips.register(ep, num("sid"), num("s"), num("n"), p["duration"].as_f64().unwrap_or(0.0)); }
+        let e = app.skips.entry(ep); p["intro"] = e["intro"].clone(); p["credits"] = e["credits"].clone();
+    } }
     j(p)
-}
-
-fn merge_probe_skips(
-    p: &mut Value,
-    fp_entry: Option<&Value>,
-    online: Option<&intro::OnlineSkipEntry>,
-    dur: f64,
-) {
-    let mut skips: Vec<Value> = p["skips"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|x| {
-            let st = x["s"].as_f64()?;
-            let en = x["e"].as_f64()?;
-            if !st.is_finite() || !en.is_finite() || en <= st { return None; }
-            let title = x["title"].as_str().unwrap_or("Intro").to_string();
-            let kind = match x["kind"].as_str() {
-                Some("recap") => "recap",
-                Some("intro") => "intro",
-                _ if crate::re!(r"(?i)\b(recap|previously)\b").is_match(&title) => "recap",
-                _ => "intro",
-            };
-            let src = x["src"].as_str().unwrap_or("chapter");
-            Some(json!({ "s": st, "e": en, "title": title, "kind": kind, "src": src }))
-        })
-        .collect();
-
-    let is_covered = |list: &[Value], s: f64, e: f64, kind: &str| -> bool {
-        list.iter().any(|x| {
-            let xs = x["s"].as_f64().unwrap_or(0.0);
-            let xe = x["e"].as_f64().unwrap_or(0.0);
-            let xk = x["kind"].as_str().unwrap_or("intro");
-            xk == kind || s.max(xs) < e.min(xe)
-        })
-    };
-
-    if let Some(fp) = fp_entry {
-        if let Some(arr) = fp["intro"].as_array() {
-            if let (Some(st), Some(en)) = (arr.first().and_then(|v| v.as_f64()), arr.get(1).and_then(|v| v.as_f64())) {
-                let valid = st.is_finite() && en.is_finite() && st >= 0.0 && en - st >= 4.0 && en - st <= 300.0 && (dur <= 30.0 || st < dur * 0.5);
-                if valid && !is_covered(&skips, st, en, "intro") {
-                    skips.push(json!({ "s": st, "e": en, "title": "Intro", "kind": "intro", "src": "fingerprint" }));
-                }
-            }
-        }
-    }
-
-    if let Some(os) = online {
-        let src = if os.src.is_empty() { "introdb" } else { os.src.as_str() };
-        if let Some((st, en)) = os.recap {
-            if !is_covered(&skips, st, en, "recap") {
-                skips.push(json!({ "s": st, "e": en, "title": "Recap", "kind": "recap", "src": src }));
-            }
-        }
-        if let Some((st, en)) = os.intro {
-            if !is_covered(&skips, st, en, "intro") {
-                skips.push(json!({ "s": st, "e": en, "title": "Intro", "kind": "intro", "src": src }));
-            }
-        }
-    }
-
-    skips.sort_by(|a, b| a["s"].as_f64().unwrap_or(0.0).total_cmp(&b["s"].as_f64().unwrap_or(0.0)));
-    p["skips"] = Value::Array(skips);
-
-    let chap_credits = p["creditsChapter"]
-        .as_f64()
-        .filter(|&c| c > 30.0 && (dur <= 30.0 || (c >= dur * 0.5 && c < dur - 3.0)));
-    let fp_credits = fp_entry
-        .and_then(|fp| fp["credits"].as_f64())
-        .filter(|&c| c > 30.0 && (dur <= 30.0 || (c >= dur * 0.5 && c < dur - 3.0)));
-    let online_credits = online
-        .and_then(|os| os.outro.map(|(s, _)| (s, os.src.as_str())))
-        .filter(|&(c, _)| c > 30.0 && (dur <= 30.0 || (c >= dur * 0.5 && c < dur - 3.0)));
-
-    if let Some(c) = chap_credits {
-        p["credits"] = json!(c);
-        p["creditsSource"] = json!("chapter");
-    } else if let Some(c) = fp_credits {
-        p["credits"] = json!(c);
-        p["creditsSource"] = json!("fingerprint");
-    } else if let Some((c, src)) = online_credits {
-        p["credits"] = json!(c);
-        p["creditsSource"] = json!(src);
-    } else {
-        p["credits"] = Value::Null;
-    }
 }
 struct Guard { app: Arc<App>, seq: u64 }
 impl Drop for Guard { fn drop(&mut self) { self.app.stream.finished(self.seq); } }
@@ -1550,62 +1428,4 @@ async fn extra_guide(app: Arc<App>) {
         *app.cat.write().unwrap() = Arc::new(c);
     }
     if changed || fresh { let a = app.clone(); let _ = tokio::task::spawn_blocking(move || sports::load_epg(&a)).await; app.memo.clear(); }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn merge_probe_skips_priority_and_sort() {
-        // Case 1: chapters missing, fingerprint has intro + credits, online has recap + intro + outro
-        let mut p = json!({
-            "duration": 1440.0,
-            "skips": [],
-            "chapters": [{ "s": 0.0, "e": 1440.0, "title": "Episode" }]
-        });
-        let fp = json!({ "intro": [85.0, 175.0], "credits": 1310.0 });
-        let online = intro::OnlineSkipEntry {
-            t: 1,
-            recap: Some((0.0, 40.0)),
-            intro: Some((86.0, 176.0)),
-            outro: Some((1320.0, 1410.0)),
-            src: "introdb".into(),
-        };
-        merge_probe_skips(&mut p, Some(&fp), Some(&online), 1440.0);
-        let skips = p["skips"].as_array().unwrap();
-        assert_eq!(skips.len(), 2);
-        assert_eq!(skips[0]["kind"], "recap");
-        assert_eq!(skips[0]["src"], "introdb");
-        assert_eq!(skips[1]["kind"], "intro");
-        assert_eq!(skips[1]["src"], "fingerprint");
-        assert_eq!(p["credits"], 1310.0);
-        assert_eq!(p["creditsSource"], "fingerprint");
-        assert_eq!(p["chapters"].as_array().unwrap().len(), 1);
-
-        // Case 2: chapter credits win over fingerprint & online
-        let mut p2 = json!({
-            "duration": 1440.0,
-            "skips": [{ "s": 90.0, "e": 180.0, "title": "Opening", "kind": "intro", "src": "chapter" }],
-            "creditsChapter": 1300.0
-        });
-        merge_probe_skips(&mut p2, Some(&fp), Some(&online), 1440.0);
-        assert_eq!(p2["credits"], 1300.0);
-        assert_eq!(p2["creditsSource"], "chapter");
-        assert_eq!(p2["skips"].as_array().unwrap()[1]["src"], "chapter");
-
-        // Case 3: online outro wins when chapter & fingerprint have no credits
-        let mut p3 = json!({ "duration": 1440.0, "skips": [] });
-        let online_ani = intro::OnlineSkipEntry {
-            t: 1,
-            recap: None,
-            intro: Some((80.0, 170.0)),
-            outro: Some((1325.0, 1415.0)),
-            src: "aniskip".into(),
-        };
-        merge_probe_skips(&mut p3, None, Some(&online_ani), 1440.0);
-        assert_eq!(p3["credits"], 1325.0);
-        assert_eq!(p3["creditsSource"], "aniskip");
-        assert_eq!(p3["skips"].as_array().unwrap()[0]["src"], "aniskip");
-    }
 }

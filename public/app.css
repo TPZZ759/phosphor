@@ -692,15 +692,3 @@ body.playing #view, body.playing .modal { visibility: hidden; }
 .rc-ov { margin: 2px 0 4px; font-size: 13px; line-height: 1.45; color: #c4cad4; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .rc-acts { margin-top: auto; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
 @media (max-width: 600px) { .rc { grid-template-columns: 74px 1fr; gap: 11px; } }
-
-/* ---------- v10: player binge controls (seekbar markers, episodes drawer, skip start/credits) */
-.seek .seek-marks { position: absolute; inset: 0; pointer-events: none; overflow: hidden; border-radius: inherit; }
-.seek .seek-mark { position: absolute; top: 0; bottom: 0; opacity: .7; }
-.seek .seek-mark.intro { background: #00d4ff; }
-.seek .seek-mark.credits { background: #ffb547; }
-.skip-btn.soft { background: rgba(16, 18, 22, .86); border: 1px solid rgba(255, 255, 255, .28); color: #f2f4f8; }
-.skip-btn.soft:hover { background: rgba(255, 255, 255, .18); border-color: #fff; }
-.pbtn-next { border: 1px solid rgba(255, 181, 71, .4); background: rgba(255, 181, 71, .12); color: #ffd48a; }
-.pbtn-next:hover { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-.ep-dr-bar { height: 3px; border-radius: 3px; background: rgba(255, 255, 255, .14); margin-top: 6px; overflow: hidden; }
-.ep-dr-bar i { display: block; height: 100%; background: var(--accent); }

@@ -34,16 +34,12 @@ impl State {
     pub fn load(path: PathBuf) -> Self {
         let mut v: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({}));
         for (k, d) in [("progress", json!({})), ("list", json!({})), ("history", json!([])), ("favs", json!({})), ("ratings", json!({})),
-            ("follows", json!({})), ("newEps", json!({})), ("teams", json!([])), ("notified", json!({})),
-            ("prefs", json!({"hide": [], "autoplay": true, "autoskip": false, "autoSkipCredits": true})),
+            ("follows", json!({})), ("newEps", json!({})), ("teams", json!([])), ("notified", json!({})), ("prefs", json!({"hide": []})),
             ("watched", json!({})), ("wanted", json!({})), ("arrived", json!({})), ("savedRows", json!([])),
             ("recentLive", json!([])), ("reminders", json!([])), ("cwDismissed", json!({})), ("cwPinned", json!({})), ("dubWatch", json!({}))] {
             if v.get(k).is_none() { v[k] = d; }
         }
         if v["prefs"].get("hide").is_none() { v["prefs"]["hide"] = json!([]); }
-        if v["prefs"].get("autoplay").is_none() { v["prefs"]["autoplay"] = json!(true); }
-        if v["prefs"].get("autoskip").is_none() { v["prefs"]["autoskip"] = json!(false); }
-        if v["prefs"].get("autoSkipCredits").is_none() { v["prefs"]["autoSkipCredits"] = json!(true); }
         State { path, v: Mutex::new(v), dirty: Default::default() }
     }
     pub fn with<R>(&self, f: impl FnOnce(&mut Value) -> R) -> R {
