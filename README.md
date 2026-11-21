@@ -1,46 +1,43 @@
 <div align="center">
 
-<img src="docs/assets/banner.png" alt="Phosphor — Pure-Black OLED Cinema for Xtream Codes IPTV" width="100%" />
+<img src="docs/assets/banner.png" alt="Phosphor OLED desktop client for Xtream Codes IPTV" width="100%" />
 
 <br />
 
 [![Rust](https://img.shields.io/badge/Rust-Single%20Binary%20(axum)-ffb547?style=for-the-badge&logo=rust&logoColor=000000)](server/Cargo.toml)
-[![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-16191f?style=for-the-badge&logo=windows11&logoColor=ffb547)](#installation)
+[![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-16191f?style=for-the-badge&logo=windows11&logoColor=ffb547)](#manual-installation)
 [![CI](https://img.shields.io/github/actions/workflow/status/TPZZ759/phosphor/ci.yml?branch=main&style=for-the-badge&label=Build&color=3ddc97)](https://github.com/TPZZ759/phosphor/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/TPZZ759/phosphor?style=for-the-badge&color=ffb547&labelColor=0d0f12)](https://github.com/TPZZ759/phosphor/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-16191f?style=for-the-badge&color=16191f&labelColor=0d0f12)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/TPZZ759/phosphor?style=for-the-badge&color=ffb547&labelColor=0d0f12)](https://github.com/TPZZ759/phosphor/stargazers)
-
-<h3>Reference pure-black OLED cinema for Xtream Codes IPTV.</h3>
 
 <p>
-  <strong>Single-binary Rust backend</strong> · <strong>0-nit OLED web UI</strong> · <strong>Native Windows Hz &amp; HDR switching</strong><br />
-  <strong><code>mpv</code> HDR10/Dolby Vision + Anime4K/FSRCNNX shaders</strong> · <strong>900 MB single-connection spool</strong> · <strong>Embedded VAD + <code>alass</code> subtitle sync</strong>
+  Phosphor is a local Windows streaming front-end for Xtream Codes IPTV accounts. A single Rust binary serves a pure-black web interface, controls mpv for HDR10 and Dolby Vision playback, switches Windows display refresh rates through Win32 APIs, and buffers streams in memory so single-connection accounts do not stall or disconnect.
 </p>
 
 <p>
-  <a href="#-install-in-60-seconds-with-ai">Install with AI</a> ·
-  <a href="#screenshots">Screenshots</a> ·
-  <a href="#why-phosphor">Why Phosphor?</a> ·
-  <a href="#features">Features</a> ·
-  <a href="#architecture">Architecture</a> ·
+  <a href="#install-with-an-ai-agent">Install with AI</a> |
+  <a href="#screenshots">Screenshots</a> |
+  <a href="#why-phosphor">Why Phosphor</a> |
+  <a href="#architecture">Architecture</a> |
+  <a href="#manual-installation">Manual setup</a> |
   <a href="#keyboard-shortcuts">Shortcuts</a>
 </p>
 
 </div>
 
-> **Player-Only Disclaimer:** Phosphor is an open-source, provider-agnostic **media player front-end only**. It does **not** include, host, endorse, link to, or distribute any streams, playlists, channels, or copyrighted media. You must supply your own Xtream Codes credentials from a legitimate provider.
+> Phosphor is a media player client only. It does not include, host, link to, or distribute streams, playlists, channels, or copyrighted media. You must provide your own Xtream Codes credentials from a legitimate provider.
 
 ---
 
-## ⚡ Install in 60 Seconds with AI
+## Install with an AI agent
 
-Phosphor ships with an [`AGENTS.md`](AGENTS.md) setup spec written specifically for AI coding agents (**Claude Code, Codex, Cursor, Windsurf, Antigravity, Cline**). Paste this into your agent:
+This repository includes [AGENTS.md](AGENTS.md) with the exact prerequisite commands, build steps, configuration schema, and health check for coding agents such as Claude Code, Codex, Cursor, Windsurf, Cline, and Antigravity. Paste this prompt into your agent:
 
 ```text
-Clone https://github.com/TPZZ759/phosphor, read AGENTS.md, install any missing Windows prerequisites (Rust, FFmpeg, mpv), run setup.ps1, ask me for my Xtream Codes credentials and optional free TMDB API key to configure config.json, then launch Phosphor and verify http://127.0.0.1:7878/api/status is responding.
+Clone https://github.com/TPZZ759/phosphor, read AGENTS.md, install any missing Windows prerequisites (Rust, FFmpeg, mpv), run setup.ps1, ask me for my Xtream Codes credentials and optional free TMDB API key to write config.json, then launch Phosphor and verify http://127.0.0.1:7878/api/status returns a response.
 ```
 
-Prefer manual setup or a prebuilt binary? Jump to **[Manual Installation](#installation)**.
+You can also download a prebuilt Windows zip from [GitHub Releases](https://github.com/TPZZ759/phosphor/releases) or build from source in [Manual installation](#manual-installation).
 
 ---
 
@@ -49,64 +46,64 @@ Prefer manual setup or a prebuilt binary? Jump to **[Manual Installation](#insta
 <p align="center">
   <img src="docs/assets/screenshots/01-home.png" alt="Phosphor pure-black OLED home screen" width="100%" />
   <br />
-  <em>Pure <code>#000000</code> OLED home screen with full-bleed hero banners, 4K Dolby Vision badges, and zero UI clutter.</em>
+  <em>Pure <code>#000000</code> OLED home view with widescreen heroes and 4K Dolby Vision badges.</em>
 </p>
 
 <table align="center">
   <tr>
     <td align="center" width="50%">
-      <img src="docs/assets/screenshots/02-4k-showcase.png" alt="4K OLED Showcase and CAM-free classifier" width="100%" /><br />
-      <strong>4K OLED Showcase &amp; CAM-Free Classifier (<code>#/4k</code>)</strong><br />
-      <sub>Automatic CAM/Telesync filtering, 4K DV / 4K UHD / Blu-Ray tiers &amp; upgrade alerts</sub>
+      <img src="docs/assets/screenshots/02-4k-showcase.png" alt="Phosphor 4K catalog and CAM filter" width="100%" /><br />
+      <strong>4K OLED catalog and CAM filter (<code>#/4k</code>)</strong><br />
+      <sub>Filters CAM and Telesync rips, groups 4K Dolby Vision, 4K UHD, and Blu-Ray copies, and watches for quality upgrades.</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/assets/screenshots/03-docs-hub.png" alt="Documentaries Hub in rich Data view" width="100%" /><br />
-      <strong>Documentaries Hub — <code>☰ Data</code> View (<code>#/docs</code>)</strong><br />
-      <sub>9 auto-classified topics, IMDb/RT scores, probed bitrate + HDR badges &amp; faceted filters</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="docs/assets/screenshots/04-concierge.png" alt="Watch-Night Concierge modal" width="100%" /><br />
-      <strong>Watch-Night Concierge (<code>🎲</code>)</strong><br />
-      <sub>Filter by type, mood, length, rating, 4K &amp; unwatched for 3 instant non-repeating picks</sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="docs/assets/screenshots/05-cinema-dna.png" alt="Personal Cinema DNA taste analytics" width="100%" /><br />
-      <strong>Personal Cinema DNA (<code>#/dna</code>)</strong><br />
-      <sub>100% local watch analytics, deterministic taste persona, genres, decades &amp; directors</sub>
+      <img src="docs/assets/screenshots/03-docs-hub.png" alt="Documentaries hub in data view" width="100%" /><br />
+      <strong>Documentaries hub in data view (<code>#/docs</code>)</strong><br />
+      <sub>Classifies documentaries into 9 topics and displays IMDb scores, Rotten Tomatoes scores, probed bitrate, and HDR tags.</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/assets/screenshots/06-oled-settings.png" alt="OLED True Black, neural shaders, and HDR calibration health" width="100%" /><br />
-      <strong>OLED True Black, Shaders &amp; Display Health</strong><br />
-      <sub>Native Win32 refresh-rate matching, SDR HDR-off fix, ICC 0.00-nit black-floor detector &amp; RTX VSR</sub>
+      <img src="docs/assets/screenshots/04-concierge.png" alt="Watch-night picker modal" width="100%" /><br />
+      <strong>Watch-night picker</strong><br />
+      <sub>Filters by media type, mood, runtime, minimum score, 4K availability, and unwatched status to return 3 non-repeating picks.</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/assets/screenshots/07-phone-remote.png" alt="Phosphor Wi-Fi Mobile Remote" width="235" /><br />
-      <strong>QR-Paired Wi-Fi Phone Remote (<code>:7880</code>)</strong><br />
-      <sub>Zero-app mobile PWA for seek, skip intro, subtitles, audio tracks, versions &amp; D-pad navigation</sub>
+      <img src="docs/assets/screenshots/05-cinema-dna.png" alt="Local Cinema DNA watch analytics" width="100%" /><br />
+      <strong>Local Cinema DNA (<code>#/dna</code>)</strong><br />
+      <sub>Computes watch hours, genre weights, decade distribution, 4K share, and favorite directors locally on disk.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/assets/screenshots/06-oled-settings.png" alt="OLED display, neural shaders, and HDR calibration diagnostics" width="100%" /><br />
+      <strong>OLED display and shader controls</strong><br />
+      <sub>Matches refresh rate via Win32, disables Windows HDR for SDR video, inspects your Windows HDR ICC profile for a 0.00 nit floor, and toggles mpv shaders.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/assets/screenshots/07-phone-remote.png" alt="Phosphor Wi-Fi phone remote" width="235" /><br />
+      <strong>QR-paired Wi-Fi phone remote (<code>:7880</code>)</strong><br />
+      <sub>Browser remote on your LAN for seeking, skipping intros, switching audio tracks and stream versions, and directional navigation.</sub>
     </td>
   </tr>
 </table>
 
 ---
 
-## Why Phosphor?
+## Why Phosphor
 
-Most desktop IPTV apps are sluggish Electron wrappers with flat folder trees, broken single-connection handling, and washed-out SDR-in-HDR grey blacks on OLED monitors. Phosphor was engineered from scratch in **Rust + vanilla JS + Lua** to feel like a dedicated reference home-theater appliance.
+Most desktop IPTV clients wrap a web player in Electron, leave provider folders flat, open duplicate connections during seeks, and play 24 fps SDR video inside a 60 Hz Windows HDR desktop where blacks turn dark grey on OLED panels. Phosphor replaces that stack with a compiled Rust server, vanilla HTML/CSS/JS, and an OLED-calibrated mpv pipeline.
 
-| Capability | Phosphor | Typical Desktop IPTV Clients |
+| Area | Phosphor | Typical desktop IPTV clients |
 |---|---|---|
-| **Runtime & Footprint** | Single compiled Rust binary (`axum`/`tokio`) + zero-build vanilla JS | Heavy Electron / Chromium shells |
-| **Single-Connection Safety** | Preflight guard, instant stream handoff, **900 MB** VOD read-ahead spool, **384 MB** Live MPEG-TS timeshift ring | Duplicate-connection kicks & seek stalls |
-| **OLED Picture Pipeline** | Native Win32 `QueryDisplayConfig` Hz matching (`24/25/30/50/60 Hz`), auto SDR HDR-off true 0-nit blacks, Windows ICC black-floor diagnostic, `mpv` 10-bit `libplacebo` HDR10/DV | 60 Hz judder & lifted grey blacks on Windows 11 HDR |
-| **GPU Neural Upscaling** | Bundled `Anime4K` (Fast/HQ), `FSRCNNX`, `KrigBilateral` live-switchable (`Ctrl+0–3`) + optional NVIDIA RTX VSR | Basic bilinear scaling |
-| **Subtitles** | Embedded **WebRTC VAD + `alass`** automatic speech alignment, zero-key OpenSubtitles search, **`R` "What Did They Just Say?"** 8s rewind with temporary EN subs | Manual timing offsets & external downloads |
-| **Intro, Credits & Filler** | Local Rust FFT (`rustfft`) audio-fingerprinted intro/credits skip + Anime Filler badges & auto-skip | Manual scrubbing |
-| **Discovery & Curation** | 4K CAM-Free Showcase, 9-topic Docs Hub, Dub-verified Anime Hub, 15 Franchise Marathons (Chrono/Release), Release Radar, Cinema DNA, Watch-Night Concierge | Endless raw provider folder lists |
-| **Living-Room Ecosystem** | QR Wi-Fi Phone Remote, Gamepad/Couch Mode, DLNA Casting, Two-way Trakt, Letterboxd `.zip` import, Windows Tray + dynamic global media keys | Mouse-only window |
+| Runtime | One Rust binary (`axum`, `tokio`) and static vanilla JS without a build step | Electron or heavy Chromium wrappers |
+| Single-connection handling | Preflight lock, stream handoff, 900 MB in-memory VOD read-ahead spool, and 384 MB Live MPEG-TS ring buffer | Duplicate-connection kicks and seek stalls |
+| OLED picture accuracy | Win32 `QueryDisplayConfig` refresh-rate matching (`24`, `25`, `30`, `50`, `60 Hz`), automatic Windows HDR off for SDR video, ICC black-floor check, and mpv 10-bit `libplacebo` HDR10/Dolby Vision | 60 Hz judder and raised SDR blacks under Windows 11 HDR |
+| GPU upscaling | Bundled `Anime4K` Fast/HQ, `FSRCNNX`, and `KrigBilateral` shaders toggled live with `Ctrl+0`, `1`, `2`, `3`, plus optional NVIDIA RTX Video Super Resolution | Bilinear scaling |
+| Subtitles | Embedded `webrtc-vad` and `alass-core` automatic speech alignment, zero-key OpenSubtitles search, and `R` for an 8 second rewind with temporary English subtitles | Manual offset adjustments |
+| Intro and filler skipping | Pure-Rust `rustfft` audio fingerprinting for intros and credits, plus anime filler badges and automatic filler skipping | Manual scrubbing |
+| Library organization | CAM-free 4K catalog, 9-topic documentaries hub, `ffprobe`-verified English-dubbed anime hub, 15 franchise marathons in chronological or release order, release radar, and local watch stats | Raw provider category lists |
+| Couch controls and sync | QR-paired LAN phone remote, gamepad navigation, DLNA casting, two-way Trakt sync, Letterboxd zip import, and a Windows tray companion with dynamic global media keys | Mouse-only window |
 
 ---
 
@@ -114,79 +111,81 @@ Most desktop IPTV apps are sluggish Electron wrappers with flat folder trees, br
 
 ```mermaid
 flowchart LR
-    XC["Xtream Codes API\n& XMLTV EPG"] --> GUARD["Single-Connection Guard\n& Multi-Server Failover"]
-    GUARD --> SPOOL["900 MB VOD Read-Ahead Spool\n& 384 MB Live Timeshift Ring"]
-    GUARD --> CAT["Local Catalog & Metadata\n(TMDB · OMDb · CAM Filter · Dub Probe)"]
+    XC["Xtream Codes API and XMLTV EPG"] --> GUARD["Single-Connection Guard and Server Failover"]
+    GUARD --> SPOOL["900 MB VOD Spool and 384 MB Live Ring"]
+    GUARD --> CAT["Local Catalog Index, TMDB, OMDb, CAM Filter, Dub Probe"]
 
-    SPOOL --> SUBS["Embedded Rust DSP\nWebRTC VAD + alass SubSync\nrustfft Intro/Credits Fingerprint"]
-    SPOOL --> WEB["Browser MSE fMP4 Player\nSub-second In-Buffer Seeks"]
-    SPOOL --> MPV["Cinema mpv Pipeline\n10-bit HDR10/DV · Anime4K/FSRCNNX\nOLED Lua HUD · Win32 Auto-Hz"]
+    SPOOL --> DSP["Embedded Rust DSP: WebRTC VAD, alass SubSync, rustfft Intro Detection"]
+    SPOOL --> WEB["Browser MSE fMP4 Player"]
+    SPOOL --> MPV["mpv HDR10/DV, GLSL Shaders, Lua HUD, Win32 Auto-Hz"]
 
-    CAT --> UI["Pure-Black #000 OLED Web UI\nHubs · Concierge · Cinema DNA"]
-    UI <--> REMOTE["LAN QR Phone Remote (:7880)\n& Gamepad / Couch Mode"]
+    CAT --> UI["Pure-Black #000 Web UI"]
+    UI <--> REMOTE["LAN QR Phone Remote (:7880) and Gamepad Mode"]
 ```
 
 ---
 
-## Features
+## Streaming and playback engine
 
-### Armored Streaming & Playback Engine
-- **Built for single-connection accounts:** Connection preflight guard, automatic stream handoff, background worker yielding, and a **900 MB in-memory VOD read-ahead spool** so seeks and brief network blips never stall playback or trigger duplicate connections.
-- **Fast Browser Player (MSE fMP4):** Sub-second in-buffer seeks, seamless quality/version switching, automatic failover across alternate copies, and source health tracking.
-- **Live TV Timeshift & Guide:** **384 MB** live MPEG-TS ring buffer (pause, rewind, and jump back to live), multi-feed channel deduplication, XMLTV TV Guide + Catch-up, **in-player Mini-Guide & Live Scores drawer (`G`)**, and broadcast reminders.
-- **Self-Correcting Subtitles:** Embedded subtitle extraction plus free zero-key OpenSubtitles search directly inside the player, automatically speech-aligned in Rust via **`webrtc-vad` + `alass-core`**.
-- **Audio-Fingerprinted Intro & Credits Skip:** Local **`rustfft`** acoustic fingerprinting detects show intros and end credits for automatic Skip Intro (`S`) and Up Next episode countdowns.
-- **"What Did They Just Say?" (`R`):** Rewinds 8 seconds and temporarily turns on English subtitles — works identically in both the browser player and `mpv`.
+- **Single-connection protection.** A preflight guard closes the active upstream socket before opening a new stream, background probes pause during playback, and a 900 MB in-memory read-ahead spool absorbs seeks and brief drops without reconnecting.
+- **Browser MSE fMP4 playback.** The Rust server remuxes VOD streams to fragmented MP4 on the fly for sub-second in-buffer seeks, version switching, automatic copy failover, and per-source health scoring.
+- **Live TV timeshift and EPG.** A 384 MB MPEG-TS ring buffer lets you pause, rewind, and jump back to live. Phosphor deduplicates duplicate feeds, loads XMLTV guides and catch-up archives, and opens a live mini-guide and sports scoreboard drawer when you press `G`.
+- **Automatic speech-aligned subtitles.** Phosphor extracts embedded subtitle tracks and searches OpenSubtitles without an API key, then aligns cue timestamps against decoded audio speech using `webrtc-vad` and `alass-core` compiled into the server.
+- **Local intro and credits detection.** Acoustic fingerprinting built on `rustfft` locates repeated intro sequences and end credits locally, driving the Skip Intro (`S`) button and automatic Up Next countdowns.
+- **Instant 8 second dialogue replay.** Pressing `R` in either the browser player or mpv rewinds 8 seconds and enables English subtitles temporarily for 10 seconds.
 
-### Reference OLED & Cinema `mpv` Pipeline
-- **OLED True Black Pipeline:** Native Windows `QueryDisplayConfig` / `ChangeDisplaySettingsEx` refresh-rate matching (`24/25/30/50/60 Hz` multiples), automatic Windows HDR toggle (including turning HDR *off* for SDR video to eliminate Windows 11's lifted grey blacks), and automatic display restore on exit.
-- **Built-in Display & Network Health Diagnostics:** Automatically parses your active Windows HDR Calibration `.icc` profile to warn if the black floor is raised above `0.00 nits`, and flags Ethernet adapters stuck below Gigabit speeds.
-- **Custom Pure-Black OLED Lua HUD (`mpv-scripts/tv_osd.lua`):** Cinema controls, live Clear Voice / Night Mode (`dynaudnorm`), Skip Intro (`S`), clickable Up Next, auto black-bar crop (`B`), and 8s replay with subs (`R`).
-- **GPU Neural Upscaling Shaders (`mpv-shaders/`):** Bundled `Anime4K` (Fast & HQ), `FSRCNNX`, and `KrigBilateral` GLSL shader chains switchable live with `Ctrl+0–3`, plus optional **NVIDIA RTX Video Super Resolution**.
+## OLED display and mpv pipeline
 
-### Rich Discovery, Curation & Specialized Hubs
-- **4K OLED Showcase & CAM Watch (`#/4k`):** Bulletproof CAM/Telesync detector keeps discovery rows clean, classifies **4K Dolby Vision / 4K UHD / Blu-Ray** masters, and watches for quality upgrades.
-- **Dedicated Documentaries Hub (`#/docs`):** Auto-classifies documentary films and series across **9 topics** (*Nature & Wildlife, Science & Space, True Crime, History & War, Sports, Biography, Music & Arts, Society & Culture, Food & Travel*) with full faceted filtering.
-- **English-Dubbed Anime Hub (`#/anime`):** Episode-level audio track verification (`ffprobe` cache), automatic hiding of sub-only episodes, **"Notify when dubbed"** alerts, and **Anime Filler Badges** (`FILLER` / `MIXED`) with automatic **Skip Filler**.
-- **Marathons & Franchise Watch Order (`#/marathons`):** 15 curated bingeable franchises with toggleable **Chronological Story Order** and **Theatrical Release Order**, live library matching, and Next-Up progress tracking.
-- **Personal Cinema DNA (`#/dna`) & Specialty Hubs (`#/specials`):** Local viewing stats, taste persona, favorite directors/decades, plus dedicated hubs for Stand-Up Comedy, Live Concerts, World Cinema, and Under-95m Tight Bangers.
-- **Release Radar (`#/radar`) & Sports / Replays (`#/sports`, `#/fights`):** Digital-drop calendar, live ESPN scoreboards with team kickoff alerts, and spoiler-free combat sports replays.
-- **Deep Faceted Browse & `⊞ Grid` / `☰ Data` Toggle:** Filter across `ANY/ALL` genres, platforms, countries, vote tiers, runtime, and series status, or hit **`🎲` Watch-Night Concierge** for 3 instant picks.
+- **Automatic refresh-rate and HDR switching.** Phosphor calls Windows `QueryDisplayConfig` and `ChangeDisplaySettingsEx` to match your panel refresh rate to `24`, `25`, `30`, `50`, or `60 Hz` multiples. It turns Windows HDR on for HDR10 and Dolby Vision titles, turns Windows HDR off for SDR titles to prevent Windows 11 from lifting 0-nit blacks to grey, and restores your desktop mode on exit.
+- **Windows HDR calibration and Ethernet checks.** The Settings health panel inspects your active Windows HDR Calibration `.icc` file to flag black floors above `0.00 nits` and detects Ethernet links stuck below 1 Gbps.
+- **Pure-black OLED Lua HUD.** The bundled script at `mpv-scripts/tv_osd.lua` renders `#000000` controls with live Clear Voice / Night Mode (`dynaudnorm`), Skip Intro (`S`), clickable Up Next cards, automatic black-bar cropping (`B`), and 8 second subtitle replay (`R`).
+- **Live GLSL neural upscaling.** Phosphor bundles `Anime4K` (Fast and HQ), `FSRCNNX`, and `KrigBilateral` in `mpv-shaders/` and switches chains live with `Ctrl+0`, `Ctrl+1`, `Ctrl+2`, and `Ctrl+3`. NVIDIA RTX GPU owners can also enable RTX Video Super Resolution in Settings.
 
-### Living-Room Controls, Remote & Sync
-- **Wi-Fi Phone Remote (`:7880`):** Off by default; enable in Settings to scan a generated QR code and control seek, subtitles, audio tracks, versions, and D-pad navigation from any phone browser.
-- **Couch & Gamepad Mode:** Full arrow-key and Xbox/PlayStation controller spatial navigation (`TV Mode`).
-- **Sync & Casting:** Two-way **Trakt** sync, **Letterboxd `.zip`** import, **DLNA** Smart TV casting, and a lightweight Windows system tray companion that dynamically binds global hardware media keys *only* while `mpv` is playing.
+## Library hubs and discovery
+
+- **4K OLED catalog and CAM watch (`#/4k`).** Phosphor detects CAM and Telesync rips, hides them from normal discovery rows, groups verified 4K Dolby Vision, 4K UHD, and Blu-Ray masters, and records quality upgrades when clean copies arrive.
+- **Documentaries hub (`#/docs`).** Documentaries are sorted into 9 topics: True Crime, Nature & Wildlife, History & War, Science & Space, Sports, Music & Arts, Biography, Society & Culture, and Food & Travel. Every filterable page toggles between a poster grid and a rich data card view showing IMDb scores, Rotten Tomatoes scores, probed Mbps, and HDR format.
+- **English-dubbed anime hub (`#/anime`).** Phosphor probes episode audio tracks with `ffprobe`, caches the results, hides sub-only episodes when requested, sends alerts when a dub arrives, and marks filler episodes (`FILLER` or `MIXED`) for automatic skipping.
+- **Franchise marathons (`#/marathons`).** Fifteen curated franchises match against your local library in O(1) time with toggles between chronological story order and theatrical release order.
+- **Cinema DNA (`#/dna`), Release Radar (`#/radar`), and Sports (`#/sports`, `#/fights`).** View local watch statistics and favorite filmmakers, track upcoming digital releases and live ESPN scoreboards with kickoff alerts, and browse combat sports replays with spoiler-free runtimes hidden.
+- **Couch controls, remote, and sync.** Enable the optional port `7880` LAN phone remote in Settings to pair by QR code, navigate with arrow keys or a gamepad in TV Mode, cast to DLNA televisions, import Letterboxd `.zip` exports, and sync history two-way with Trakt.
 
 ---
 
-## Installation
+## Manual installation
 
-### Prerequisites (Windows 10 / 11 64-bit)
-- **FFmpeg (`ffmpeg` & `ffprobe`)** on `PATH`:
+### Prerequisites on Windows 10 or 11 (64-bit)
+
+- **FFmpeg and FFprobe** on `PATH`:
   ```powershell
   winget install Gyan.FFmpeg
   ```
-- **mpv** *(optional, strongly recommended for 4K HDR10 / Dolby Vision & neural shaders)*:
+- **mpv** is optional, though recommended for 4K HDR10, Dolby Vision, and neural shaders:
   ```powershell
   winget install shinchiro.mpv
   ```
-- **Rust toolchain** *(only if building from source — skip if using a GitHub Release `.zip`)*: https://rustup.rs/
+- **Rust toolchain** is required only when building from source, available at https://rustup.rs/
 
-### Option A: Prebuilt Release (Fastest Manual Setup)
-1. Download `Phosphor-windows-x64.zip` from **[GitHub Releases](https://github.com/TPZZ759/phosphor/releases)** and extract it.
-2. Copy `config.example.json` to `config.json` and fill in your Xtream Codes credentials.
-3. Double-click **`Open Phosphor.vbs`**.
+### Option 1. Prebuilt Windows release
 
-### Option B: Build from Source
+1. Download `Phosphor-windows-x64.zip` from [GitHub Releases](https://github.com/TPZZ759/phosphor/releases) and extract it to a folder.
+2. Copy `config.example.json` to `config.json` and fill in your Xtream Codes details.
+3. Double-click `Open Phosphor.vbs`.
+
+### Option 2. Build from source
+
 ```powershell
 git clone https://github.com/TPZZ759/phosphor.git
 cd phosphor
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
-`setup.ps1` checks prerequisites, compiles `phosphor-server.exe` in release mode, stages the Windows launchers, and creates `config.json` from `config.example.json`.
 
-### Configuration (`config.json`)
+`setup.ps1` verifies dependencies, compiles `phosphor-server.exe` in release mode, stages the launcher scripts into the repository root, and creates `config.json` if it does not exist.
+
+### Configuration
+
+Edit `config.json` with your Xtream Codes host and login:
+
 ```json
 {
   "servers": ["http://your-provider-host.example"],
@@ -200,56 +199,58 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
   "catalogRefreshHours": 12
 }
 ```
-- **TMDB API key (free, strongly recommended):** https://www.themoviedb.org/settings/api — unlocks Trending rows, Cinema DNA, Marathons, Release Radar, and rich faceted search (can also be pasted in **Settings**).
-- **OMDb API key (free, optional):** https://www.omdbapi.com/apikey.aspx — adds IMDb, Rotten Tomatoes, and Metacritic badges.
 
-### Launch
-- **`Open Phosphor.vbs`** — Starts `phosphor-server.exe` hidden on `http://localhost:7878` and opens Phosphor in a clean frameless app window.
-- **`Start Phosphor Tray.vbs`** *(optional)* — Lightweight Windows system tray companion with dynamic global media keys and logon auto-start toggle.
-- **`Stop Phosphor.cmd`** — Stops the background server anytime.
+- **Free TMDB API key.** Request a developer key at https://www.themoviedb.org/settings/api to enable Trending rows, Cinema DNA, Marathons, Release Radar, and deep faceted filters. You can also paste it inside Settings.
+- **Free OMDb API key.** Request an optional key at https://www.omdbapi.com/apikey.aspx to display IMDb, Rotten Tomatoes, and Metacritic scores.
+
+### Launchers
+
+- `Open Phosphor.vbs` starts `phosphor-server.exe` hidden on `http://localhost:7878` and opens Phosphor in an app window.
+- `Start Phosphor Tray.vbs` runs a lightweight system tray icon that binds Windows hardware Play, Pause, Next, and Previous keys only while mpv is playing.
+- `Stop Phosphor.cmd` stops the background server process on port `7878`.
 
 ---
 
-## Keyboard Shortcuts
+## Keyboard shortcuts
 
 | Context | Key | Action |
 |---|---|---|
-| Navigation | `Arrows` / `Enter` / `Backspace` | Spatial couch / gamepad navigation |
+| Navigation | `Arrows`, `Enter`, `Backspace` | Spatial couch and gamepad navigation |
 | Navigation | `/` | Focus global search |
-| Player (Browser & `mpv`) | `Space` / `K` | Play / Pause (pauses Live TV ring buffer too) |
-| Player (Browser & `mpv`) | `←` / `→` | Seek ±10 seconds |
-| Player (Browser & `mpv`) | `R` | **"What did they just say?"** (8s rewind with temporary EN subs) |
-| Player (Browser & `mpv`) | `S` | Skip Intro |
-| Player (Browser & `mpv`) | `C` | Toggle / cycle subtitles |
-| Player (Browser & `mpv`) | `N` | Next episode |
-| Player (Browser & `mpv`) | `F` / `M` / `I` | Fullscreen / Mute / Playback stats overlay |
-| Browser Player | `P` | Hand off current title directly to `mpv` |
-| Browser Player | `G` / `H` | Subtitle timing ±250 ms (`G` opens Mini-Guide on Live TV) |
-| Browser Player | `[` / `]` | Audio timing ±100 ms |
-| `mpv` OLED HUD | `B` | Auto-crop black bars (`cropdetect`) |
-| `mpv` OLED HUD | `Ctrl+0` / `1` / `2` / `3` | Live GPU shaders: Off / Film (`FSRCNNX`) / `Anime4K` Fast / `Anime4K` HQ |
-| Live TV | `G` / `L` / `↑↓` / `End` | Mini-Guide & Live Scores / Last Channel / Zap / Jump to Live |
+| Browser and mpv | `Space` or `K` | Play or pause (pauses Live TV ring buffer too) |
+| Browser and mpv | `Left` or `Right` | Seek 10 seconds back or forward |
+| Browser and mpv | `R` | Rewind 8 seconds with temporary English subtitles |
+| Browser and mpv | `S` | Skip intro |
+| Browser and mpv | `C` | Toggle or cycle subtitles |
+| Browser and mpv | `N` | Next episode |
+| Browser and mpv | `F`, `M`, `I` | Fullscreen, mute, playback stats overlay |
+| Browser player | `P` | Hand off current stream to mpv |
+| Browser player | `G` or `H` | Shift subtitle timing by 250 ms (`G` opens Mini-Guide on Live TV) |
+| Browser player | `[` or `]` | Shift audio timing by 100 ms |
+| mpv OLED HUD | `B` | Auto-crop black bars (`cropdetect`) |
+| mpv OLED HUD | `Ctrl+0`, `1`, `2`, `3` | Switch GPU shaders: Off, Film (`FSRCNNX`), `Anime4K` Fast, `Anime4K` HQ |
+| Live TV | `G`, `L`, `Up`/`Down`, `End` | Mini-Guide and scores, last channel, zap channels, jump to live |
 
 ---
 
-## Project Layout
+## Project layout
 
 ```text
 ├── AGENTS.md                  # Deterministic setup contract for AI coding agents
-├── setup.ps1                  # One-command Windows build & staging script
-├── config.example.json        # Config template (copy to config.json; gitignored)
-├── server/                    # Single-binary Rust backend (axum, tokio, webrtc-vad, alass, rustfft)
+├── setup.ps1                  # Windows build and launcher staging script
+├── config.example.json        # Configuration template (copy to config.json; gitignored)
+├── server/                    # Rust backend (axum, tokio, webrtc-vad, alass-core, rustfft)
 │   ├── Cargo.toml
 │   ├── Cargo.lock
-│   ├── deploy-when-idle.ps1   # Zero-interruption idle server binary swapper
+│   ├── deploy-when-idle.ps1   # Idle server binary swapper
 │   └── src/
-├── public/                    # Zero-build vanilla JS + pure-black OLED CSS UI & mobile remote
-├── mpv-scripts/               # Custom pure-black OLED Lua OSD (tv_osd.lua)
-├── mpv-shaders/               # Bundled GLSL neural shaders + third-party licenses
-├── scripts/                   # Windows launchers, watchdog & amber-icon tray companion
-└── docs/assets/               # Brand mark, banner & clean synthetic UI showcase screenshots
+├── public/                    # Zero-build vanilla JS, pure-black OLED CSS, and mobile remote
+├── mpv-scripts/               # Pure-black OLED Lua OSD (tv_osd.lua)
+├── mpv-shaders/               # Bundled GLSL shaders and third-party licenses
+├── scripts/                   # Windows launchers, watchdog, and tray companion
+└── docs/assets/               # Brand mark, hero banner, and synthetic UI screenshots
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party GLSL shaders in `mpv-shaders/` carry their own upstream licenses (see [mpv-shaders/THIRD_PARTY_LICENSES.md](mpv-shaders/THIRD_PARTY_LICENSES.md)).
+MIT. See [LICENSE](LICENSE). Bundled GLSL shaders in `mpv-shaders/` carry their upstream licenses in [mpv-shaders/THIRD_PARTY_LICENSES.md](mpv-shaders/THIRD_PARTY_LICENSES.md).
