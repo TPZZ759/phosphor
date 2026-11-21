@@ -1,4 +1,4 @@
-# AGENTS.md — AI Coding Agent Install & Setup Guide for Phosphor
+# AGENTS.md: AI coding agent install and setup guide for Phosphor
 
 If a user asked you to install, configure, or troubleshoot **Phosphor** on Windows 10/11, follow this deterministic checklist.
 
@@ -38,9 +38,9 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 What `setup.ps1` does:
 1. Compiles `server/` in release mode (`cargo build --release`).
-2. Copies `server\target\release\phosphor.exe` → `.\phosphor-server.exe`.
-3. Stages Windows launchers (`Open Phosphor.vbs`, `Start Phosphor Tray.vbs`, `Stop Phosphor.cmd`, `phosphor-tray.ps1`, `phosphor-watchdog.vbs`) into the repo root.
-4. Copies `config.example.json` → `config.json` if missing.
+2. Copies `server\target\release\phosphor.exe` to `.\phosphor-server.exe`.
+3. Stages Windows launchers (`Open Phosphor.vbs`, `Start Phosphor Tray.vbs`, `Stop Phosphor.cmd`, `phosphor-tray.ps1`, `phosphor-watchdog.vbs`) into the repository root.
+4. Copies `config.example.json` to `config.json` if missing.
 
 *(If staging a prebuilt `phosphor-server.exe` from GitHub Releases, run `.\setup.ps1 -SkipBuild`.)*
 
