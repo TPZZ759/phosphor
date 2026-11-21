@@ -1,0 +1,14 @@
+{
+  "servers": [
+    "http://your-provider-host.example"
+  ],
+  "username": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD",
+  "port": 7878,
+  "tmdbKey": "YOUR_TMDB_API_KEY_OR_READ_TOKEN",
+  "omdbKey": "",
+  "serverTimezone": "Europe/Amsterdam",
+  "mpvPath": "C:\\Program Files\\MPV Player\\mpv.exe",
+  "catalogRefreshHours": 12,
+  "userAgent": "Mozilla/5.0"
+}

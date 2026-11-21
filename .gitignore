@@ -1,0 +1,24 @@
+# Secrets & personal runtime data (NEVER commit)
+config.json
+data/
+*.icc
+*.log
+*.tmp
+*.bak
+
+# Build outputs & binaries
+target/
+server/target/
+*.exe
+*.pdb
+*.dll
+
+# Scratch & test fixtures
+testroot/
+*.mkv
+*.mp4
+*.ts
+*.zip
+node_modules/
+.DS_Store
+Thumbs.db

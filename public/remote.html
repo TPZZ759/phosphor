@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Remote</title>
+<style>
+  :root { --bg: #0b0d10; --bg2: #151920; --bg3: #1e232c; --line: #2a303a; --fg: #f2f4f7; --muted: #8b93a1; --accent: #e50914; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { padding: env(safe-area-inset-top) 16px calc(76px + env(safe-area-inset-bottom)); max-width: 520px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 18px 0 12px; }
+  button { font: inherit; color: inherit; background: var(--bg3); border: 0; border-radius: 12px; padding: 12px; cursor: pointer; }
+  button:active { transform: scale(.96); background: #2a303a; }
+  .primary { background: var(--accent); }
+  .hidden { display: none !important; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .np { background: var(--bg2); border-radius: 16px; overflow: hidden; margin-top: 14px; }
+  .np .art { aspect-ratio: 16/9; background: #000 center/cover no-repeat; }
+  .np .info { padding: 12px 14px 4px; }
+  .np b { display: block; font-size: 17px; } .np small { color: var(--muted); }
+  .seek { padding: 6px 14px 12px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+  .times { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .ctl { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 10px; margin: 14px 0; }
+  .ctl button { height: 64px; font-size: 22px; }
+  .ctl .pp { font-size: 28px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+  .row button { flex: 1 1 30%; font-size: 14px; }
+  .skip { width: 100%; height: 54px; font-weight: 700; margin-top: 4px; }
+  select { width: 100%; background: var(--bg3); color: var(--fg); border: 0; border-radius: 12px; padding: 12px; font: inherit; }
+  .pad { display: grid; grid-template-columns: repeat(3, 72px); grid-template-rows: repeat(3, 64px); gap: 8px; justify-content: center; margin: 14px 0; }
+  .pad button { font-size: 22px; }
+  .pad .ok { background: var(--accent); font-weight: 800; font-size: 16px; border-radius: 50%; }
+  .tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: rgba(11,13,16,.96); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); backdrop-filter: blur(10px); }
+  .tabs button { flex: 1; background: none; border-radius: 0; padding: 14px 0; color: var(--muted); font-weight: 600; }
+  .tabs button.on { color: var(--fg); box-shadow: inset 0 2px 0 var(--accent); }
+  .list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .item { background: var(--bg2); border-radius: 12px; overflow: hidden; text-align: left; padding: 0; }
+  .item .img { aspect-ratio: 16/9; background: #000 center/cover no-repeat; position: relative; }
+  .item .bar { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); }
+  .item .t { padding: 8px 10px 10px; font-size: 13px; }
+  .item .t small { display: block; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .poster .img { aspect-ratio: 2/3; }
+  input[type=search], input.code { width: 100%; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 14px; font: inherit; font-size: 16px; }
+  input.code { font-size: 30px; text-align: center; letter-spacing: .3em; font-weight: 800; }
+  .pair { margin-top: 18vh; text-align: center; }
+  .pair button { width: 100%; margin-top: 12px; height: 54px; }
+  .err { color: #ff8a8a; min-height: 20px; margin-top: 8px; }
+  .offline { background: var(--bg2); border-radius: 14px; padding: 16px; margin-top: 14px; }
+  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 18px 0 10px; }
+</style>
+</head>
+<body>
+<section id="pairView" class="pair hidden">
+  <h1>Pair this phone</h1>
+  <p class="muted">On the PC, open <b>Settings → Phone remote</b> and type the 6-digit code shown there.</p>
+  <input class="code" id="code" inputmode="numeric" maxlength="7" autocomplete="one-time-code" placeholder="000000">
+  <button class="primary" id="pairBtn">Pair</button>
+  <div class="err" id="pairErr"></div>
+</section>
+
+<section id="remoteView" class="hidden">
+  <div id="idle" class="offline"><b>Nothing playing</b><div class="muted" id="idleMsg">Pick something from Continue or Search, or move around the TV with the pad below.</div></div>
+  <div id="np" class="np hidden">
+    <div class="art" id="art"></div>
+    <div class="info"><b id="title"></b><small id="sub"></small></div>
+    <div class="seek" id="seekBox"><input type="range" id="seek" min="0" max="1000" value="0"><div class="times"><span id="tPos">0:00</span><span id="tDur">0:00</span></div></div>
+  </div>
+  <button class="skip primary hidden" id="skip"></button>
+  <div class="ctl" id="ctl"><button data-c="seek" data-v="-10">⟲ 10</button><button class="pp primary" data-c="toggle" id="pp">▶</button><button data-c="seek" data-v="10">10 ⟳</button></div>
+  <div class="row" id="row2">
+    <button data-c="subs" id="subsBtn">Subtitles</button><button data-c="audio" id="audBtn" class="hidden">Audio</button><button data-c="next" id="nextBtn">Next ep</button><button data-c="last" id="lastBtn" class="hidden">Last ch</button><button data-c="mute" id="muteBtn">Mute</button>
+    <button data-c="full">Fullscreen</button><button data-c="close">Stop</button>
+  </div>
+  <div class="row"><span class="muted" style="align-self:center">Volume</span><input type="range" id="vol" min="0" max="100" value="100" style="flex:1"></div>
+  <div id="audBox" class="hidden"><h2>Audio</h2><select id="aud"></select></div>
+  <div id="srcBox" class="hidden"><h2 id="srcLabel">Version</h2><select id="src"></select></div>
+  <h2>Navigate</h2>
+  <div class="pad">
+    <span></span><button data-k="ArrowUp">▲</button><span></span>
+    <button data-k="ArrowLeft">◀</button><button class="ok" data-k="Enter">OK</button><button data-k="ArrowRight">▶</button>
+    <span></span><button data-k="ArrowDown">▼</button><span></span>
+  </div>
+  <div class="row"><button data-k="Back">Back</button><button data-c="tvmode">TV mode</button></div>
+</section>
+
+<section id="contView" class="hidden">
+  <h1>Continue watching</h1><div class="list" id="cont"></div>
+  <h2 id="hf" class="hidden">Favourite channels</h2><div class="list" id="favs"></div>
+  <h2>My list</h2><div class="list" id="mine"></div>
+</section>
+
+<section id="searchView" class="hidden">
+  <h1>Search</h1>
+  <input type="search" id="q" placeholder="Movies, shows and live channels" autocomplete="off">
+  <h2 id="hl" class="hidden">Live channels</h2><div class="list" id="rl"></div>
+  <h2 id="hm" class="hidden">Movies</h2><div class="list" id="rm"></div>
+  <h2 id="hs" class="hidden">Shows</h2><div class="list" id="rs"></div>
+</section>
+
+<nav class="tabs hidden" id="tabs"><button data-tab="remote" class="on">Remote</button><button data-tab="cont">Continue</button><button data-tab="search">Search</button></nav>
+
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  let token = ''; try { token = localStorage.getItem('remoteToken') || ''; } catch {}
+  let tab = 'remote'; let st = null; let dragging = false;
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const fmt = (t) => { t = Math.max(0, Math.floor(t || 0)); const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60; return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0'); };
+  async function call(path, body) {
+    const r = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'x-remote': token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+    if (r.status === 401) { showPair(); throw new Error('pair'); }
+    const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || 'Error'); return j;
+  }
+  const cmd = (c, v) => { if (navigator.vibrate) navigator.vibrate(12); return call('/r/cmd', { cmd: c, v }).catch(() => {}); };
+  function showPair() { ['remoteView', 'contView', 'searchView', 'tabs'].forEach((id) => $('#' + id).classList.add('hidden')); $('#pairView').classList.remove('hidden'); }
+  function show(t) {
+    tab = t; $('#pairView').classList.add('hidden'); $('#tabs').classList.remove('hidden');
+    $('#remoteView').classList.toggle('hidden', t !== 'remote'); $('#contView').classList.toggle('hidden', t !== 'cont'); $('#searchView').classList.toggle('hidden', t !== 'search');
+    document.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('on', b.dataset.tab === t));
+    if (t === 'cont') loadHome(); if (t === 'search') setTimeout(() => $('#q').focus(), 50);
+  }
+  $('#pairBtn').onclick = async () => {
+    $('#pairErr').textContent = '';
+    try { const r = await fetch('/r/pair', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: $('#code').value.replace(/\D/g, '') }) }); const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'Pairing failed'); token = j.token; try { localStorage.setItem('remoteToken', token); } catch {} show('remote'); poll(); }
+    catch (e) { $('#pairErr').textContent = e.message; }
+  };
+  $('#code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pairBtn').click(); });
+  document.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => show(b.dataset.tab)));
+  document.querySelectorAll('[data-c]').forEach((b) => (b.onclick = () => cmd(b.dataset.c, b.dataset.v !== undefined ? +b.dataset.v : undefined).then(poll)));
+  document.querySelectorAll('[data-k]').forEach((b) => (b.onclick = () => cmd('key', b.dataset.k)));
+  $('#skip').onclick = () => cmd('skip').then(poll);
+  const seek = $('#seek');
+  seek.addEventListener('input', () => { dragging = true; if (st?.dur) $('#tPos').textContent = fmt(seek.value / 1000 * st.dur); });
+  seek.addEventListener('change', () => { dragging = false; if (st?.dur) cmd('seekto', seek.value / 1000 * st.dur); });
+  $('#vol').addEventListener('change', (e) => cmd('vol', e.target.value / 100));
+  $('#aud').onchange = (e) => cmd('audio', +e.target.value);
+  $('#src').onchange = (e) => cmd('source', +e.target.value);
+
+  function render(r) {
+    const p = r.s?.player; st = p;
+    if (!r.tv) { $('#idle').classList.remove('hidden'); $('#idleMsg').textContent = 'The TV app isn’t open on the PC. Picking something to play will open it.'; }
+    else $('#idleMsg').textContent = 'Pick something from Continue or Search, or move around the TV with the pad below.';
+    $('#idle').classList.toggle('hidden', !!p); $('#np').classList.toggle('hidden', !p);
+    ['ctl', 'row2'].forEach((id) => $('#' + id).classList.toggle('hidden', !p));
+    if (!p) { $('#skip').classList.add('hidden'); $('#srcBox').classList.add('hidden'); $('#audBox').classList.add('hidden'); return; }
+    $('#title').textContent = p.title; $('#sub').textContent = p.sub + (p.casting ? ` · on ${p.casting}` : ''); $('#art').style.backgroundImage = p.img ? `url("${p.img.replace(/"/g, '')}")` : '';
+    $('#pp').textContent = p.paused ? '▶' : '❚❚';
+    $('#seekBox').classList.toggle('hidden', p.live || !p.dur);
+    if (!dragging && p.dur) { seek.value = Math.round(p.pos / p.dur * 1000); $('#tPos').textContent = fmt(p.pos); $('#tDur').textContent = fmt(p.dur); }
+    $('#skip').classList.toggle('hidden', !p.skip); $('#skip').textContent = p.skip || '';
+    $('#nextBtn').classList.toggle('hidden', !p.next);
+    $('#lastBtn').classList.toggle('hidden', !p.live);
+    $('#subsBtn').classList.toggle('hidden', !p.hasSubs); $('#subsBtn').textContent = p.subs ? 'Subtitles: on' : 'Subtitles: off';
+    const manyAud = (p.audios || []).length > 1;
+    $('#audBtn').classList.toggle('hidden', !manyAud);
+    $('#audBox').classList.toggle('hidden', !manyAud);
+    if (manyAud && document.activeElement !== $('#aud')) {
+      $('#aud').innerHTML = p.audios.map((a) => `<option value="${a.i}">${esc(a.label)}</option>`).join('');
+      $('#aud').value = p.audio ?? 0;
+    }
+    $('#muteBtn').textContent = p.muted ? 'Unmute' : 'Mute';
+    if (document.activeElement !== $('#vol')) $('#vol').value = Math.round((p.vol ?? 1) * 100);
+    const many = (p.sources || []).length > 1; $('#srcBox').classList.toggle('hidden', !many);
+    $('#srcLabel').textContent = p.live ? 'Backup feed' : 'Version';
+    if (many && document.activeElement !== $('#src')) { $('#src').innerHTML = p.sources.map((s) => `<option value="${s.id}">${esc(s.label)}</option>`).join(''); $('#src').value = p.src; }
+  }
+  let pollT;
+  async function poll() { clearTimeout(pollT); if (tab === 'remote' && !document.hidden) { try { render(await call('/r/state')); } catch (e) { if (e.message === 'pair') return; } } pollT = setTimeout(poll, 1000); }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+
+  const card = (x, poster) => `<button class="item ${poster ? 'poster' : ''}" data-k="${x.k}" data-id="${x.id}" data-sid="${x.sid ?? ''}"><div class="img" style="background-image:url('${esc((x.img || '').replace(/'/g, ''))}')">${x.pct ? `<div class="bar" style="width:${Math.round(x.pct * 100)}%"></div>` : ''}</div><div class="t">${esc(x.title)}${x.sub || x.year ? `<small>${esc(x.sub || x.year)}</small>` : ''}</div></button>`;
+  function wirePlay(root) { root.querySelectorAll('.item').forEach((b) => (b.onclick = async () => { await call('/r/play', { k: b.dataset.k, id: +b.dataset.id, sid: b.dataset.sid ? +b.dataset.sid : null }).catch(() => {}); show('remote'); poll(); })); }
+  async function loadHome() {
+    try { const h = await call('/r/home'); $('#cont').innerHTML = h.cont.length ? h.cont.map((x) => card(x)).join('') : '<p class="muted">Nothing in progress.</p>';
+      const favs = h.favs || []; $('#hf').classList.toggle('hidden', !favs.length); $('#favs').innerHTML = favs.map((x) => card(x)).join('');
+      $('#mine').innerHTML = h.list.length ? h.list.map((x) => card(x, true)).join('') : '<p class="muted">Your list is empty.</p>'; wirePlay($('#contView')); } catch {}
+  }
+  let qt; $('#q').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(async () => {
+    const q = $('#q').value.trim(); if (q.length < 2) { $('#rm').innerHTML = $('#rs').innerHTML = $('#rl').innerHTML = ''; $('#hm').classList.add('hidden'); $('#hs').classList.add('hidden'); $('#hl').classList.add('hidden'); return; }
+    try { const r = await call('/r/search?q=' + encodeURIComponent(q));
+      const lv = r.live || [];
+      $('#rl').innerHTML = lv.map((x) => card(x)).join('');
+      $('#rm').innerHTML = r.movies.map((x) => card(x, true)).join(''); $('#rs').innerHTML = r.series.map((x) => card(x, true)).join('');
+      $('#hl').classList.toggle('hidden', !lv.length); $('#hm').classList.toggle('hidden', !r.movies.length); $('#hs').classList.toggle('hidden', !r.series.length); wirePlay($('#searchView')); } catch {}
+  }, 300); });
+
+  if (!token) showPair(); else { show('remote'); poll(); }
+})();
+</script>
+</body>
+</html>
