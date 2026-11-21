@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://tpzz759.github.io/phosphor/sitemap.xml
