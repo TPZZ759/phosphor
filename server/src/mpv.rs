@@ -238,6 +238,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
     }
 
     let use_vsr = mpv_vsr && !hdr && dv == 0 && (live || (vh > 0 && vh < 1800));
+    let is_native_4k = vh >= 1800 || vw >= 3600;
     let mut a: Vec<String> = vec![
         url,
         "--no-config".into(),
@@ -249,11 +250,19 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         "--gpu-api=d3d11".into(),
         "--profile=high-quality".into(),
         if use_vsr { "--hwdec=d3d11va".into() } else { "--hwdec=auto-safe".into() },
+        // Hardware-fused bilinear chroma scaling avoids extra 4K VRAM passes (polar ewa_lanczossharp
+        // or 2-pass spline36 spike 20-30ms when the GPU downclocks to P3/P5); native 4K luma is 1:1.
+        "--cscale=bilinear".into(),
+        "--dscale=bilinear".into(),
+        if is_native_4k { "--scale=bilinear".into() } else { "--scale=ewa_lanczossharp".into() },
         // OLED True Black core: infinite contrast (0-nit black floor) + full 0-255 range
         "--target-contrast=inf".into(),
         "--video-output-levels=full".into(),
         "--background-color=#000000".into(),
-        "--video-sync=display-resample".into(),
+        // Audio-clock sync + 3-frame swapchain prevents mixed-Hz multi-monitor DWM focus jitter
+        // from snowballing into frame drops while keeping crisp 240Hz / integer cadence.
+        "--video-sync=audio".into(),
+        "--swapchain-depth=3".into(),
         "--interpolation=no".into(),
         format!("--user-agent={}", app.cfg.str("userAgent")),
         format!("--input-ipc-server={PIPE}"),
@@ -290,7 +299,14 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         a.push("--target-colorspace-hint-mode=target".into());
         a.push("--target-trc=pq".into());
         a.push("--target-prim=bt.2020".into());
-        a.push("--hdr-compute-peak=yes".into());
+        if dv > 0 {
+            // Dolby Vision already supplies per-frame dynamic metadata; skip redundant 4K compute passes.
+            a.push("--hdr-compute-peak=no".into());
+        } else {
+            a.push("--hdr-compute-peak=auto".into());
+            a.push("--allow-delayed-peak-detect=yes".into());
+        }
+        a.push("--hdr-contrast-recovery=0".into());
         a.push("--tone-mapping=bt.2390".into());
         a.push("--gamut-mapping-mode=perceptual".into());
         if !oled_peak.is_empty() && oled_peak != "auto" {
@@ -302,7 +318,13 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         a.push("--target-colorspace-hint=no".into());
         a.push("--d3d11-output-csp=srgb".into());
         a.push("--target-trc=gamma2.2".into());
-        a.push("--hdr-compute-peak=yes".into());
+        if dv > 0 {
+            a.push("--hdr-compute-peak=no".into());
+        } else {
+            a.push("--hdr-compute-peak=auto".into());
+            a.push("--allow-delayed-peak-detect=yes".into());
+        }
+        a.push("--hdr-contrast-recovery=0".into());
         a.push("--tone-mapping=bt.2390".into());
         a.push("--gamut-mapping-mode=perceptual".into());
         a.push("--deband=no".into());
@@ -329,7 +351,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
             }
             if is_anime && mpv_anime_sharp {
                 a.push("--scale=ewa_lanczossharp".into());
-                a.push("--cscale=ewa_lanczossharp".into());
+                a.push("--cscale=bilinear".into());
                 a.push("--sharpen=0.15".into());
             }
         }
@@ -351,7 +373,6 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
     let osd_script = root.join("mpv-scripts").join("tv_osd.lua");
     let shader_dir = root.join("mpv-shaders");
     let has_osd = osd_script.is_file();
-    let is_native_4k = vh >= 1800 || vw >= 3600;
     let shader_preset = if !shader_dir.is_dir() || mpv_shaders == "off" || use_vsr || is_native_4k {
         "off"
     } else if is_anime {
