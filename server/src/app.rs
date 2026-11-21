@@ -64,9 +64,16 @@ impl App {
 
     /// Card JSON for a catalogue item, optionally enriched with a TMDB result object.
     pub fn card(&self, it: &Item, tm: Option<&Value>) -> Value {
+        let cam_only = it.cam && it.variants.iter().all(|v| v.cam);
+        let has_uhd = (!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd);
+        let has_dv = (!it.cam && it.dv) || it.variants.iter().any(|v| !v.cam && v.dv);
+        let has_bluray = (!it.cam && it.bluray) || it.variants.iter().any(|v| !v.cam && v.bluray);
         let mut c = json!({ "k": it.k, "id": it.id, "tmdb": it.tmdb, "title": it.title, "year": it.year,
             "poster": it.poster.replace("/t/p/w600_and_h900_bestv2/", "/t/p/w342/"), "backdrop": it.backdrop, "rating": it.rating,
-            "uhd": it.uhd || it.variants.iter().any(|v| v.uhd) });
+            "uhd": has_uhd });
+        if has_dv { c["dv"] = json!(true); }
+        if has_bluray { c["bluray"] = json!(true); }
+        if cam_only { c["cam"] = json!(true); }
         if let Some(tm) = tm {
             if let Some(b) = tm["backdrop_path"].as_str() { if !b.is_empty() { c["backdrop"] = json!(tmdb_img(b, "w1280")); } }
             if let Some(p) = tm["poster_path"].as_str() { if !p.is_empty() { c["poster"] = json!(tmdb_img(p, "w342")); } }

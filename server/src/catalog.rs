@@ -9,7 +9,14 @@ use std::path::{Path, PathBuf};
 pub const RAW: [&str; 6] = ["get_live_categories", "get_vod_categories", "get_series_categories", "get_live_streams", "get_vod_streams", "get_series"];
 
 #[derive(Clone, Debug, Default)]
-pub struct Variant { pub id: i64, pub uhd: bool }
+pub struct Variant {
+    pub id: i64,
+    pub uhd: bool,
+    pub cam: bool,
+    pub dv: bool,
+    pub bluray: bool,
+    pub dolby_audio: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Item {
@@ -28,6 +35,10 @@ pub struct Item {
     pub en: bool,
     pub sport: bool,
     pub uhd: bool,
+    pub cam: bool,
+    pub dv: bool,
+    pub bluray: bool,
+    pub dolby_audio: bool,
     pub trailer: String,
     pub genre: String,
     pub plot: String,
@@ -138,31 +149,42 @@ impl Catalog {
         let t0 = std::time::Instant::now();
         let dir = Self::raw_dir(data);
         let mut c = Catalog::default();
+        let mut raw_cats: HashMap<String, String> = HashMap::new();
         for (kind, file) in [("live", "get_live_categories"), ("movie", "get_vod_categories"), ("series", "get_series_categories")] {
             for x in read(&dir, file).as_array().into_iter().flatten() {
                 let raw = s(&x["category_name"]); let name = clean_cat(&raw);
                 let (en, sport) = if kind == "live" { (is_en_live(&name), is_sport_live(&name)) } else { (is_en_vod(&name), is_sport_vod(&name)) };
                 let id = s(&x["category_id"]);
-                c.cats.insert(format!("{kind}:{id}"), Cat { id, kind, name, en, sport, uhd: is_uhd(&raw), count: 0 });
+                let key = format!("{kind}:{id}");
+                raw_cats.insert(key.clone(), raw.clone());
+                c.cats.insert(key, Cat { id, kind, name, en, sport, uhd: is_uhd(&raw), count: 0 });
             }
         }
         // movies
         let vod = read(&dir, "get_vod_streams");
         for v in vod.as_array().into_iter().flatten() {
             let cat_id = s(&v["category_id"]);
-            let Some(cat) = c.cats.get_mut(&format!("movie:{cat_id}")) else { continue };
+            let cat_key = format!("movie:{cat_id}");
+            let Some(cat) = c.cats.get_mut(&cat_key) else { continue };
             cat.count += 1;
-            let cl = clean_title(&s(&v["name"]));
+            let raw_name = s(&v["name"]);
+            let raw_cat = raw_cats.get(&cat_key).map(String::as_str).unwrap_or("");
+            let cl = clean_title(&raw_name);
             let tm = s(&v["tmdb"]); let tm = if tm.is_empty() || tm == "0" { None } else { Some(tm) };
+            let cam = crate::showcase::is_cam_release(&raw_name, raw_cat);
+            let dv = !cam && crate::showcase::is_dv_tag(&raw_name, raw_cat);
+            let bluray = !cam && crate::showcase::is_bluray_tag(&raw_name, raw_cat);
+            let dolby_audio = !cam && crate::showcase::is_dolby_audio_tag(&raw_name, raw_cat);
+            let uhd = !cam && (cat.uhd || dv || crate::showcase::is_uhd_tag(&raw_name, raw_cat));
             let it = Item { k: "m", id: i(&v["stream_id"]), title: cl.title, year: cl.year, origin: cl.origin, poster: s(&v["stream_icon"]), rating: rating(&v["rating"]),
                 tmdb: tm, added: i(&v["added"]), cat: cat_id, ext: { let e = s(&v["container_extension"]); if e.is_empty() { "mp4".into() } else { e } },
-                en: cat.en, sport: cat.sport, uhd: cat.uhd, trailer: s(&v["trailer"]), ..Default::default() };
+                en: cat.en, sport: cat.sport, uhd, cam, dv, bluray, dolby_audio, trailer: s(&v["trailer"]), ..Default::default() };
             c.movie_raw.insert(it.id, it.clone());
             if it.en { if let Some(t) = it.tmdb.clone() {
                 if let Some(&ix) = c.movie_by_tmdb.get(&t) {
                     let prev = &mut c.movies[ix];
-                    prev.variants.push(Variant { id: it.id, uhd: it.uhd });
-                    if prev.uhd && !it.uhd { swap_primary(prev, &it); }
+                    prev.variants.push(Variant { id: it.id, uhd: it.uhd, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio });
+                    if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
                     prev.added = prev.added.max(it.added);
                     continue;
                 }
@@ -175,22 +197,30 @@ impl Catalog {
         let ser = read(&dir, "get_series");
         for x in ser.as_array().into_iter().flatten() {
             let cat_id = s(&x["category_id"]);
-            let Some(cat) = c.cats.get_mut(&format!("series:{cat_id}")) else { continue };
+            let cat_key = format!("series:{cat_id}");
+            let Some(cat) = c.cats.get_mut(&cat_key) else { continue };
             cat.count += 1;
-            let cl = clean_title(&s(&x["name"]));
+            let raw_name = s(&x["name"]);
+            let raw_cat = raw_cats.get(&cat_key).map(String::as_str).unwrap_or("");
+            let cl = clean_title(&raw_name);
             let rd = s(&x["releaseDate"]);
             let tm = s(&x["tmdb"]); let tm = if tm.is_empty() || tm == "0" { None } else { Some(tm) };
+            let cam = crate::showcase::is_cam_release(&raw_name, raw_cat);
+            let dv = !cam && crate::showcase::is_dv_tag(&raw_name, raw_cat);
+            let bluray = !cam && crate::showcase::is_bluray_tag(&raw_name, raw_cat);
+            let dolby_audio = !cam && crate::showcase::is_dolby_audio_tag(&raw_name, raw_cat);
+            let uhd = !cam && (cat.uhd || dv || crate::showcase::is_uhd_tag(&raw_name, raw_cat));
             let it = Item { k: "s", id: i(&x["series_id"]), title: cl.title, origin: cl.origin,
                 year: cl.year.or_else(|| rd.get(0..4).and_then(|y| y.parse().ok())), poster: s(&x["cover"]),
                 backdrop: x["backdrop_path"].as_array().and_then(|a| a.first()).map(s).unwrap_or_default(),
                 rating: rating(&x["rating"]), tmdb: tm, added: i(&x["last_modified"]), cat: cat_id, genre: s(&x["genre"]), plot: s(&x["plot"]),
-                en: cat.en, sport: cat.sport, uhd: cat.uhd, ..Default::default() };
+                en: cat.en, sport: cat.sport, uhd, cam, dv, bluray, dolby_audio, ..Default::default() };
             c.series_raw.insert(it.id, it.clone());
             if it.en { if let Some(t) = it.tmdb.clone() {
                 if let Some(&ix) = c.series_by_tmdb.get(&t) {
                     let prev = &mut c.series[ix];
-                    prev.variants.push(Variant { id: it.id, uhd: it.uhd });
-                    if prev.uhd && !it.uhd { swap_primary(prev, &it); }
+                    prev.variants.push(Variant { id: it.id, uhd: it.uhd, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio });
+                    if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
                     prev.added = prev.added.max(it.added);
                     continue;
                 }
@@ -292,8 +322,9 @@ impl Catalog {
 fn rating(v: &Value) -> f64 { let mut n = num(v); if n > 10.0 { n /= 10.0; } (n * 10.0).round() / 10.0 }
 
 fn swap_primary(prev: &mut Item, it: &Item) {
-    let keep = Variant { id: prev.id, uhd: prev.uhd };
-    prev.id = it.id; prev.cat = it.cat.clone(); prev.ext = it.ext.clone(); prev.uhd = it.uhd;
+    let keep = Variant { id: prev.id, uhd: prev.uhd, cam: prev.cam, dv: prev.dv, bluray: prev.bluray, dolby_audio: prev.dolby_audio };
+    prev.id = it.id; prev.cat = it.cat.clone(); prev.ext = it.ext.clone();
+    prev.uhd = it.uhd; prev.cam = it.cam; prev.dv = it.dv; prev.bluray = it.bluray; prev.dolby_audio = it.dolby_audio;
     if !it.poster.is_empty() { prev.poster = it.poster.clone(); }
     if !it.trailer.is_empty() { prev.trailer = it.trailer.clone(); }
     if !it.backdrop.is_empty() { prev.backdrop = it.backdrop.clone(); }

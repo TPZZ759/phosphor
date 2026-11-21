@@ -27,7 +27,9 @@ pub fn hidden_by(hide: &[String], g: &[i64], l: &str, cat: &str, kw: &[i64], sta
     })
 }
 fn standup_kw(app: &App) -> HashSet<i64> { app.kw_cache.lock().unwrap().iter().filter(|(k, _)| k.starts_with("stand")).filter_map(|(_, v)| *v).collect() }
+pub fn hide_cams_enabled(app: &App) -> bool { app.state.read(|st| st["prefs"]["hideCams"].as_bool().unwrap_or(true)) }
 pub fn hidden_item(app: &App, it: &Item) -> bool {
+    if hide_cams_enabled(app) && crate::showcase::is_cam_only(app, it) { return true; }
     let hide = hide_prefs(app); if hide.is_empty() { return false; }
     let m = app.meta_of(it).unwrap_or_default();
     let cat = app.catalog().cat_name(if it.k == "s" { "series" } else { "movie" }, &it.cat);

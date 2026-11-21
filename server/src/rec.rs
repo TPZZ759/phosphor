@@ -33,6 +33,7 @@ pub fn match_results(app: &App, results: &[Value], kind: Option<&str>, limit: us
         }
         let it = match mt { "tv" => cat.by_tmdb("tv", &id), "movie" => cat.by_tmdb("movie", &id), _ => None };
         let Some(it) = it else { continue };
+        if crate::discover::hide_cams_enabled(app) && crate::showcase::is_cam_only(app, it) { continue; }
         if !seen.insert(format!("{}{}", it.k, it.id)) { continue; }
         out.push(app.card(it, Some(r)));
         if out.len() >= limit { break; }

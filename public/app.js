@@ -113,6 +113,14 @@ const viewToggleHTML = (mode) => `<div class="view-seg" role="group" aria-label=
   <button type="button" data-vmode="list" class="${mode === 'list' ? 'on' : ''}" title="Detailed data view">☰ Data</button>
 </div>`;
 
+function qualityBadgeHTML(it) {
+  if (it.cam || it.camOnly) return '<span class="badge-cam" title="CAM / Telesync rip">CAM</span>';
+  if (it.dv || it.isDv || it.qualityLabel === '4K DV') return '<span class="badge4k dv" title="4K Dolby Vision">4K DV</span>';
+  if (it.uhd || it.qualityTier >= 3) return '<span class="badge4k">4K</span>';
+  if (it.bluray || it.isBluray || it.qualityLabel === 'Blu-Ray') return '<span class="badge4k br" title="Blu-Ray Master">BLU-RAY</span>';
+  return '';
+}
+
 function poster(it) {
   const k = remember(it);
   const img = it.poster ? `<img src="${esc(it.poster)}" alt="" loading="lazy" onerror="this.remove()">` : '';
@@ -121,9 +129,11 @@ function poster(it) {
   const topLeft = it.dubStatus === 'yes'
     ? '<span class="badge-dub" title="Confirmed English dubbed audio">DUB</span>'
     : (it.isDoc && location.hash.indexOf('#/docs') !== 0 ? '<span class="badge-doc" title="Documentary">DOC</span>' : '');
+  const qBadge = qualityBadgeHTML(it);
+  const upgBadge = it.upgradeBadge ? `<span class="badge-upg" title="Recently upgraded">${esc(it.upgradeBadge)}</span>` : '';
   return `<div class="card" tabindex="0" data-open="${k}" role="button" aria-label="${esc(it.title)}">
     <div class="fallback">${esc(it.title)}</div>${img}
-    ${topLeft}${it.uhd ? '<span class="badge4k">4K</span>' : ''}${it.k === 'x' ? `<span class="badge-ext">${it.wanted ? '🔔 Alert set' : it.release && new Date(it.release) > Date.now() ? new Date(it.release).toLocaleDateString([], { day: 'numeric', month: 'short' }) : 'Not in library'}</span>` : ''}
+    ${topLeft}${qBadge}${upgBadge}${it.k === 'x' ? `<span class="badge-ext">${it.wanted ? '🔔 Alert set' : it.release && new Date(it.release) > Date.now() ? new Date(it.release).toLocaleDateString([], { day: 'numeric', month: 'short' }) : 'Not in library'}</span>` : ''}
     <div class="cap"><div class="cap-title">${esc(it.title)}</div>
       <div class="cap-meta">${it.year ? `<span>${it.year}</span>` : ''}${it.rating ? `<span class="star" title="${it.votes ? `${it.votes.toLocaleString()} votes` : ''}">★ ${(+it.rating).toFixed(1)}</span>` : ''}${dur ? `<span>${esc(dur)}</span>` : ''}</div>
       ${subParts.length ? `<div class="cap-sub">${esc(subParts.join(' · '))}</div>` : ''}
@@ -139,19 +149,21 @@ function richCard(it) {
     it.rating ? `<span class="star">★ ${(+it.rating).toFixed(1)}${it.votes ? ` <span class="votes">(${fmtVotes(it.votes)})</span>` : ''}</span>` : '',
     it.scores?.imdb ? `<span class="rc-sc">IMDb ${esc(it.scores.imdb)}</span>` : '',
     it.scores?.rt ? `<span class="rc-sc">${parseInt(it.scores.rt, 10) >= 60 ? '🍅' : '🤢'} ${esc(it.scores.rt)}</span>` : '',
+    it.probedKbps ? `<span class="rc-sc">${Math.round(it.probedKbps / 1000)} Mbps${it.probedHdr ? ` · ${esc(it.probedHdr)}` : ''}</span>` : '',
     it.k === 's' && it.seasons ? `<span>${it.seasons} season${it.seasons === 1 ? '' : 's'}${it.status ? ` · ${esc(it.status)}` : ''}</span>` : (it.runtime ? `<span>${runtime(it.runtime)}</span>` : ''),
     it.country ? `<span>${esc(countryName(it.country))}</span>` : '',
     it.lang ? `<span>${esc(langName(it.lang) || it.lang.toUpperCase())}</span>` : '',
     it.versions > 1 ? `<span>${it.versions} copies</span>` : '',
   ].filter(Boolean).join('');
   const tags = [
+    ...(it.upgradeBadge ? [`<span class="rc-tag topic">${esc(it.upgradeBadge)}</span>`] : []),
     ...(it.docTopics || []).map((t) => `<span class="rc-tag topic">${esc(t)}</span>`),
     ...(it.genres || []).filter((g) => !(it.isDoc && g === 'Documentary')).slice(0, 5).map((g) => `<span class="rc-tag">${esc(g)}</span>`),
     ...(it.platforms || []).slice(0, 3).map((p) => `<span class="rc-tag plat">${esc(p)}</span>`),
   ].join('');
   const topLeft = it.dubStatus === 'yes' ? '<span class="badge-dub">DUB</span>' : (it.isDoc ? '<span class="badge-doc">DOC</span>' : '');
   return `<article class="rc" data-open="${k}" tabindex="0" role="button">
-    <div class="rc-thumb">${img}${topLeft}${it.uhd ? '<span class="badge4k">4K</span>' : ''}</div>
+    <div class="rc-thumb">${img}${topLeft}${qualityBadgeHTML(it)}</div>
     <div class="rc-body">
       <div class="rc-top"><h3 class="rc-title">${esc(it.title)} ${it.year ? `<span class="rc-yr">(${it.year})</span>` : ''}</h3><span class="pill ${it.isDoc ? 'doc' : it.isAnime ? 'dub' : ''}">${esc(typeLabel)}</span></div>
       ${dataBits ? `<div class="rc-data">${dataBits}</div>` : ''}
@@ -785,6 +797,648 @@ async function pageAnime() {
   drawBody();
 }
 
+// ---------------------------------------------------------------- 4K OLED Showcase & CAM Watch (#/4k)
+let scState = { mode: 'curated', tier: 'all', kind: 'all', platform: '', genre: '', rmin: '', unwatched: false, sort: 'trending', q: '' };
+async function pageShowcase(qs) {
+  if (qs) {
+    const p = new URLSearchParams(qs);
+    if (p.get('tier')) { scState.mode = 'grid'; scState.tier = p.get('tier'); }
+    if (p.get('kind')) { scState.mode = 'grid'; scState.kind = p.get('kind'); }
+  }
+  const d = await api('/api/showcase').catch(() => null);
+  if (!d || !Array.isArray(d.rows)) {
+    view.innerHTML = '<div class="page-pad"><div class="page-head"><h1 class="page-title">4K OLED Showcase</h1></div><div class="empty">Loading showcase…</div></div>';
+    return;
+  }
+  const heroItems = d.hero || [];
+  const cnt = d.counts || {};
+  const platOpts = [['', 'All platforms'], ...(d.platforms || []).map((p) => [p.name.toLowerCase().replace(/[^a-z]/g, ''), `${p.name} (${p.count})`])];
+  const genreOpts = [['', 'All genres'], ...(d.genres || []).map((g) => [String(g.id), `${g.name} (${g.count})`])];
+  const scSorts = [['trending', 'Trending'], ['rating', 'Highest rated'], ['newest', 'Newest year'], ['added', 'Recently added'], ['tier', 'Highest quality (DV first)'], ['az', 'A–Z']];
+  const vmode = getViewMode();
+  view.innerHTML = heroHTML(heroItems) + `<div class="rows">
+    <div class="anime-bar">
+      <div class="anime-bar-row">
+        <div class="chips">
+          <button class="chip ${scState.mode === 'curated' ? 'on' : ''}" data-scmode="curated">Curated OLED</button>
+          <button class="chip ${scState.mode === 'grid' && scState.tier === 'all' ? 'on' : ''}" data-sctier="all">All 4K &amp; Blu-Ray <span class="chip-cnt">${(cnt.total || 0).toLocaleString()}</span></button>
+          <button class="chip ${scState.mode === 'grid' && scState.tier === 'dv' ? 'on' : ''}" data-sctier="dv">4K Dolby Vision <span class="chip-cnt">${(cnt.dv || 0).toLocaleString()}</span></button>
+          <button class="chip ${scState.mode === 'grid' && scState.tier === '4k' ? 'on' : ''}" data-sctier="4k">4K UHD <span class="chip-cnt">${(cnt.uhd4k || 0).toLocaleString()}</span></button>
+          <button class="chip ${scState.mode === 'grid' && scState.tier === 'bluray' ? 'on' : ''}" data-sctier="bluray">Blu-Ray Masters <span class="chip-cnt">${(cnt.bluray || 0).toLocaleString()}</span></button>
+          <button class="chip ${scState.mode === 'grid' && scState.tier === 'cam' ? 'on' : ''}" data-sctier="cam">CAM-Only Watch <span class="chip-cnt">${(cnt.camOnly || 0).toLocaleString()}</span></button>
+        </div>
+        <input type="search" class="explore-search" id="scQuery" placeholder="Search 4K Dolby Vision, HDR, Blu-Ray…" value="${esc(scState.q)}">
+        ${viewToggleHTML(vmode)}
+      </div>
+      <div class="anime-bar-row">
+        <div class="chips">
+          ${[['all', 'All'], ['movie', 'Movies'], ['tv', 'Series'], ['docs', 'Docs']].map(([k, l]) => `<button class="chip sm ${scState.kind === k && scState.mode === 'grid' ? 'on' : ''}" data-sckind="${k}">${l}</button>`).join('')}
+        </div>
+        ${sel('scPlat', platOpts, scState.platform)}
+        ${sel('scGenre', genreOpts, scState.genre)}
+        ${sel('scRating', RATINGS_DEEP, scState.rmin)}
+        ${sel('scSort', scSorts, scState.sort)}
+        <label class="tog"><input type="checkbox" id="scUnw" ${scState.unwatched ? 'checked' : ''}> Unwatched</label>
+        <button class="btn btn-ghost btn-sm" id="scReset">Reset</button>
+      </div>
+    </div>
+    <div id="scBody"></div><div id="scMore" class="more-sentinel"></div></div>`;
+  wireHero(heroItems, (i, h) => `${h.qualityLabel || '4K OLED'} Showcase${h.platforms?.[0] ? ` · ${h.platforms[0]}` : ''}`);
+
+  let page = 0; let loading = false; let done = false; let reqId = 0; let curItems = [];
+  const loadGrid = async (pg, reset) => {
+    if (loading && !reset) return;
+    loading = true; const my = ++reqId;
+    const body = $('#scBody'); if (!body) return;
+    if (reset) { page = 0; done = false; curItems = []; body.innerHTML = '<div class="browse-meta" id="scMeta">Loading…</div><div id="scItems" class="grid"></div>'; }
+    const q = new URLSearchParams({ tier: scState.tier, kind: scState.kind, sort: scState.sort, page: String(pg), limit: '60' });
+    if (scState.q.trim()) q.set('q', scState.q.trim());
+    if (scState.platform) q.set('platform', scState.platform);
+    if (scState.genre) q.set('genre', scState.genre);
+    if (scState.rmin) q.set('minRating', scState.rmin);
+    if (scState.unwatched) q.set('unwatched', '1');
+    try {
+      const r = await api(`/api/showcase/browse?${q}`);
+      if (my !== reqId || scState.mode !== 'grid') return;
+      const items = r.items || [];
+      curItems = reset ? items : curItems.concat(items);
+      const tc = r.tierCounts || {};
+      const stats = [`<b>${(r.total || 0).toLocaleString()}</b> ${scState.tier === 'cam' ? 'CAM-only releases' : 'verified 4K / Blu-Ray titles'}`];
+      if (scState.tier !== 'cam' && tc.dv) stats.push(`${tc.dv.toLocaleString()} Dolby Vision`);
+      if (scState.tier !== 'cam' && tc['4k']) stats.push(`${tc['4k'].toLocaleString()} 4K UHD`);
+      if (scState.tier !== 'cam' && tc.bluray) stats.push(`${tc.bluray.toLocaleString()} Blu-Ray`);
+      if ($('#scMeta')) $('#scMeta').innerHTML = `<div class="browse-stats">${stats.join(' · ')}</div>`;
+      const host = $('#scItems'); const mode = getViewMode();
+      if (host) {
+        if (reset) { host.className = mode === 'list' ? 'rich-list' : 'grid'; host.innerHTML = items.length ? items.map(mode === 'list' ? richCard : poster).join('') : '<div class="empty" style="grid-column:1/-1">No titles match those filters.</div>'; }
+        else host.insertAdjacentHTML('beforeend', items.map(mode === 'list' ? richCard : poster).join(''));
+      }
+      page = pg; done = !r.more;
+    } finally { if (my === reqId) loading = false; }
+  };
+  const syncActive = () => {
+    $$('[data-scmode]').forEach((b) => b.classList.toggle('on', scState.mode === 'curated'));
+    $$('[data-sctier]').forEach((b) => b.classList.toggle('on', scState.mode === 'grid' && b.dataset.sctier === scState.tier));
+    $$('[data-sckind]').forEach((b) => b.classList.toggle('on', scState.mode === 'grid' && b.dataset.sckind === scState.kind));
+  };
+  const drawBody = () => {
+    const body = $('#scBody'); if (!body) return;
+    if (scState.mode === 'curated') {
+      body.innerHTML = d.rows.map(renderRow).join('') || '<div class="empty">No 4K Showcase titles found yet.</div>';
+      wireRows();
+    } else loadGrid(0, true);
+  };
+  const io = new IntersectionObserver((es) => { if (es[0]?.isIntersecting && scState.mode === 'grid' && !done && !loading) loadGrid(page + 1, false); }, { rootMargin: '600px' });
+  const sen = $('#scMore'); if (sen) io.observe(sen);
+  $('[data-scmode="curated"]').onclick = () => { scState.mode = 'curated'; syncActive(); drawBody(); };
+  $$('[data-sctier]').forEach((b) => (b.onclick = () => { scState.mode = 'grid'; scState.tier = b.dataset.sctier; syncActive(); drawBody(); }));
+  $$('[data-sckind]').forEach((b) => (b.onclick = () => { scState.mode = 'grid'; scState.kind = b.dataset.sckind; syncActive(); drawBody(); }));
+  $('#scQuery').oninput = debounce((e) => { scState.q = e.target.value; scState.mode = 'grid'; syncActive(); drawBody(); }, 220);
+  $('#scPlat').onchange = (e) => { scState.platform = e.target.value; scState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#scGenre').onchange = (e) => { scState.genre = e.target.value; scState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#scRating').onchange = (e) => { scState.rmin = e.target.value; scState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#scSort').onchange = (e) => { scState.sort = e.target.value; scState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#scUnw').onchange = (e) => { scState.unwatched = e.target.checked; scState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#scReset').onclick = () => { scState = { mode: 'curated', tier: 'all', kind: 'all', platform: '', genre: '', rmin: '', unwatched: false, sort: 'trending', q: '' }; pageShowcase(); };
+  $$('[data-vmode]', view).forEach((b) => (b.onclick = () => {
+    setViewMode(b.dataset.vmode);
+    $$('[data-vmode]', view).forEach((x) => x.classList.toggle('on', x === b));
+    if (scState.mode === 'grid' && curItems.length) {
+      const host = $('#scItems'); const mode = getViewMode();
+      if (host) { host.className = mode === 'list' ? 'rich-list' : 'grid'; host.innerHTML = curItems.map(mode === 'list' ? richCard : poster).join(''); }
+    } else { scState.mode = 'grid'; syncActive(); drawBody(); }
+  }));
+  drawBody();
+}
+
+// ---------------------------------------------------------------- UFC & Sports Replays Hub (#/fights)
+let fightState = { mode: 'curated', sport: 'ufc', fighter: '', year: '', q: '', unwatched: false, sort: 'latest' };
+const ufcSpoilerFree = () => localGet('ufcSpoilerFree', '0') === '1';
+
+function playFightReplay(f, fresh = false) {
+  const sf = ufcSpoilerFree();
+  Player.open({
+    kind: 'movie', id: f.id, ext: f.ext || 'mp4',
+    title: f.title || f.cleanTitle || 'Fight Replay',
+    sub: [f.matchup || f.sportLabel, f.dateStr || f.year].filter(Boolean).join(' · '),
+    resume: fresh ? 0 : (f.progress < 0.92 ? (f.resume || 0) : 0),
+    duration: f.duration || 0,
+    spoilerFree: sf && (f.sportKey === 'ufc' || f.sportKey === 'boxing'),
+    progressKey: `m:${f.id}`, tmdb: f.tmdb || null, historyKind: 'm', historyTitle: f.title,
+    item: { k: 'm', id: f.id, title: f.title, year: f.year, poster: f.poster, backdrop: f.backdrop },
+    label: f.cat || f.sportLabel || 'Main',
+    alternates: (f.alternates || []).map((a) => ({ id: a.id, ext: a.ext, label: a.label })),
+  });
+}
+
+async function openFightCardModal(f) {
+  openModal(`<div class="sheet" style="max-width:740px"><button class="close" aria-label="Close">${I.close}</button>
+    <div class="sheet-section" style="padding:28px 32px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="fbadge ppv">${esc(f.eventNum ? `UFC ${f.eventNum}` : (f.sportLabel || 'UFC'))}</span>
+        <span class="spoiler-bar">🛡️ 100% Spoiler-Free Card — Zero results shown</span>
+      </div>
+      <h2 style="margin:12px 0 4px">${esc(f.title || f.cleanTitle)}</h2>
+      <div class="muted" id="fcMeta">${esc(f.matchup || '')}${f.dateStr ? ` · ${esc(f.dateStr)}` : ''}</div>
+      <div class="btns" style="margin-top:14px">
+        <button class="btn btn-primary btn-sm" id="fcPlay">${I.play}${f.resume > 30 && f.progress < 0.92 && !ufcSpoilerFree() ? `Resume (${fmtTime(f.resume)})` : 'Watch Replay'}</button>
+        ${f.resume > 30 ? '<button class="btn btn-ghost btn-sm" id="fcRestart">⟲ Start from beginning</button>' : ''}
+      </div>
+      <div id="fcBody" style="margin-top:18px"><p class="muted">Loading spoiler-free fight card lineup…</p></div>
+    </div></div>`);
+  $('#fcPlay').onclick = () => { closeModal(true); playFightReplay(f, false); };
+  if ($('#fcRestart')) $('#fcRestart').onclick = () => { closeModal(true); playFightReplay(f, true); };
+  const r = await api(`/api/fights/card/${f.id}`).catch(() => null);
+  const body = $('#fcBody'); if (!body || !body.isConnected) return;
+  if (!r || !r.found || !r.bouts?.length) {
+    body.innerHTML = `<div class="empty" style="padding:20px 0">No bout-by-bout card published on ESPN for this event yet — hit <b>Watch Replay</b> above to jump straight into the broadcast!</div>`;
+    return;
+  }
+  if ($('#fcMeta')) $('#fcMeta').textContent = [r.sydneyDate || r.date, r.venue].filter(Boolean).join(' · ');
+  body.innerHTML = `<div class="bout-list">${r.bouts.map((b) => `<div class="bout-row ${b.isMainEvent ? 'main' : ''}">
+    <div class="bout-sec">${esc(b.section || b.card || 'Bout')}</div>
+    <div><div class="bout-vs">${esc(b.fighterA)} <span class="muted">vs.</span> ${esc(b.fighterB)}${b.isTitle ? ' <span class="pill uhd" style="margin-left:6px">TITLE</span>' : ''}</div>
+      ${b.weightClass ? `<div class="bout-wc">${esc(b.weightClass)}</div>` : ''}</div>
+    <span class="bout-rds">${b.rounds || 3} Rds</span>
+  </div>`).join('')}</div>`;
+}
+
+const FIGHT_ITEMS = new Map();
+function fightCardHTML(f) {
+  const fk = `f:${f.id}`;
+  FIGHT_ITEMS.set(fk, f);
+  const sf = ufcSpoilerFree();
+  const img = f.backdrop || f.poster;
+  const tag = f.eventNum && f.eventKind === 'ppv' ? `<span class="fbadge ppv">UFC ${f.eventNum}</span>`
+    : f.eventKind === 'fn' ? `<span class="fbadge">${f.eventNum ? `Fight Night ${f.eventNum}` : 'Fight Night'}</span>`
+    : `<span class="fbadge">${esc(f.sportLabel || 'Replay')}</span>`;
+  const showProg = !sf && f.progress > 0.02 && f.progress < 0.94;
+  return `<article class="fcard" data-fight-play="${fk}" tabindex="0" role="button">
+    <div class="fcard-thumb">
+      <div class="fcard-ph">${esc(f.eventNum ? `UFC ${f.eventNum}` : (f.sportLabel || 'UFC'))}</div>
+      ${img ? `<img src="${esc(img)}" alt="" loading="lazy" onerror="this.remove()">` : ''}
+      <div class="fcard-badges">${tag}${f.isAnz ? '<span class="fbadge anz">ANZ</span>' : ''}${f.watched ? '<span class="fbadge watched">✓ Watched</span>' : ''}</div>
+      ${showProg ? `<div class="bar"><i style="width:${Math.min(100, Math.round(f.progress * 100))}%"></i></div>` : ''}
+    </div>
+    <div class="fcard-body">
+      <div class="fcard-title">${esc(f.cleanTitle || f.title)}</div>
+      ${f.matchup ? `<div class="fcard-match">${esc(f.matchup)}</div>` : ''}
+      <div class="fcard-meta">${f.dateStr ? `<span>${esc(f.dateStr)}</span>` : (f.year ? `<span>${f.year}</span>` : '')}${f.variantCount > 1 ? `<span>${f.variantCount} feeds</span>` : ''}${!sf && f.resume > 30 && !f.watched ? `<span>${fmtTime(f.resume)} watched</span>` : ''}</div>
+      <div class="fcard-acts">
+        <button class="btn btn-primary btn-sm" data-fight-play="${fk}">${I.play}${!sf && f.resume > 30 && !f.watched ? 'Resume' : 'Watch'}</button>
+        ${f.sportKey === 'ufc' ? `<button class="btn btn-ghost btn-sm" data-fight-card="${fk}">🥊 Fight Card</button>` : ''}
+      </div>
+    </div>
+  </article>`;
+}
+
+async function pageFights(qs) {
+  if (qs) {
+    const p = new URLSearchParams(qs);
+    if (p.get('sport')) { fightState.mode = 'grid'; fightState.sport = p.get('sport'); }
+    if (p.get('fighter')) { fightState.mode = 'grid'; fightState.fighter = p.get('fighter'); }
+  }
+  const d = await api('/api/fights').catch(() => null);
+  if (!d || !Array.isArray(d.rows)) {
+    view.innerHTML = '<div class="page-pad"><div class="page-head"><h1 class="page-title">UFC &amp; Sports Replays</h1></div><div class="empty">Loading fight library…</div></div>';
+    return;
+  }
+  const h = d.hero;
+  const cnt = d.counts || {};
+  const sf = ufcSpoilerFree();
+  if (h) FIGHT_ITEMS.set(`f:${h.id}`, h);
+  const heroBg = h?.backdrop || h?.poster || '';
+  const heroHtml = h ? `<section class="hero" style="min-height:420px;height:min(62vh,560px)">
+    <div class="hero-slide on">${heroBg ? `<img src="${esc(heroBg)}" alt="" onerror="this.remove()">` : ''}</div>
+    <div class="hero-info">
+      <div class="hero-kicker">🥊 Latest UFC PPV Replay · ${cnt.ufc || 0} UFC Events Ready</div>
+      <h1 class="hero-title">${esc(h.cleanTitle || h.title)}</h1>
+      <div class="hero-meta">${h.matchup ? `<b style="color:var(--accent)">${esc(h.matchup)}</b>` : ''}${h.dateStr ? `<span>${esc(h.dateStr)}</span>` : (h.year ? `<span>${h.year}</span>` : '')}${h.variantCount > 1 ? `<span class="pill">${h.variantCount} backup feeds</span>` : ''}${h.isAnz ? '<span class="pill" style="border-color:#3ddc97;color:#7af2be">Aussie / Kiwi Headliner</span>' : ''}</div>
+      <div class="btns">
+        <button class="btn btn-primary" id="fhPlay">${I.play}Watch Replay</button>
+        <button class="btn btn-ghost" id="fhCard">🥊 Spoiler-Free Fight Card</button>
+        <button class="btn btn-ghost" id="fhSpoiler">${sf ? '🛡️ Spoiler-Free: ON' : '🛡️ Spoiler-Free: OFF'}</button>
+        <a class="btn btn-ghost" href="#/radar">📅 Upcoming UFC Schedule</a>
+      </div>
+    </div>
+  </section>` : '<div class="page-pad"></div>';
+
+  const sportTabs = [
+    ['ufc', 'UFC All', cnt.ufc], ['ppv', 'UFC PPVs', cnt.ppv], ['fn', 'Fight Nights', cnt.fn], ['anz', 'Aussie & Kiwi', cnt.anz],
+    ['boxing', 'Boxing', cnt.boxing], ['f1', 'Formula 1', cnt.f1], ['rugby', 'Rugby', cnt.rugby], ['afl', 'AFL', cnt.afl],
+    ['nba', 'NBA', cnt.nba], ['nfl', 'NFL', cnt.nfl], ['football', 'Football', cnt.football], ['wwe', 'WWE', cnt.wwe],
+  ].filter(([, , n]) => (n || 0) > 0);
+  const yrOpts = [['', 'All years'], ...(d.years || []).map((y) => [String(y), String(y)])];
+  const fSorts = [['latest', 'Latest first'], ['num_desc', 'UFC # High → Low'], ['num_asc', 'UFC # Low → High'], ['oldest', 'Oldest first'], ['title', 'A–Z']];
+
+  view.innerHTML = heroHtml + `<div class="rows">
+    <div class="anime-bar">
+      <div class="anime-bar-row">
+        <div class="chips">
+          <button class="chip ${fightState.mode === 'curated' ? 'on' : ''}" data-fmode="curated">Curated</button>
+          ${sportTabs.map(([k, l, n]) => `<button class="chip ${fightState.mode === 'grid' && fightState.sport === k ? 'on' : ''}" data-fsport="${k}">${esc(l)} <span class="chip-cnt">${(n || 0).toLocaleString()}</span></button>`).join('')}
+        </div>
+        <input type="search" class="explore-search" id="fQuery" placeholder="Search fighter, UFC #, team (e.g. 322, Volkanovski)…" value="${esc(fightState.q)}">
+      </div>
+      ${(d.topFighters || []).length ? `<div class="anime-bar-row">
+        <span class="muted" style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em">Fighters:</span>
+        <button class="chip sm ${!fightState.fighter && fightState.mode === 'grid' ? 'on' : ''}" data-ffighter="">All</button>
+        ${d.topFighters.slice(0, 16).map((f) => `<button class="chip sm ${fightState.fighter === f.name ? 'on' : ''}" data-ffighter="${esc(f.name)}">${esc(f.name)} <span class="chip-cnt">${f.count}</span></button>`).join('')}
+      </div>` : ''}
+      <div class="anime-bar-row">
+        ${sel('fYear', yrOpts, fightState.year)}
+        ${sel('fSort', fSorts, fightState.sort)}
+        <label class="tog"><input type="checkbox" id="fUnw" ${fightState.unwatched ? 'checked' : ''}> Unwatched only</label>
+        <label class="tog"><input type="checkbox" id="fSpoil" ${sf ? 'checked' : ''}> 🛡️ Spoiler-free mode (hide runtime &amp; progress bars)</label>
+        <button class="btn btn-ghost btn-sm" id="fReset">Reset</button>
+      </div>
+    </div>
+    <div id="fightsBody"></div><div id="fightsMore" class="more-sentinel"></div></div>`;
+
+  if (h) {
+    $('#fhPlay').onclick = () => playFightReplay(h);
+    $('#fhCard').onclick = () => openFightCardModal(h);
+    $('#fhSpoiler').onclick = () => {
+      const next = !ufcSpoilerFree();
+      localSet('ufcSpoilerFree', next ? '1' : '0');
+      post('/api/prefs', { ufcSpoilerFree: next }).catch(() => {});
+      toast(next ? 'Spoiler-Free UFC mode ON (runtimes & progress bars hidden)' : 'Spoiler-Free UFC mode OFF');
+      pageFights();
+    };
+  }
+
+  let page = 0; let loading = false; let done = false; let reqId = 0;
+  const loadGrid = async (pg, reset) => {
+    if (loading && !reset) return;
+    loading = true; const my = ++reqId;
+    const body = $('#fightsBody'); if (!body) return;
+    if (reset) { page = 0; done = false; body.innerHTML = '<div class="browse-meta" id="fMeta">Loading…</div><div id="fItems" class="fight-grid"></div>'; }
+    const q = new URLSearchParams({ sport: fightState.sport, sort: fightState.sort, page: String(pg), limit: '60' });
+    if (fightState.fighter) q.set('fighter', fightState.fighter);
+    if (fightState.year) q.set('year', fightState.year);
+    if (fightState.q.trim()) q.set('q', fightState.q.trim());
+    if (fightState.unwatched) q.set('unwatched', '1');
+    try {
+      const r = await api(`/api/fights/browse?${q}`);
+      if (my !== reqId || fightState.mode !== 'grid') return;
+      const items = r.items || [];
+      if ($('#fMeta')) $('#fMeta').innerHTML = `<div class="browse-stats"><b>${(r.total || 0).toLocaleString()}</b> replay${r.total === 1 ? '' : 's'}${fightState.fighter ? ` featuring <b>${esc(fightState.fighter)}</b>` : ''}</div>`;
+      const host = $('#fItems');
+      if (host) {
+        if (reset) host.innerHTML = items.length ? items.map(fightCardHTML).join('') : '<div class="empty" style="grid-column:1/-1">No replays match those filters.</div>';
+        else host.insertAdjacentHTML('beforeend', items.map(fightCardHTML).join(''));
+      }
+      page = pg; done = !r.more;
+    } finally { if (my === reqId) loading = false; }
+  };
+  const syncActive = () => {
+    $$('[data-fmode]').forEach((b) => b.classList.toggle('on', fightState.mode === 'curated'));
+    $$('[data-fsport]').forEach((b) => b.classList.toggle('on', fightState.mode === 'grid' && b.dataset.fsport === fightState.sport));
+    $$('[data-ffighter]').forEach((b) => b.classList.toggle('on', fightState.mode === 'grid' && b.dataset.ffighter === fightState.fighter));
+  };
+  const drawBody = () => {
+    const body = $('#fightsBody'); if (!body) return;
+    if (fightState.mode === 'curated') {
+      body.innerHTML = d.rows.map((r) => `<section class="row" data-row="${esc(r.id)}">
+        <div class="row-head"><h2 class="row-title">${esc(r.title)}</h2>${r.sub ? `<span class="row-sub">${esc(r.sub)}</span>` : ''}</div>
+        <div class="row-wrap"><button class="arrow l" aria-label="Scroll left">${I.left}</button>
+          <div class="scroller">${(r.items || []).map(fightCardHTML).join('')}</div>
+          <button class="arrow r" aria-label="Scroll right">${I.right}</button></div></section>`).join('');
+      wireRows();
+    } else loadGrid(0, true);
+  };
+  const io = new IntersectionObserver((es) => { if (es[0]?.isIntersecting && fightState.mode === 'grid' && !done && !loading) loadGrid(page + 1, false); }, { rootMargin: '600px' });
+  const sen = $('#fightsMore'); if (sen) io.observe(sen);
+  $('[data-fmode="curated"]').onclick = () => { fightState.mode = 'curated'; syncActive(); drawBody(); };
+  $$('[data-fsport]').forEach((b) => (b.onclick = () => { fightState.mode = 'grid'; fightState.sport = b.dataset.fsport; fightState.fighter = ''; syncActive(); drawBody(); }));
+  $$('[data-ffighter]').forEach((b) => (b.onclick = () => { fightState.mode = 'grid'; fightState.sport = 'ufc'; fightState.fighter = b.dataset.ffighter; syncActive(); drawBody(); }));
+  $('#fQuery').oninput = debounce((e) => { fightState.q = e.target.value; fightState.mode = 'grid'; syncActive(); drawBody(); }, 220);
+  $('#fYear').onchange = (e) => { fightState.year = e.target.value; fightState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#fSort').onchange = (e) => { fightState.sort = e.target.value; fightState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#fUnw').onchange = (e) => { fightState.unwatched = e.target.checked; fightState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#fSpoil').onchange = (e) => {
+    localSet('ufcSpoilerFree', e.target.checked ? '1' : '0');
+    post('/api/prefs', { ufcSpoilerFree: e.target.checked }).catch(() => {});
+    toast(e.target.checked ? 'Spoiler-Free UFC mode ON' : 'Spoiler-Free UFC mode OFF');
+    pageFights();
+  };
+  $('#fReset').onclick = () => { fightState = { mode: 'curated', sport: 'ufc', fighter: '', year: '', q: '', unwatched: false, sort: 'latest' }; pageFights(); };
+  drawBody();
+}
+
+// ---------------------------------------------------------------- Release Radar & Calendar (#/radar)
+let radarTab = 'all';
+async function pageRadar() {
+  view.innerHTML = '<div class="page-pad"><div class="page-head"><h1 class="page-title">Release Radar</h1></div><div class="empty">Scanning your followed shows, digital drops &amp; UFC schedule…</div></div>';
+  const d = await api('/api/radar').catch(() => null);
+  if (!d) { view.innerHTML = '<div class="page-pad"><div class="empty">Couldn’t load Release Radar.</div></div>'; return; }
+  const cnt = d.counts || {};
+  const fmtDays = (n) => n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : n > 1 ? `In ${n} days` : n === -1 ? 'Yesterday' : `${Math.abs(n)}d ago`;
+  const draw = () => {
+    const show = (t) => radarTab === 'all' || radarTab === t;
+    let body = '';
+    if (show('episodes')) {
+      const eps = d.episodes || [];
+      body += `<div class="section-label">Upcoming &amp; Recent Episodes (Shows You Watch) · ${eps.length}</div>`;
+      body += eps.length ? `<div class="radar-grid">${eps.map((e) => {
+        const k = e.sid ? remember({ k: 's', id: e.sid, tmdb: e.tmdb, title: e.showTitle, poster: e.poster, backdrop: e.backdrop }) : '';
+        return `<div class="radar-card" ${k ? `data-open="${k}" style="cursor:pointer"` : ''}>
+          <div class="radar-thumb">${e.poster ? `<img src="${esc(e.poster)}" alt="" loading="lazy">` : ''}</div>
+          <div>
+            <div class="radar-kicker"><span class="rcd-pill ${e.daysUntil <= 0 ? 'ok' : ''}">${esc(fmtDays(e.daysUntil))}</span><span class="rcd-pill muted">S${e.season}:E${e.episode}</span>${e.airDate ? `<span class="muted" style="font-size:12px">${esc(e.airDate)}</span>` : ''}</div>
+            <div class="radar-title">${esc(e.showTitle)}</div>
+            <div class="radar-sub">${esc(e.epName || e.status || '')}</div>
+          </div></div>`;
+      }).join('')}</div>` : '<div class="empty" style="padding:18px var(--gutter)">No upcoming episode air dates yet — follow any ongoing series to track it here.</div>';
+    }
+    if (show('ufc')) {
+      const ufcs = d.ufc || [];
+      body += `<div class="section-label">Upcoming UFC Schedule (Sydney Time · Spoiler-Free) · ${ufcs.length}</div>`;
+      body += ufcs.length ? `<div class="radar-grid">${ufcs.map((u, idx) => `<div class="radar-card" style="grid-template-columns:1fr">
+        <div>
+          <div class="radar-kicker">
+            <span class="fbadge ${u.isPpv ? 'ppv' : ''}">${esc(u.shortName || 'UFC')}</span>
+            <span class="rcd-pill ${u.daysUntil <= 1 ? 'ok' : ''}">${esc(fmtDays(u.daysUntil))}</span>
+            ${u.replayAvailable ? '<span class="rcd-pill ok">Replay Ready</span>' : ''}
+          </div>
+          <div class="radar-title">${esc(u.name)}</div>
+          ${u.mainEvent ? `<div class="fcard-match" style="margin-top:3px">${esc(u.mainEvent)}</div>` : ''}
+          <div class="radar-sub">${esc([u.sydneyDate, u.mainCardSydneyTime ? `Main card ${u.mainCardSydneyTime}` : u.sydneyTime, u.venue].filter(Boolean).join(' · '))}</div>
+          <div class="radar-acts">
+            ${u.replayAvailable && u.replayId ? `<button class="btn btn-primary btn-sm" data-open="${remember({ k: 'm', id: u.replayId, title: u.name })}">${I.play}Watch Replay</button>` : ''}
+            ${u.bouts?.length ? `<button class="btn btn-ghost btn-sm" data-radar-ufc="${idx}">🥊 Preview ${u.bouts.length} Bouts</button>` : ''}
+          </div>
+        </div></div>`).join('')}</div>` : '<div class="empty" style="padding:18px var(--gutter)">No upcoming UFC events returned by ESPN right now.</div>';
+    }
+    if (show('movies')) {
+      const movs = d.movies || [];
+      body += `<div class="section-label">Upcoming Theatrical &amp; Digital Drops · ${movs.length}</div>`;
+      body += movs.length ? `<div class="radar-grid">${movs.map((m, idx) => {
+        const stCls = m.libraryState === '4k' ? 'ok' : m.libraryState === 'cam' ? 'cam' : '';
+        const k = m.inLibrary && m.id ? remember({ k: 'm', id: m.id, tmdb: m.tmdb, title: m.title, year: m.year, poster: m.poster, backdrop: m.backdrop }) : '';
+        return `<div class="radar-card">
+          <div class="radar-thumb" ${k ? `data-open="${k}" style="cursor:pointer"` : ''}>${m.poster ? `<img src="${esc(m.poster)}" alt="" loading="lazy">` : ''}</div>
+          <div>
+            <div class="radar-kicker">
+              <span class="rcd-pill ${stCls}">${esc(m.status || m.libraryState)}</span>
+              ${m.releaseDate ? `<span class="muted" style="font-size:12px">${esc(m.releaseDate)}</span>` : ''}
+            </div>
+            <div class="radar-title" ${k ? `data-open="${k}" style="cursor:pointer"` : ''}>${esc(m.title)}${m.year ? ` <span class="muted">(${m.year})</span>` : ''}</div>
+            ${m.overview ? `<div class="radar-sub" style="-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden">${esc(m.overview)}</div>` : ''}
+            <div class="radar-acts">
+              ${k ? `<button class="btn btn-primary btn-sm" data-open="${k}">Open</button>` : ''}
+              ${m.tmdb && m.libraryState !== '4k' ? `<button class="btn btn-ghost btn-sm" data-radar-want="${idx}">${m.wanted ? '🔔 Watching' : '🔔 Notify for HD/4K'}</button>` : ''}
+            </div>
+          </div></div>`;
+      }).join('')}</div>` : '<div class="empty" style="padding:18px var(--gutter)">No upcoming movie drops found.</div>';
+    }
+    if (show('upgrades')) {
+      const ups = d.upgrades || [];
+      body += `<div class="section-label">Recent 4K &amp; Clean HD Upgrades in your library · ${ups.length}</div>`;
+      body += ups.length ? `<div class="grid" style="padding:0 var(--gutter)">${ups.map(poster).join('')}</div>`
+        : '<div class="empty" style="padding:18px var(--gutter)">Quality baseline recorded — as your provider upgrades titles from CAM → HD or HD → 4K DV on future syncs, they’ll appear here automatically!</div>';
+    }
+    view.innerHTML = `<div class="page-pad"><div class="page-head">
+      <h1 class="page-title">Release Radar</h1>
+      <div class="chips">
+        ${[['all', 'Everything', (cnt.episodes || 0) + (cnt.ufc || 0) + (cnt.movies || 0)],
+           ['episodes', 'Episodes', cnt.episodes || 0],
+           ['ufc', 'Upcoming UFC', cnt.ufc || 0],
+           ['movies', 'Digital Drops', cnt.movies || 0],
+           ['upgrades', '4K Upgrades', cnt.upgrades || 0]].map(([k, l, n]) => `<button class="chip ${radarTab === k ? 'on' : ''}" data-rtab="${k}">${l} <span class="chip-cnt">${n}</span></button>`).join('')}
+      </div>
+      <a class="chip" href="#/4k?tier=cam" style="margin-left:auto">CAM-Only Watch (${cnt.camWatch || 0}) →</a>
+    </div>${body}</div>`;
+    $$('[data-rtab]').forEach((b) => (b.onclick = () => { radarTab = b.dataset.rtab; draw(); }));
+    $$('[data-radar-ufc]').forEach((b) => (b.onclick = () => {
+      const u = (d.ufc || [])[+b.dataset.radarUfc]; if (!u) return;
+      openModal(`<div class="sheet" style="max-width:740px"><button class="close" aria-label="Close">${I.close}</button>
+        <div class="sheet-section" style="padding:28px 32px">
+          <span class="spoiler-bar">🛡️ Spoiler-Free Bout Lineup</span>
+          <h2 style="margin:12px 0 4px">${esc(u.name)}</h2>
+          <div class="muted">${esc([u.sydneyDate, u.mainCardSydneyTime ? `Main card ${u.mainCardSydneyTime}` : u.sydneyTime, u.venue].filter(Boolean).join(' · '))}</div>
+          <div class="bout-list">${(u.bouts || []).map((bt) => `<div class="bout-row ${bt.isMainEvent ? 'main' : ''}">
+            <div class="bout-sec">${esc(bt.section || bt.card)}</div>
+            <div><div class="bout-vs">${esc(bt.fighterA)} <span class="muted">vs.</span> ${esc(bt.fighterB)}${bt.isTitle ? ' <span class="pill uhd">TITLE</span>' : ''}</div>
+              ${bt.weightClass ? `<div class="bout-wc">${esc(bt.weightClass)}</div>` : ''}</div>
+            <span class="bout-rds">${bt.rounds || 3} Rds</span></div>`).join('')}</div>
+        </div></div>`);
+    }));
+    $$('[data-radar-want]').forEach((b) => (b.onclick = async () => {
+      const m = (d.movies || [])[+b.dataset.radarWant]; if (!m) return;
+      m.wanted = !m.wanted;
+      await post('/api/wanted', { mt: 'movie', tmdb: m.tmdb, on: m.wanted, item: { k: 'x', mt: 'movie', tmdb: m.tmdb, title: m.title, year: m.year, poster: m.poster, backdrop: m.backdrop } }).catch(() => {});
+      b.textContent = m.wanted ? '🔔 Watching' : '🔔 Notify for HD/4K';
+      toast(m.wanted ? `Watching ${m.title} for clean HD/4K` : `Removed ${m.title} from watch alerts`);
+    }));
+  };
+  draw();
+}
+
+// ---------------------------------------------------------------- Marathons & Watch Order (#/marathons)
+async function pageMarathons(slug, qs) {
+  if (slug) {
+    const order = new URLSearchParams(qs || '').get('order') === 'release' ? 'release' : 'chrono';
+    const d = await api(`/api/marathons/${encodeURIComponent(slug)}?order=${order}`).catch(() => null);
+    if (!d) { view.innerHTML = '<div class="page-pad"><div class="empty">Marathon not found. <a href="#/marathons" style="color:var(--accent)">Back to Marathons</a></div></div>'; return; }
+    const fmtMins = (m) => { const h = Math.floor((m || 0) / 60), r = (m || 0) % 60; return h ? `${h}h ${r}m` : `${r}m`; };
+    const nextKey = d.nextUp?.id ? remember(d.nextUp) : '';
+    view.innerHTML = `<section class="hero" style="min-height:380px;height:min(54vh,480px)">
+      <div class="hero-slide on">${d.backdrop ? `<img src="${esc(d.backdrop)}" alt="">` : ''}</div>
+      <div class="hero-info">
+        <div class="hero-kicker"><a href="#/marathons" style="color:var(--muted)">← All Marathons</a> · ${d.watchedCount}/${d.availableCount} Watched (${d.pctComplete}%)</div>
+        <h1 class="hero-title">${esc(d.icon || '🎬')} ${esc(d.title)}</h1>
+        <p class="hero-overview">${esc(d.tagline || '')}</p>
+        <div class="hero-meta"><span><b>${d.availableCount}</b> of ${d.total} in your library</span><span><b>${d.uhdCount}</b> in 4K</span>${d.totalRuntimeMins ? `<span>Total: ${fmtMins(d.totalRuntimeMins)}${d.remainingRuntimeMins && d.watchedCount ? ` · ${fmtMins(d.remainingRuntimeMins)} left` : ''}</span>` : ''}</div>
+        <div class="btns">
+          ${nextKey ? `<button class="btn btn-primary" data-quickplay="${nextKey}">${I.play}Next: ${esc(d.nextUp.title)}</button>` : ''}
+          ${d.hasDistinctOrder ? `<a class="btn ${order === 'chrono' ? 'btn-accent' : 'btn-ghost'}" href="#/marathons/${encodeURIComponent(slug)}?order=chrono">Chronological Story Order</a>
+          <a class="btn ${order === 'release' ? 'btn-accent' : 'btn-ghost'}" href="#/marathons/${encodeURIComponent(slug)}?order=release">Release Order</a>` : ''}
+        </div>
+      </div>
+    </section>
+    <div class="rows" style="margin-top:20px">
+      <div class="mar-steps">${(d.items || []).map((it) => {
+        const isNext = d.nextUp && it.available && it.id === d.nextUp.id;
+        const k = it.available ? remember(it) : '';
+        return `<div class="mar-step ${it.available ? 'avail' : ''} ${isNext ? 'nextup' : ''} ${it.watched ? 'done' : ''}" ${k ? `data-open="${k}"` : ''}>
+          <div class="mar-num">${it.index}</div>
+          <div class="mar-step-thumb">${it.poster ? `<img src="${esc(it.poster)}" alt="" loading="lazy">` : ''}</div>
+          <div style="min-width:0">
+            <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+              <b>${esc(it.title)}</b>
+              ${it.year ? `<span class="muted">(${it.year})</span>` : ''}
+              ${it.phase ? `<span class="rc-tag">${esc(it.phase)}</span>` : ''}
+              ${isNext ? '<span class="rcd-pill">NEXT IN MARATHON</span>' : ''}
+              ${it.watched ? '<span class="rcd-pill ok">✓ Watched</span>' : ''}
+              ${it.available ? (it.dv ? '<span class="pill dv">4K DV</span>' : it.uhd ? '<span class="pill uhd">4K</span>' : '') : '<span class="rcd-pill muted">Not in library</span>'}
+            </div>
+            <div class="muted" style="font-size:12.5px;margin-top:4px">${[it.rating ? `★ ${(+it.rating).toFixed(1)}` : '', it.runtime ? runtime(it.runtime) : '', it.progress > 0.03 && !it.watched ? `${Math.round(it.progress * 100)}% watched` : ''].filter(Boolean).join(' · ')}</div>
+          </div>
+          <div class="btns">
+            ${k ? `<button class="btn ${isNext ? 'btn-primary' : 'btn-ghost'} btn-sm" data-quickplay="${k}">${I.play}${it.k === 's' ? 'Series' : 'Play'}</button>` : ''}
+          </div>
+        </div>`;
+      }).join('')}</div>
+    </div>`;
+    return;
+  }
+
+  const d = await api('/api/marathons').catch(() => null);
+  if (!d) { view.innerHTML = '<div class="page-pad"><div class="empty">Couldn’t load marathons.</div></div>'; return; }
+  const card = (m) => `<a class="mar-card" href="#/marathons/${encodeURIComponent(m.slug)}">
+    <div class="mar-hero">
+      ${m.backdrop ? `<img src="${esc(m.backdrop)}" alt="" loading="lazy">` : ''}
+      <div class="mar-head"><h3>${esc(m.icon || '🎬')} ${esc(m.title)}</h3><p>${esc(m.tagline || '')}</p></div>
+      <div class="mar-posters">${(m.posters || []).slice(0, 4).map((p) => `<img src="${esc(p)}" alt="" loading="lazy">`).join('')}</div>
+    </div>
+    <div class="mar-body">
+      <div class="mar-stats">
+        <span><b>${m.availableCount}</b>/${m.total} available</span>
+        <span><b>${m.watchedCount}</b> watched (${m.pctComplete}%)</span>
+        ${m.uhdCount ? `<span><b>${m.uhdCount}</b> in 4K</span>` : ''}
+        ${m.hasDistinctOrder ? '<span class="pill">Chrono + Release</span>' : ''}
+      </div>
+      <div class="mar-prog"><i style="width:${m.pctComplete || 0}%"></i></div>
+      ${m.nextUp ? `<div class="mar-next">▶ Next up: ${esc(m.nextUp.title)}</div>` : m.completed ? '<div class="ok" style="font-size:12.5px;font-weight:700">✓ Marathon Complete</div>' : ''}
+    </div>
+  </a>`;
+  view.innerHTML = `<div class="page-pad">
+    <div class="page-head"><h1 class="page-title">Marathons &amp; Watch Order</h1><span class="muted">Chronological &amp; release binge guides matched live to your library</span></div>
+    <div class="mar-grid">${(d.marathons || []).map(card).join('')}</div>
+    ${(d.collections || []).length ? `<div class="section-label" style="margin-top:30px">More Franchises &amp; Collections in Your Library</div><div class="mar-grid">${d.collections.map(card).join('')}</div>` : ''}
+  </div>`;
+}
+
+// ---------------------------------------------------------------- Personal Cinema DNA (#/dna)
+async function pageDna() {
+  view.innerHTML = '<div class="page-pad"><div class="page-head"><h1 class="page-title">Cinema DNA</h1></div><div class="empty">Analyzing your watch history, ratings &amp; filmmakers…</div></div>';
+  const d = await api('/api/dna').catch(() => null);
+  if (!d) { view.innerHTML = '<div class="page-pad"><div class="empty">Couldn’t load Cinema DNA.</div></div>'; return; }
+  const maxG = Math.max(1, ...(d.topGenres || []).map((x) => x.pct || x.count || 1));
+  const maxDec = Math.max(1, ...(d.topDecades || []).map((x) => x.pct || x.count || 1));
+  view.innerHTML = `<div class="page-pad">
+    <div class="dna-hero">
+      <div>
+        <span class="dna-tag">🧬 Your Cinema DNA</span>
+        <h1>${esc(d.persona?.tag || 'Cinema Explorer')}</h1>
+        <p>${esc(d.persona?.summary || 'Watch a few movies or episodes to build your taste profile.')}</p>
+        <div class="btns" style="margin-top:16px">
+          <a class="btn btn-accent btn-sm" href="#/specials">🎤 Stand-Up, Concerts &amp; Prestige →</a>
+          <a class="btn btn-ghost btn-sm" href="#/4k">✨ 4K OLED Showcase</a>
+          <a class="btn btn-ghost btn-sm" href="#/marathons">🎬 Marathons</a>
+        </div>
+      </div>
+      <div class="dna-kpis">
+        <div class="dna-kpi"><b>${(d.totalHours || 0).toLocaleString()}h</b><span>Watch Time</span></div>
+        <div class="dna-kpi"><b>${(d.moviesWatched || 0).toLocaleString()}</b><span>Films Watched</span></div>
+        <div class="dna-kpi"><b>${(d.episodesWatched || 0).toLocaleString()}</b><span>Episodes Watched</span></div>
+        <div class="dna-kpi"><b>${d.avgRating ? `★ ${d.avgRating}` : '—'}</b><span>Avg Score</span></div>
+        <div class="dna-kpi"><b>${d.uhdSharePct || 0}%</b><span>Watched in 4K</span></div>
+        <div class="dna-kpi"><b>${esc(d.runtimeSweetSpot || '—')}</b><span>Film Sweet Spot</span></div>
+      </div>
+    </div>
+    <div class="dna-panels">
+      <div class="dna-panel"><h3>Top Genres</h3>${(d.topGenres || []).length ? d.topGenres.map((g) => `<div class="dna-bar-row"><span>${esc(g.name)}</span><div class="dna-bar-track"><i style="width:${Math.round((g.pct || g.count) * 100 / maxG)}%"></i></div><span class="muted">${g.pct}%</span></div>`).join('') : '<p class="muted">Watch a few titles to see your genre breakdown.</p>'}</div>
+      <div class="dna-panel"><h3>Favorite Decades &amp; Platforms</h3>
+        ${(d.topDecades || []).map((x) => `<div class="dna-bar-row"><span>${esc(x.decade)}</span><div class="dna-bar-track"><i style="width:${Math.round((x.pct || x.count) * 100 / maxDec)}%"></i></div><span class="muted">${x.pct}%</span></div>`).join('')}
+        ${(d.topPlatforms || []).length ? `<div class="chips" style="margin-top:14px">${d.topPlatforms.map((p) => `<a class="chip sm" href="#/browse?platform=${encodeURIComponent(p.name.toLowerCase().replace(/[^a-z]/g, ''))}">${esc(p.name)} <span class="chip-cnt">${p.count}</span></a>`).join('')}</div>` : ''}
+      </div>
+      ${(d.topDirectors || []).length || (d.topActors || []).length ? `<div class="dna-panel">
+        ${(d.topDirectors || []).length ? `<h3>Favorite Directors</h3><div class="dna-people" style="margin-bottom:16px">${d.topDirectors.slice(0, 8).map((p) => `<a class="dna-person" href="#/person/${p.id}">${p.photo ? `<img src="${esc(p.photo)}" alt="">` : ''}<span>${esc(p.name)} <small>(${p.count})</small></span></a>`).join('')}</div>` : ''}
+        ${(d.topActors || []).length ? `<h3>Most-Watched Actors</h3><div class="dna-people">${d.topActors.slice(0, 10).map((p) => `<a class="dna-person" href="#/person/${p.id}">${p.photo ? `<img src="${esc(p.photo)}" alt="">` : ''}<span>${esc(p.name)} <small>(${p.count})</small></span></a>`).join('')}</div>` : ''}
+      </div>` : ''}
+    </div>
+    <div class="rows">${(d.becauseYouLoved || []).map(renderRow).join('')}</div>
+  </div>`;
+  wireRows();
+}
+
+// ---------------------------------------------------------------- Stand-Up, Concerts, World Cinema & Prestige (#/specials)
+let specState = { mode: 'curated', bucket: 'standup', q: '', uhd: false, unwatched: false, sort: '', page: 0 };
+async function pageSpecials(qs) {
+  if (qs) { const b = new URLSearchParams(qs).get('bucket'); if (b) { specState.mode = 'grid'; specState.bucket = b; } }
+  const d = await api('/api/specials').catch(() => null);
+  if (!d) { view.innerHTML = '<div class="page-pad"><div class="empty">Couldn’t load specialty hubs.</div></div>'; return; }
+  const c = d.counts || {};
+  const buckets = [
+    ['standup', '🎤 Stand-Up Comedy', c.standup], ['concerts', '🎸 Concerts & Music', c.concerts],
+    ['world', '🌍 World Cinema', c.worldCinema], ['apple', 'Apple TV+ Prestige', c.apple],
+    ['hbo', 'HBO Prestige', c.hbo], ['imdb', 'IMDb Top 250', c.imdbTop], ['short', '⏱ Under 95 Min', c.shortGems],
+  ];
+  const spSorts = [['', 'Curated'], ['rating', 'Highest rated'], ['newest', 'Newest'], ['added', 'Recently added'], ['az', 'A–Z']];
+  view.innerHTML = `<div class="page-pad"><div class="page-head"><h1 class="page-title">Stand-Up, Concerts &amp; Prestige</h1>${viewToggleHTML(getViewMode())}</div>
+    <div class="anime-bar" style="margin-bottom:18px">
+      <div class="anime-bar-row">
+        <div class="chips">
+          <button class="chip ${specState.mode === 'curated' ? 'on' : ''}" data-spmode="curated">All Shelves</button>
+          ${buckets.map(([k, l, n]) => `<button class="chip ${specState.mode === 'grid' && specState.bucket === k ? 'on' : ''}" data-spb="${k}">${l} <span class="chip-cnt">${(n || 0).toLocaleString()}</span></button>`).join('')}
+        </div>
+        <input type="search" class="explore-search" id="spQuery" placeholder="Search comedian, artist, language (korean, french)…" value="${esc(specState.q)}">
+      </div>
+      <div class="anime-bar-row">
+        ${sel('spSort', spSorts, specState.sort)}
+        <label class="tog"><input type="checkbox" id="spUhd" ${specState.uhd ? 'checked' : ''}> 4K only</label>
+        <label class="tog"><input type="checkbox" id="spUnw" ${specState.unwatched ? 'checked' : ''}> Unwatched</label>
+        <button class="btn btn-ghost btn-sm" id="spReset">Reset</button>
+      </div>
+    </div>
+    <div id="spBody"></div><div id="spMore" class="more-sentinel"></div></div>`;
+
+  let page = 0; let loading = false; let done = false; let reqId = 0; let curItems = [];
+  const loadGrid = async (pg, reset) => {
+    if (loading && !reset) return;
+    loading = true; const my = ++reqId;
+    const body = $('#spBody'); if (!body) return;
+    if (reset) { page = 0; done = false; curItems = []; body.innerHTML = '<div class="browse-meta" id="spMeta">Loading…</div><div id="spItems" class="grid"></div>'; }
+    const q = new URLSearchParams({ bucket: specState.bucket, page: String(pg), limit: '60' });
+    if (specState.q.trim()) q.set('q', specState.q.trim());
+    if (specState.sort) q.set('sort', specState.sort);
+    if (specState.uhd) q.set('uhd', '1');
+    if (specState.unwatched) q.set('unwatched', '1');
+    try {
+      const r = await api(`/api/specials/browse?${q}`);
+      if (my !== reqId || specState.mode !== 'grid') return;
+      const items = r.items || [];
+      curItems = reset ? items : curItems.concat(items);
+      if ($('#spMeta')) $('#spMeta').innerHTML = `<div class="browse-stats"><b>${(r.total || 0).toLocaleString()}</b> titles</div>`;
+      const host = $('#spItems'); const mode = getViewMode();
+      if (host) {
+        if (reset) { host.className = mode === 'list' ? 'rich-list' : 'grid'; host.innerHTML = items.length ? items.map(mode === 'list' ? richCard : poster).join('') : '<div class="empty" style="grid-column:1/-1">Nothing matches those filters.</div>'; }
+        else host.insertAdjacentHTML('beforeend', items.map(mode === 'list' ? richCard : poster).join(''));
+      }
+      page = pg; done = !r.more;
+    } finally { if (my === reqId) loading = false; }
+  };
+  const sync = () => {
+    $$('[data-spmode]').forEach((b) => b.classList.toggle('on', specState.mode === 'curated'));
+    $$('[data-spb]').forEach((b) => b.classList.toggle('on', specState.mode === 'grid' && b.dataset.spb === specState.bucket));
+  };
+  const drawBody = () => {
+    const body = $('#spBody'); if (!body) return;
+    if (specState.mode === 'curated') { body.innerHTML = `<div class="rows">${(d.rows || []).map(renderRow).join('')}</div>`; wireRows(); }
+    else loadGrid(0, true);
+  };
+  const io = new IntersectionObserver((es) => { if (es[0]?.isIntersecting && specState.mode === 'grid' && !done && !loading) loadGrid(page + 1, false); }, { rootMargin: '600px' });
+  const sen = $('#spMore'); if (sen) io.observe(sen);
+  $('[data-spmode="curated"]').onclick = () => { specState.mode = 'curated'; sync(); drawBody(); };
+  $$('[data-spb]').forEach((b) => (b.onclick = () => { specState.mode = 'grid'; specState.bucket = b.dataset.spb; sync(); drawBody(); }));
+  $('#spQuery').oninput = debounce((e) => { specState.q = e.target.value; specState.mode = 'grid'; sync(); drawBody(); }, 220);
+  $('#spSort').onchange = (e) => { specState.sort = e.target.value; specState.mode = 'grid'; sync(); drawBody(); };
+  $('#spUhd').onchange = (e) => { specState.uhd = e.target.checked; specState.mode = 'grid'; sync(); drawBody(); };
+  $('#spUnw').onchange = (e) => { specState.unwatched = e.target.checked; specState.mode = 'grid'; sync(); drawBody(); };
+  $('#spReset').onclick = () => { specState = { mode: 'curated', bucket: 'standup', q: '', uhd: false, unwatched: false, sort: '', page: 0 }; pageSpecials(); };
+  $$('[data-vmode]', view).forEach((b) => (b.onclick = () => {
+    setViewMode(b.dataset.vmode);
+    $$('[data-vmode]', view).forEach((x) => x.classList.toggle('on', x === b));
+    if (specState.mode === 'grid' && curItems.length) {
+      const host = $('#spItems'); const mode = getViewMode();
+      if (host) { host.className = mode === 'list' ? 'rich-list' : 'grid'; host.innerHTML = curItems.map(mode === 'list' ? richCard : poster).join(''); }
+    } else { specState.mode = 'grid'; sync(); drawBody(); }
+  }));
+  drawBody();
+}
+
 let sportsLeague = 'All';
 async function pageSports() {
   const d = await api('/api/sports');
@@ -798,7 +1452,8 @@ async function pageSports() {
     const leagues = ['All', ...d.leagues.sort((a, b) => count(b) - count(a))];
     let html = `<div class="page-pad"><div class="page-head"><h1 class="page-title">Sports</h1>
       <div class="chips">${leagues.map((l) => `<button class="chip ${l === sportsLeague ? 'on' : ''}" data-league="${esc(l)}">${esc(l)}</button>`).join('')}</div>
-      <div class="chips" style="margin-left:auto"><button class="chip ${spoilerFree() ? 'on' : ''}" id="spoilBtn" title="Hide scores and results">${spoilerFree() ? 'Scores hidden' : 'Hide scores'}</button>
+      <div class="chips" style="margin-left:auto"><a class="chip on" href="#/fights">🥊 UFC &amp; Sports Replays →</a>
+      <button class="chip ${spoilerFree() ? 'on' : ''}" id="spoilBtn" title="Hide scores and results">${spoilerFree() ? 'Scores hidden' : 'Hide scores'}</button>
       <button class="chip" id="teamsBtn">★ My teams${d.teams.length ? ` (${d.teams.length})` : ''}</button></div></div>`;
     html += fixtureRows(fx);
     if (live.length || up.length) html += `<div class="section-label">More events from your channels</div>`;
@@ -1444,12 +2099,23 @@ async function route() {
   const [p, qs] = (location.hash.slice(2) || 'home').split('?');
   const tab = p.split('/')[0];
   $$('.tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
+  const hubTabs = new Set(['radar', 'marathons', 'dna', 'specials', 'tonight']);
+  $('#hubsBtn')?.classList.toggle('active', hubTabs.has(tab));
+  if ($('#hubsMenu')) $('#hubsMenu').hidden = true;
+  if ($('#hubsBtn')) $('#hubsBtn').setAttribute('aria-expanded', 'false');
   if (tab !== 'search') $('#searchInput').value = '';
   [STATUS, ACCOUNT] = await Promise.all([api('/api/status').catch(() => ({})), ACCOUNT && Date.now() - ACCOUNT._t < 600e3 ? ACCOUNT : api('/api/account').then((a) => ({ ...a, _t: Date.now() })).catch(() => null)]);
   const pill = $('#subPill'); if (pill) { const dl = ACCOUNT?.daysLeft; pill.hidden = !(dl != null && dl <= 14); pill.textContent = dl > 0 ? `${dl} day${dl === 1 ? '' : 's'} left` : 'Expired'; }
   if (!STATUS.ready && !document.querySelector('.loading')) loadingScreen();
   window.scrollTo(0, 0); Peek.hide();
-  const pages = { browse: () => pageBrowseAll(qs), person: () => pagePerson(p.split('/')[1]), home: pageHome, series: () => pageBrowse('series'), movies: () => pageBrowse('movies'), docs: pageDocs, anime: pageAnime, sports: pageSports, live: pageLive, guide: pageGuide, tonight: pageTonight, mylist: pageMyList, search: () => pageSearch(new URLSearchParams(qs).get('q') || '') };
+  const pages = {
+    browse: () => pageBrowseAll(qs), person: () => pagePerson(p.split('/')[1]), home: pageHome,
+    series: () => pageBrowse('series'), movies: () => pageBrowse('movies'), docs: pageDocs, anime: pageAnime,
+    '4k': () => pageShowcase(qs), fights: () => pageFights(qs), radar: pageRadar,
+    marathons: () => pageMarathons(p.split('/')[1], qs), dna: pageDna, specials: () => pageSpecials(qs),
+    sports: pageSports, live: pageLive, guide: pageGuide, tonight: pageTonight, mylist: pageMyList,
+    search: () => pageSearch(new URLSearchParams(qs).get('q') || ''),
+  };
   await guard(pages[tab] || pageHome);
   const y = SCROLL.get(location.hash); if (y) requestAnimationFrame(() => window.scrollTo(0, y));
   if (tab === 'home' && !route.prefetched) { route.prefetched = true; setTimeout(() => { api('/api/movies').catch(() => {}); api('/api/series').catch(() => {}); }, 2500); }
@@ -1474,6 +2140,22 @@ $('#searchInput').addEventListener('input', debounce((e) => {
   }
 }, 280));
 $('#settingsBtn').onclick = openSettings;
+(() => {
+  const btn = $('#hubsBtn'); const menu = $('#hubsMenu');
+  if (!btn || !menu) return;
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    const open = menu.hidden;
+    menu.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+  document.addEventListener('click', (e) => {
+    if (!menu.hidden && !e.target.closest('#hubsDd')) { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !menu.hidden) { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
+  });
+})();
 
 // ---------------------------------------------------------------- global clicks
 document.addEventListener('click', (e) => {
@@ -1516,6 +2198,10 @@ document.addEventListener('click', (e) => {
     }).catch((err) => toast(err.message));
     return;
   }
+  const fCard = e.target.closest('[data-fight-card]');
+  if (fCard) { e.stopPropagation(); const f = FIGHT_ITEMS.get(fCard.dataset.fightCard); if (f) return openFightCardModal(f); }
+  const fPlay = e.target.closest('[data-fight-play]');
+  if (fPlay) { e.stopPropagation(); const f = FIGHT_ITEMS.get(fPlay.dataset.fightPlay); if (f) return playFightReplay(f); }
   const r = e.target.closest('[data-rate]');
   if (r) { e.stopPropagation(); return rateItem(ITEMS.get(r.dataset.key), +r.dataset.rate); }
   const t = e.target.closest('[data-open],[data-quickplay],[data-resume],[data-live],[data-fav],[data-settings],[data-fixture],[data-surprise]');
@@ -1581,8 +2267,13 @@ async function openDetail(it) {
   let playLabel = 'Play';
   if (isSeries && nu) playLabel = canResume ? `Resume S${nu.season}:E${nu.n}` : (nu.season === d.seasons[0]?.n && nu.n === d.seasons[0]?.episodes[0]?.n ? 'Play S1:E1' : `Play S${nu.season}:E${nu.n}`);
   if (!isSeries && canResume) playLabel = `Resume from ${fmtTime(d.resume)}`;
+  const qPill = d.camOnly ? '<span class="pill cam">CAM Rip</span>'
+    : d.qualityLabel === '4K DV' ? '<span class="pill dv">4K Dolby Vision</span>'
+    : d.qualityLabel === '4K HDR' ? '<span class="pill dv">4K HDR</span>'
+    : d.uhd ? '<span class="pill uhd">4K</span>'
+    : d.qualityLabel === 'Blu-Ray' ? '<span class="pill br">Blu-Ray Master</span>' : '';
   const meta = [d.rating ? `<span class="star" title="${d.votes ? `${d.votes.toLocaleString()} TMDB votes` : ''}">★ ${(+d.rating).toFixed(1)}${d.votes ? ` <small class="muted">(${fmtVotes(d.votes)})</small>` : ''}</span>` : '', d.year ? `<span>${d.year}</span>` : '', d.cert ? `<span class="pill">${esc(d.cert)}</span>` : '',
-    d.runtime ? `<span>${runtime(d.runtime)}</span>` : '', isSeries ? `<span>${d.seasons.length} Season${d.seasons.length === 1 ? '' : 's'}</span>` : '', d.uhd ? '<span class="pill uhd">4K</span>' : '',
+    d.runtime ? `<span>${runtime(d.runtime)}</span>` : '', isSeries ? `<span>${d.seasons.length} Season${d.seasons.length === 1 ? '' : 's'}</span>` : '', qPill,
     d.isDoc ? `<span class="pill doc">Documentary${d.docTopics?.length ? ` · ${esc(d.docTopics.slice(0, 2).join(', '))}` : ''}</span>` : '',
     d.isAnime ? `<span class="pill dub">English Dub${d.dubbedCount ? ` · ${d.dubbedCount} verified` : ''}</span>` : ''].join('');
 
@@ -1599,6 +2290,7 @@ async function openDetail(it) {
         ${isSeries ? `<button class="btn btn-round ${d.following ? 'on' : ''}" id="dFollow" title="${d.following ? 'Following: you get new-episode alerts' : 'Follow for new-episode alerts'}" aria-label="Follow">${d.following ? I.bellOn : I.bell}</button>` : ''}</div></div></div>
     <div class="sheet-body"><div>
         <div class="meta">${meta}</div>
+        ${d.camOnly ? `<div class="cam-banner"><span><b>CAM / Telesync Rip:</b> Only a lower-quality theatre rip is currently available.</span>${d.tmdb ? '<button class="btn btn-accent btn-sm" id="dCamWatch">🔔 Notify when clean HD / 4K drops</button>' : ''}</div>` : ''}
         ${d.scores ? `<div class="scores">${d.scores.imdb ? `<span class="score imdb" title="${esc(d.scores.votes)} votes"><b>IMDb</b> ${esc(d.scores.imdb)}</span>` : ''}${d.scores.rt ? `<span class="score rt"><b>${parseInt(d.scores.rt) >= 60 ? '🍅' : '🤢'}</b> ${esc(d.scores.rt)}</span>` : ''}${d.scores.mc ? `<span class="score mc"><b>MC</b> ${esc(d.scores.mc)}</span>` : ''}${d.scores.awards && /won|win/i.test(d.scores.awards) ? `<span class="score aw">🏆 ${esc(d.scores.awards.split('.')[0])}</span>` : ''}</div>` : ''}
         ${d.tagline ? `<p class="tagline">${esc(d.tagline)}</p>` : ''}
         <p class="overview">${esc(d.overview || 'No description available.')}</p></div>
@@ -1618,6 +2310,11 @@ async function openDetail(it) {
 
   let variant = d.best ?? d.id;
   $$('[data-variant]', modal).forEach((b) => (b.onclick = () => { variant = +b.dataset.variant; $$('[data-variant]', modal).forEach((x) => x.classList.toggle('on', x === b)); }));
+  if ($('#dCamWatch')) $('#dCamWatch').onclick = async () => {
+    await post('/api/wanted', { mt: isSeries ? 'tv' : 'movie', tmdb: d.tmdb, on: true, item: { k: 'x', mt: isSeries ? 'tv' : 'movie', tmdb: d.tmdb, title: d.title, year: d.year, poster: d.poster, backdrop: d.backdrop } }).catch(() => {});
+    $('#dCamWatch').textContent = '✓ Watching for HD / 4K upgrade'; $('#dCamWatch').disabled = true;
+    toast(`We'll alert you the moment ${d.title} upgrades to clean HD or 4K`);
+  };
   $('#dList').onclick = async () => {
     d.inList = !d.inList; await post('/api/list', { key: listKey, on: d.inList, item: card });
     $('#dList').innerHTML = d.inList ? I.check : I.plus; toast(d.inList ? 'Added to My List' : 'Removed from My List');
@@ -2765,7 +3462,7 @@ const Player = (() => {
             <button class="pbtn" id="pCast" title="Play on a TV">${I.cast}</button>
             <button class="pbtn" id="pFull" title="Fullscreen (F)">${I.full}</button>
           </div></div></div>`;
-    el.hidden = false; document.body.style.overflow = 'hidden'; SKIPS = [];
+    el.hidden = false; el.classList.toggle('spoiler-free', !!o.spoilerFree); document.body.style.overflow = 'hidden'; SKIPS = [];
     if (!PLAYER_STATE.open) {
       if (history.state?.modal) history.replaceState({ player: true }, '', location.href); else history.pushState({ player: true }, '', location.href);
       PLAYER_STATE.open = true;
@@ -3443,7 +4140,10 @@ async function openSettings() {
       <span>Ends</span><b>${new Date(acct.exp).toLocaleDateString([], { day: 'numeric', month: 'long', year: 'numeric' })} · ${acct.daysLeft} day${acct.daysLeft === 1 ? '' : 's'} left</b>
       <span>Streams in use</span><b>${acct.active} of ${acct.max}${acct.ours ? ' (this app)' : acct.active ? ' (another device)' : ''}</b></div>` : '<p>Couldn’t reach the provider for account details.</p>'}
     <h4>Hide from all rows</h4><p>Never show these in recommendations, browse or curated rows (search still finds them).</p>
-    <div class="hide-grid">${[['kids', 'Kids & family'], ['anime', 'Anime'], ['reality', 'Reality TV'], ['talk', 'Talk & news'], ['docs', 'Documentaries'], ['standup', 'Stand-up'], ['horror', 'Horror']].map(([k, l]) => `<label class="tog"><input type="checkbox" data-hide="${k}" ${prefs.hide.includes(k) ? 'checked' : ''}> ${l}</label>`).join('')}</div>
+    <div class="hide-grid">
+      <label class="tog"><input type="checkbox" id="optHideCams" ${prefs.hideCams !== false ? 'checked' : ''}> Hide CAM &amp; Telesync rips (still viewable in 4K › CAM Watch)</label>
+      <label class="tog"><input type="checkbox" id="optUfcSpoiler" ${prefs.ufcSpoilerFree ? 'checked' : ''}> Spoiler-free UFC replays (hide runtime &amp; progress bars)</label>
+      ${[['kids', 'Kids & family'], ['anime', 'Anime'], ['reality', 'Reality TV'], ['talk', 'Talk & news'], ['docs', 'Documentaries'], ['standup', 'Stand-up'], ['horror', 'Horror']].map(([k, l]) => `<label class="tog"><input type="checkbox" data-hide="${k}" ${prefs.hide.includes(k) ? 'checked' : ''}> ${l}</label>`).join('')}</div>
     <h4>IMDb & Rotten Tomatoes scores ${s.omdbKeySet ? '<span class="ok">· connected</span>' : ''}</h4>
     <p>Free key from <a href="https://www.omdbapi.com/apikey.aspx" target="_blank" rel="noopener">omdbapi.com/apikey.aspx</a> (choose FREE, then click the activation link they email you).</p>
     <div class="field"><input id="omdbKey" type="password" placeholder="${s.omdbKeySet ? 'Key saved. Paste a new one to replace it' : 'Paste your OMDb key'}" autocomplete="off"><button class="btn btn-accent btn-sm" id="saveOmdb" style="height:42px">Save</button></div>
@@ -3473,6 +4173,8 @@ async function openSettings() {
     try { await post('/api/settings', { tmdbKey: v }); toast('TMDB connected. Trending rows are live.'); closeModal(); route(); }
     catch (e) { toast(e.message); $('#saveKey').textContent = 'Save'; }
   };
+  $('#optHideCams').onchange = (e) => post('/api/prefs', { hideCams: e.target.checked }).then(() => toast(e.target.checked ? 'CAM rips hidden from discovery rows' : 'CAM rips shown')).catch(() => {});
+  $('#optUfcSpoiler').onchange = (e) => { localSet('ufcSpoilerFree', e.target.checked ? '1' : '0'); post('/api/prefs', { ufcSpoilerFree: e.target.checked }).catch(() => {}); toast(e.target.checked ? 'UFC Spoiler-Free mode enabled' : 'UFC Spoiler-Free mode off'); };
   $$('[data-hide]', modal).forEach((c) => (c.onchange = async () => {
     const hide = $$('[data-hide]', modal).filter((x) => x.checked).map((x) => x.dataset.hide);
     await post('/api/prefs', { hide }); toast('Saved. Rows will update');
@@ -3774,7 +4476,7 @@ window.__player = Player;
 })();
 async function renderTrakt() {
   const box = $('#traktBox'); if (!box) return;
-  const t = await api('/api/trakt').catch(() => null); if (!t) return;
+  const t = await api('/api/trakt').catch(() => null); if (!t || !box.isConnected) return;
   if (t.connected) {
     box.innerHTML = `<p><b>Trakt</b>: connected${t.user ? ` as <b>${esc(t.user)}</b>` : ''}. History, ratings and watchlist sync every 6 hours; what you finish, rate or add here is sent to Trakt.${t.lastSync ? ` Last sync ${new Date(t.lastSync).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}.` : ''}</p>
       ${t.result ? `<p class="muted">Last pull: ${t.result.watched} films, ${t.result.episodes} episodes, ${t.result.ratings} ratings, ${t.result.watchlist} watchlist.</p>` : ''}
@@ -3800,6 +4502,7 @@ async function renderTrakt() {
 async function renderDisplay(prefs) {
   const box = $('#dispBox'); if (!box) return;
   const [d, m] = await Promise.all([api('/api/display').catch(() => null), api('/api/mpv').catch(() => ({}))]);
+  if (!box.isConnected) return;
   if (!d) { box.innerHTML = '<p class="muted">Display info unavailable.</p>'; return; }
   const t = d.displays.find((x) => x.target) || d.displays[0]; const max = t ? Math.max(...t.rates) : 0;
   const tog = (id, on, label) => `<label class="tog"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
@@ -3850,6 +4553,7 @@ async function renderDisplay(prefs) {
 async function renderSysHealth() {
   const box = $('#sysHealthBox'); if (!box) return;
   const h = await api('/api/syshealth').catch(() => null);
+  if (!box.isConnected) return;
   if (!h || !h.net) {
     box.innerHTML = '<p class="muted">System health activates after the queued server update finishes.</p>';
     return;
@@ -3882,7 +4586,7 @@ async function renderSysHealth() {
 
 async function renderRemote() {
   const box = $('#remoteBox'); if (!box) return;
-  const r = await api('/api/remote').catch(() => null); if (!r) return;
+  const r = await api('/api/remote').catch(() => null); if (!r || !box.isConnected) return;
   REMOTE_ON = r.enabled;
   box.innerHTML = r.enabled ? `<div class="remote-pair">${r.qr ? `<div class="qr">${r.qr}</div>` : ''}<div>
       <p>On your phone (same Wi-Fi), open<br><b class="mono">${esc(r.url || 'this PC’s address, port 7880')}</b><br>or scan the code, then enter</p>

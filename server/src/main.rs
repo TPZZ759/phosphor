@@ -1,5 +1,5 @@
 // Personal streaming front-end for an Xtream Codes subscription — Rust server.
-mod subsync; mod fmp4; mod intro; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
+mod subsync; mod fmp4; mod intro; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
 pub use extras::notify;
 
 pub fn notify_all(app: &App, kind: &str, title: &str, body: &str, link: &str, action: Value) {
@@ -72,6 +72,11 @@ async fn main() {
         .route("/api/hero", get(hero)).route("/api/home", get(home)).route("/api/movies", get(movies_page)).route("/api/series", get(series_page))
         .route("/api/anime", get(anime_page)).route("/api/anime/browse", get(anime_browse)).route("/api/anime/check-dub", post(anime_check_dub)).route("/api/anime/check-series/{id}", post(anime_check_series)).route("/api/anime/dub-watch", get(anime_dub_watch_get).post(anime_dub_watch_post))
         .route("/api/docs", get(docs_page)).route("/api/docs/browse", get(docs_browse))
+        .route("/api/fights", get(fights_page)).route("/api/fights/browse", get(fights_browse)).route("/api/fights/card/{id}", get(fights_card))
+        .route("/api/showcase", get(showcase_page)).route("/api/showcase/browse", get(showcase_browse)).route("/api/showcase/upgrades", get(showcase_upgrades))
+        .route("/api/radar", get(radar_page))
+        .route("/api/dna", get(dna_page)).route("/api/specials", get(specials_page)).route("/api/specials/browse", get(specials_browse))
+        .route("/api/marathons", get(marathons_page)).route("/api/marathons/{slug}", get(marathons_detail))
         .route("/api/extsubs/search", get(extsubs_search)).route("/api/extsubs/fetch", post(extsubs_fetch)).route("/api/extsubs/file/{name}", get(extsubs_file)).route("/api/extsubs/sync/{key}", get(extsubs_sync))
         .route("/api/concierge", post(concierge_route))
         .route("/api/browse", get(browse)).route("/api/genres", get(genres)).route("/api/collection/{id}", get(collection)).route("/api/person/{id}", get(person))
@@ -116,6 +121,18 @@ async fn after_catalog(app: Arc<App>) {
     tokio::spawn(extra_guide(app.clone()));
     *app.tri.write().unwrap() = None; app.net_idx.lock().unwrap().clear(); app.memo.expire();
     discover::check_wanted(&app);
+    for ev in fights::check_new_ufc(&app) {
+        let title = s(&ev["title"]);
+        let body = if !s(&ev["matchup"]).is_empty() { s(&ev["matchup"]) } else { "New UFC replay available".into() };
+        notify_all(&app, "ufc", &format!("New UFC Replay: {title}"), &body, "http://localhost:7878/#/fights",
+            json!({ "k": "m", "id": ev["id"], "title": title, "label": "Watch replay" }));
+    }
+    for u in showcase::check_upgrades(&app) {
+        let title = s(&u["alertTitle"]);
+        let body = s(&u["alertBody"]);
+        notify_all(&app, "upgrade", &title, &body, "http://localhost:7878/#/4k",
+            json!({ "k": u["k"], "id": u["id"], "title": u["title"], "label": "View title" }));
+    }
     tokio::spawn(meta::build(app.clone()));
     prewarm(app).await;
 }
@@ -140,7 +157,8 @@ async fn prewarm(app: Arc<App>) {
     let _ = tokio::join!(
         app.memo("hero", 30 * 60_000, rec::hero), app.memo("home-shared", 30 * 60_000, rec::home_shared),
         app.memo("movies", 30 * 60_000, |a| async move { page_rows(a, false).await }), app.memo("series", 30 * 60_000, |a| async move { page_rows(a, true).await }),
-        app.memo("sports", 45_000, sports_compute), app.memo("foryou", 20 * 60_000, rec::for_you), app.memo("anime", 30 * 60_000, anime::page), app.memo("docs", 30 * 60_000, docs::page));
+        app.memo("sports", 45_000, sports_compute), app.memo("foryou", 20 * 60_000, rec::for_you), app.memo("anime", 30 * 60_000, anime::page), app.memo("docs", 30 * 60_000, docs::page),
+        app.memo("showcase", 20 * 60_000, |a| async move { tokio::task::spawn_blocking(move || showcase::hub(&a)).await.unwrap_or_default() }));
     println!("[prewarm] pages ready in {}ms", t0.elapsed().as_millis());
 }
 fn spawn_loops(app: Arc<App>) {
@@ -352,6 +370,77 @@ async fn docs_browse(State(app): A, Query(q): Q) -> Response {
     if let Some(r) = not_ready(&app) { return r; }
     j(docs::browse(&app, &q))
 }
+async fn fights_page(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || fights::hub(&a)).await.unwrap_or_default();
+    j(v)
+}
+async fn fights_browse(State(app): A, Query(q): Q) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || fights::browse(&a, &q)).await.unwrap_or_default();
+    j(v)
+}
+async fn fights_card(State(app): A, Path(id): Path<i64>) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    j(radar::fight_card(app, id).await)
+}
+async fn showcase_page(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let v = app.memo("showcase", 20 * 60_000, |a| async move {
+        tokio::task::spawn_blocking(move || showcase::hub(&a)).await.unwrap_or_default()
+    }).await;
+    ja(v)
+}
+async fn showcase_browse(State(app): A, Query(q): Q) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || showcase::browse(&a, &q)).await.unwrap_or_default();
+    j(v)
+}
+async fn showcase_upgrades(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || json!({ "upgrades": showcase::recent_upgrades(&a) })).await.unwrap_or_default();
+    j(v)
+}
+async fn radar_page(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let v = app.memo("radar", 15 * 60_000, radar::radar).await;
+    ja(v)
+}
+async fn dna_page(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let v = app.memo("dna", 10 * 60_000, dna::profile).await;
+    ja(v)
+}
+async fn specials_page(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let v = app.memo("specials", 20 * 60_000, |a| async move {
+        tokio::task::spawn_blocking(move || dna::specials_hub(&a)).await.unwrap_or_default()
+    }).await;
+    ja(v)
+}
+async fn specials_browse(State(app): A, Query(q): Q) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || dna::specials_browse(&a, &q)).await.unwrap_or_default();
+    j(v)
+}
+async fn marathons_page(State(app): A) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || marathons::list(&a)).await.unwrap_or_default();
+    j(v)
+}
+async fn marathons_detail(State(app): A, Path(slug): Path<String>, Query(q): Q) -> Response {
+    if let Some(r) = not_ready(&app) { return r; }
+    let order = q.get("order").cloned().unwrap_or_else(|| "chrono".into());
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || marathons::detail(&a, &slug, &order)).await.unwrap_or(None);
+    match v { Some(x) => j(x), None => err(404, "marathon not found") }
+}
 async fn anime_check_dub(State(app): A, Json(b): Json<Value>) -> Response {
     if app.stream.is_active() || mpv::running(&app) || livebuf::is_active() {
         return err(409, "Cannot check dub while streaming");
@@ -478,7 +567,7 @@ async fn episodes_watched(State(app): A, Json(b): Json<Value>) -> Response {
 async fn prefs_get(State(app): A) -> Response { j(app.state.read(|st| st["prefs"].clone())) }
 async fn prefs_post(State(app): A, Json(b): Json<Value>) -> Response {
     if let Some(h) = b["hide"].as_array() { let h: Vec<Value> = h.iter().filter(|x| x.is_string()).cloned().collect(); app.state.with(|st| st["prefs"]["hide"] = json!(h)); }
-    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
+    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "hideCams", "ufcSpoilerFree"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     for k in ["display", "pro", "oledPeak", "mpvShaders"] { if let Some(v) = b[k].as_str() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     app.state.save(); app.memo.clear(); tokio::spawn(prewarm(app.clone()));
     j(json!({ "ok": true, "prefs": app.state.read(|st| st["prefs"].clone()) }))
@@ -802,10 +891,14 @@ async fn movie_detail(State(app): A, Path(id): Path<i64>) -> Response {
     let card = app.card(&it, d.as_ref());
     let imdb = d.as_ref().map(|d| s(&d["imdb_id"])).filter(|x| !x.is_empty()).or_else(|| tm.as_ref().and_then(|t| app.meta_get("movie", t)).map(|m| m.im)).unwrap_or_default();
     let similar = match &tm { Some(t) => { let r = app.tmdb.get(format!("/movie/{t}/recommendations"), crate::tmdb::NO, TTL_D).await; rec::match_results(&app, r.as_ref().and_then(|r| r["results"].as_array()).map(|a| a.as_slice()).unwrap_or(&[]), Some("movie"), 18) } None => vec![] };
-    let mut variants = vec![(it.id, it.uhd, cat.cat_name("movie", &it.cat))];
-    for v in &it.variants { variants.push((v.id, v.uhd, cat.movie_raw.get(&v.id).map(|x| cat.cat_name("movie", &x.cat)).unwrap_or_default())); }
+    let mut variants = vec![(it.id, it.uhd, it.cam, it.dv, it.bluray, cat.cat_name("movie", &it.cat))];
+    for v in &it.variants { variants.push((v.id, v.uhd, v.cam, v.dv, v.bluray, cat.movie_raw.get(&v.id).map(|x| cat.cat_name("movie", &x.cat)).unwrap_or_default())); }
     let mut n: HashMap<&str, usize> = HashMap::new();
-    let mut variants: Vec<Value> = variants.into_iter().map(|(id, uhd, c)| { let b = if uhd { "4K" } else { "HD" }; let k = n.entry(b).or_insert(0); *k += 1; json!({ "id": id, "cat": c, "uhd": uhd, "label": if *k > 1 { format!("{b} {k}") } else { b.into() }, "health": source_health(&app, id), "q": app.stream.quality_of(id) }) }).collect();
+    let mut variants: Vec<Value> = variants.into_iter().map(|(id, uhd, cam, dv, bluray, c)| {
+        let b = if cam { "CAM" } else if dv { "4K DV" } else if uhd { "4K" } else if bluray { "Blu-Ray" } else { "HD" };
+        let k = n.entry(b).or_insert(0); *k += 1;
+        json!({ "id": id, "cat": c, "uhd": uhd, "cam": cam, "dv": dv, "bluray": bluray, "label": if *k > 1 { format!("{b} {k}") } else { b.into() }, "health": source_health(&app, id), "q": app.stream.quality_of(id) })
+    }).collect();
     rank_sources(&app, &mut variants); apply_pick(&app, &format!("m:{}", it.id), &mut variants);
     let mut out = card;
     let dd = d.clone().unwrap_or(Value::Null);
@@ -840,6 +933,10 @@ async fn movie_detail(State(app): A, Path(id): Path<i64>) -> Response {
         out["isDoc"] = json!(true);
         out["docTopics"] = json!(docs::doc_topic_labels(&app, &it));
     }
+    let best_t = showcase::best_tier(&app, &it);
+    out["qualityTier"] = json!(best_t.as_u8());
+    out["qualityLabel"] = json!(best_t.label());
+    out["camOnly"] = json!(showcase::is_cam_only(&app, &it));
     let is_anime = anime::is_anime_item(&app, &it);
     out["isAnime"] = json!(is_anime);
     if is_anime {
@@ -947,6 +1044,9 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
         out["isDoc"] = json!(true);
         out["docTopics"] = json!(docs::doc_topic_labels(&app, &it));
     }
+    let best_t = showcase::best_tier(&app, &it);
+    out["qualityTier"] = json!(best_t.as_u8());
+    out["qualityLabel"] = json!(best_t.label());
     out["isAnime"] = json!(is_anime);
     if is_anime {
         out["dubbedCount"] = json!(dubbed_count);
@@ -1287,8 +1387,13 @@ fn rank_sources(app: &App, v: &mut Vec<Value>) {
     let pro = mpv::find(app).is_some(); let hdr_pref = app.state.read(|st| st["prefs"]["preferHdr"].as_bool().unwrap_or(false));
     for x in v.iter_mut() { let qs = quality_score(x, pro, hdr_pref); x["qs"] = json!(qs); let q = x["q"].clone(); if let Some(lab) = quality_label(&q) { x["label"] = json!(lab); } }
     // one score: picture quality minus a penalty for real trouble (failures, frequent stalls, slow
-    // starts). A stall or two doesn't outweigh 4K; a version that keeps failing drops below HD.
-    let score = |x: &Value| { let q = x["qs"].as_f64().unwrap_or(0.0); let h = x["health"].as_f64().unwrap_or(0.0); (if pref4k { q } else { -q }) - 3.0 * h };
+    // starts). CAM rips ALWAYS drop to the very bottom when any clean copy exists.
+    let score = |x: &Value| {
+        if x["cam"].as_bool().unwrap_or(false) { return -5000.0; }
+        let q = x["qs"].as_f64().unwrap_or(0.0);
+        let h = x["health"].as_f64().unwrap_or(0.0);
+        (if pref4k { q } else { -q }) - 3.0 * h
+    };
     v.sort_by(|a, b| score(b).total_cmp(&score(a)));
 }
 /// "4K HDR10 · 5.1" for a probed stream.
@@ -1302,54 +1407,102 @@ fn quality_label(q: &Value) -> Option<String> {
     Some(s)
 }
 
-/// Idle time: probe the other versions of movies AND series being watched / on the list, so the
-/// best one is known (resolution, HDR, sound) before pressing play. Only when the account is free.
+/// Idle time (#7 Instant-Start Quality Pre-Prober): quietly pre-probes Continue Watching, My List,
+/// Wanted, top 4K/DV Showcase films, and newest UFC PPV replays so playback starts instantly and
+/// real verified 4K/HDR10/Dolby Vision bitrates outrank fake upscales. Yields immediately on any play.
 async fn quality_worker(app: &Arc<App>) {
+    if std::env::var("TV_TEST_SOURCE").map_or(false, |v| !v.is_empty()) { return; }
     let cat = app.catalog();
-    let (m_ids, s_ids): (Vec<i64>, Vec<i64>) = app.state.read(|st| {
-        let mut mv: Vec<i64> = vec![]; let mut sv: Vec<i64> = vec![];
-        for k in ["progress", "list", "wanted"] {
-            if let Some(m) = st[k].as_object() {
-                for (_, x) in m {
+    let (cw_m_ids, list_m_ids, s_ids): (Vec<i64>, Vec<i64>, Vec<i64>) = app.state.read(|st| {
+        let mut cw_mv: Vec<i64> = vec![];
+        let mut mv: Vec<i64> = vec![];
+        let mut sv: Vec<i64> = vec![];
+        for (idx, k) in ["progress", "list", "wanted", "follows"].iter().enumerate() {
+            if let Some(m) = st[*k].as_object() {
+                for (mk, x) in m {
+                    if *k == "follows" {
+                        if let Ok(sid) = mk.parse::<i64>() { if sid > 0 && !sv.contains(&sid) { sv.push(sid); } }
+                        continue;
+                    }
                     let it = &x["item"];
                     let kind = it["k"].as_str().unwrap_or("");
                     if kind == "s" { let id = util::i(&it["id"]); if id > 0 && !sv.contains(&id) { sv.push(id); } }
                     else if kind == "e" { let sid = util::i(&it["sid"]); if sid > 0 && !sv.contains(&sid) { sv.push(sid); } }
-                    else { let id = util::i(&it["id"]); if id > 0 && !mv.contains(&id) { mv.push(id); } }
+                    else {
+                        let id = util::i(&it["id"]);
+                        if id > 0 {
+                            if idx == 0 { if !cw_mv.contains(&id) { cw_mv.push(id); } }
+                            else if !mv.contains(&id) { mv.push(id); }
+                        }
+                    }
                 }
             }
         }
-        (mv, sv)
+        (cw_mv, mv, sv)
     });
     let mut todo: Vec<(&'static str, i64, String)> = vec![];
-    for id in m_ids {
+    let push_todo = |todo: &mut Vec<(&'static str, i64, String)>, kind: &'static str, vid: i64, ext: String| {
+        if vid > 0 && app.stream.quality_of(vid).is_none() && !todo.iter().any(|x| x.1 == vid) {
+            todo.push((kind, vid, ext));
+        }
+    };
+    // Priority 1: Continue Watching movies (even single-variant for instant resume!) + multi-variant My List / Wanted
+    for id in cw_m_ids {
         let Some(it) = cat.movie(id) else { continue };
-        if it.variants.is_empty() { continue; }
         for vid in std::iter::once(it.id).chain(it.variants.iter().map(|v| v.id)) {
-            if app.stream.quality_of(vid).is_none() && !todo.iter().any(|x| x.1 == vid) {
-                let e = cat.movie_raw.get(&vid).map(|m| m.ext.clone()).unwrap_or_else(|| "mp4".into());
-                todo.push(("movie", vid, e));
-            }
+            let e = cat.movie_raw.get(&vid).map(|m| m.ext.clone()).unwrap_or_else(|| "mp4".into());
+            push_todo(&mut todo, "movie", vid, e);
         }
     }
-    // Also probe episode 1 of watched/listed series that have multiple variants (e.g. 4K DV vs HD)
+    for id in list_m_ids {
+        let Some(it) = cat.movie(id) else { continue };
+        for vid in std::iter::once(it.id).chain(it.variants.iter().map(|v| v.id)) {
+            let e = cat.movie_raw.get(&vid).map(|m| m.ext.clone()).unwrap_or_else(|| "mp4".into());
+            push_todo(&mut todo, "movie", vid, e);
+        }
+    }
+    // Priority 2: Watched/listed/followed series (probe episode 1 across variants so 4K DV vs HD is known!)
     for sid in s_ids.into_iter().take(4) {
         if todo.len() >= 6 { break; }
         let Some(it) = cat.series_item(sid).cloned() else { continue };
-        if it.variants.is_empty() { continue; }
         for vsid in std::iter::once(it.id).chain(it.variants.iter().map(|v| v.id)) {
             let info = app.xc_info("get_series_info", "series_id", vsid, 6 * 3_600_000).await;
             if let Some(first_ep) = info["episodes"].as_object().and_then(|m| m.values().next()).and_then(|a| a.as_array()).and_then(|a| a.first()) {
                 let eid = util::i(&first_ep["id"]);
-                if eid > 0 && app.stream.quality_of(eid).is_none() && !todo.iter().any(|x| x.1 == eid) {
-                    let ext = { let x = s(&first_ep["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
-                    todo.push(("series", eid, ext));
-                }
+                let ext = { let x = s(&first_ep["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
+                push_todo(&mut todo, "series", eid, ext);
             }
         }
     }
+    // Priority 3: Top unprobed 4K Dolby Vision / 4K UHD Showcase movies (verify real bitrate & HDR/DV!)
+    if todo.len() < 10 {
+        let mut top_4k: Vec<(f64, i64, String)> = cat.movies.iter()
+            .filter(|m| m.en && !m.sport && !m.cam && (m.dv || m.uhd || m.variants.iter().any(|v| !v.cam && (v.dv || v.uhd))))
+            .filter_map(|m| {
+                let best_vid = if m.dv { m.id } else if let Some(v) = m.variants.iter().find(|v| !v.cam && v.dv) { v.id }
+                    else if m.uhd { m.id } else if let Some(v) = m.variants.iter().find(|v| !v.cam && v.uhd) { v.id } else { m.id };
+                if app.stream.quality_of(best_vid).is_some() { return None; }
+                let pop = app.meta_of(m).map(|mm| mm.p + mm.va * 8.0).unwrap_or(m.rating * 5.0);
+                let ext = cat.movie_raw.get(&best_vid).map(|x| x.ext.clone()).unwrap_or_else(|| "mp4".into());
+                Some((pop, best_vid, ext))
+            })
+            .collect();
+        top_4k.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, vid, ext) in top_4k.into_iter().take(6) {
+            push_todo(&mut todo, "movie", vid, ext);
+            if todo.len() >= 10 { break; }
+        }
+    }
+    // Priority 4: Latest 3 unprobed UFC PPV replays so opening a fight is instant!
+    if todo.len() < 10 {
+        let fight_list = fights::collect_fights(&cat, None);
+        for f in fight_list.into_iter().filter(|f| f.entry.sport_key == "ufc" && f.entry.event_kind == "ppv").take(3) {
+            push_todo(&mut todo, "movie", f.id, f.ext);
+            if todo.len() >= 10 { break; }
+        }
+    }
     let ua = app.cfg.str("userAgent");
-    for (kind, vid, ext) in todo.into_iter().take(6) {
+    for (kind, vid, ext) in todo.into_iter().take(10) {
         if app.stream.is_active() || mpv::running(app) || livebuf::is_active() || now_ms() - app.stream.last_stop() < 120_000 { return; }
         match app.account(true).await { Ok(a) if a.active == 0 => {} _ => return }
         let url = app.xc.stream_url(kind, &vid.to_string(), &ext, false);
@@ -1365,8 +1518,8 @@ async fn quality_worker(app: &Arc<App>) {
             _ = async { while !app.skips.cancel.load(SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } } => false,
         };
         app.skips.busy.store(false, SeqCst); app.stream.mark_stop();
-        if got { println!("[quality] probed {kind} version {vid}"); }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if got { println!("[quality] pre-probed {kind} {vid}"); }
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     }
 }
 async fn health(State(app): A, Json(b): Json<Value>) -> Response {
