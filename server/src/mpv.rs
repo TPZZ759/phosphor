@@ -1,5 +1,5 @@
 // Pro player: hands a title to mpv (gpu-next/libplacebo, true OLED infinite contrast, exact HDR /
-// Dolby Vision & gamma 2.2 SDR colour, GPU neural upscaling, display-synced motion). mpv reads the
+// Dolby Vision & gamma 2.2 SDR colour, GPU upscaling, display-synced motion). mpv reads the
 // provider directly over the single connection, so the browser stream is stopped first. Progress,
 // intro-skipping, phone remote control, and auto-next-episode run over mpv's IPC pipe; when mpv
 // closes, the display goes back to its own settings.
@@ -21,7 +21,7 @@ pub struct Session {
     pub dur: f64,
     pub title: String,
     pub live: bool,
-    pub skips: Vec<(f64, f64, String)>,
+    pub skips: Vec<(f64, f64, String, String)>, // (start, end, title, kind: "recap" | "intro")
     pub credits: Option<f64>,
     pub autoskip: bool,
     pub skipped: Vec<usize>,
@@ -126,11 +126,18 @@ pub fn control_sync(app: &App, cmd: &str, v: Option<&Value>) -> bool {
         "subs" => ipc(json!(["cycle", "sub"])).is_some(),
         "audio" => ipc(json!(["cycle", "audio"])).is_some(),
         "full" => ipc(json!(["cycle", "fullscreen"])).is_some(),
+        "next" => ipc(json!(["script-message", "tv-next"])).is_some(),
+        "prev" => ipc(json!(["script-message", "tv-prev"])).is_some(),
         "skip" => {
-            let target = app.mpv.s.lock().unwrap().as_ref().and_then(|s| {
-                s.skips.iter().find(|(st, en, _)| s.pos >= *st - 2.0 && s.pos < *en - 2.0).map(|(_, en, _)| *en)
-            });
-            if let Some(en) = target {
+            let (has_osd, target) = app.mpv.s.lock().unwrap().as_ref().map(|s| {
+                let tgt = s.skips.iter()
+                    .find(|(st, en, _, _)| s.pos >= *st - 2.0 && s.pos < *en - 2.0)
+                    .map(|(_, en, _, _)| *en);
+                (s.has_osd, tgt)
+            }).unwrap_or((false, None));
+            if has_osd && ipc(json!(["script-message", "tv-skip"])).is_some() {
+                true
+            } else if let Some(en) = target {
                 let _ = ipc(json!(["show-text", "Skipped intro", 2500]));
                 ipc(json!(["seek", en, "absolute"])).is_some()
             } else {
@@ -215,17 +222,26 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
     let audio_delay = b["audioDelay"].as_f64().unwrap_or(0.0);
     let sub_delay = b["subDelay"].as_f64().unwrap_or(0.0);
     let sub_label = b["subTitle"].as_str().unwrap_or("").to_string();
+    let has_prev = b["hasPrev"].as_bool().unwrap_or(false);
+    let prev_label = b["prevLabel"].as_str().unwrap_or("").to_string();
     let has_next = b["hasNext"].as_bool().unwrap_or(false);
     let next_label = b["nextLabel"].as_str().unwrap_or("").to_string();
-    let autoplay = b["autoplay"].as_bool().unwrap_or(true);
     let key = b["progress"]["key"].as_str().unwrap_or("").to_string();
 
-    let (oled_peak, mpv_vsr, mpv_anime_sharp, mpv_shaders) = app.state.read(|st| (
+    let (oled_peak, mpv_vsr, mpv_anime_sharp, mpv_shaders, pref_autoplay, pref_autoskip, pref_autoskip_credits) = app.state.read(|st| (
         st["prefs"]["oledPeak"].as_str().unwrap_or("auto").to_string(),
         st["prefs"]["mpvVsr"].as_bool().unwrap_or(false),
         st["prefs"]["mpvAnimeSharp"].as_bool().unwrap_or(true),
         st["prefs"]["mpvShaders"].as_str().unwrap_or("auto").to_string(),
+        st["prefs"]["autoplay"].as_bool().unwrap_or(true),
+        st["prefs"]["autoskip"].as_bool().unwrap_or(false),
+        st["prefs"]["autoSkipCredits"].as_bool().unwrap_or(true),
     ));
+    let autoplay = b["autoplay"].as_bool().unwrap_or(pref_autoplay);
+    let autoskip = b["autoskip"].as_bool().unwrap_or(pref_autoskip);
+    let autoskip_credits = b["autoSkipCredits"].as_bool()
+        .or_else(|| b["autoskipCredits"].as_bool())
+        .unwrap_or(pref_autoskip_credits);
 
     // Match OLED refresh rate + True Black HDR/SDR switch, then WAIT for DWM to finish switching
     // before spawning mpv so its D3D11 swapchain latches onto the exact final colour space!
@@ -335,16 +351,25 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         }
     }
 
-    // Parse intro/credits skips BEFORE spawning mpv so we can pass them into tv_osd.lua!
-    let skips: Vec<(f64, f64, String)> = b["skips"].as_array().map(|arr| {
-        arr.iter().filter_map(|x| {
-            let st = x["s"].as_f64()?;
-            let en = x["e"].as_f64()?;
-            Some((st, en, x["title"].as_str().unwrap_or("Intro").to_string()))
-        }).collect()
-    }).unwrap_or_default();
+    // Parse intro/recap/credits skips BEFORE spawning mpv so we can pass them into tv_osd.lua!
+    let skips = parse_skips_list(&b["skips"]);
     let credits = b["credits"].as_f64().filter(|x| *x > 30.0);
-    let autoskip = b["autoskip"].as_bool().unwrap_or(false);
+
+    // Clear stale action file & stage episodes list (when provided) BEFORE spawning mpv.
+    let action_file = app.data.join("mpv-action.json");
+    let _ = std::fs::remove_file(&action_file);
+    let episodes_file = app.data.join("mpv-episodes.json");
+    let has_episodes = b["episodes"].as_array().map_or(false, |arr| !arr.is_empty());
+    if has_episodes {
+        if let Ok(bytes) = serde_json::to_vec(&b["episodes"]) {
+            let tmp = episodes_file.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &episodes_file);
+            }
+        }
+    } else {
+        let _ = std::fs::remove_file(&episodes_file);
+    }
 
     // Custom pure-black OLED Lua OSD + neural GPU shader chain
     let root = app.data.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -372,17 +397,27 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         };
         add_opt("title", title.clone());
         add_opt("sub", sub_label.clone());
-        if let Some((ist, ien, _)) = skips.iter().find(|(_, _, l)| {
-            let ll = l.to_lowercase(); ll.contains("intro") || ll.contains("opening") || ll.contains("recap")
-        }) {
+        if let Some((rst, ren, _, _)) = skips.iter().find(|(_, _, _, k)| k == "recap") {
+            add_opt("recap_s", format!("{rst:.2}"));
+            add_opt("recap_e", format!("{ren:.2}"));
+        }
+        if let Some((ist, ien, _, _)) = skips.iter().find(|(_, _, _, k)| k != "recap") {
             add_opt("intro_s", format!("{ist:.2}"));
             add_opt("intro_e", format!("{ien:.2}"));
         }
         if let Some(cr) = credits { add_opt("credits", format!("{cr:.2}")); }
+        add_opt("has_prev", if has_prev { "yes" } else { "no" }.into());
+        add_opt("prev_label", prev_label.clone());
         add_opt("has_next", if has_next { "yes" } else { "no" }.into());
         add_opt("next_label", next_label.clone());
         add_opt("autoplay", if autoplay { "yes" } else { "no" }.into());
         add_opt("autoskip", if autoskip { "yes" } else { "no" }.into());
+        add_opt("autoskip_credits", if autoskip_credits { "yes" } else { "no" }.into());
+        add_opt("is_series", if kind == "series" { "yes" } else { "no" }.into());
+        add_opt("action_file", action_file.to_string_lossy().to_string());
+        if has_episodes {
+            add_opt("episodes_file", episodes_file.to_string_lossy().to_string());
+        }
         add_opt("shader_dir", shader_dir.to_string_lossy().to_string());
         add_opt("shader_preset", shader_preset.into());
         add_opt("night", if night { "yes" } else { "no" }.into());
@@ -486,9 +521,9 @@ async fn watch(app: Arc<App>, gen: u64) {
                 s.next_triggered = true;
             }
             if !s.has_osd && !s.live && !s.skips.is_empty() {
-                for (i, (st, en, label)) in s.skips.iter().enumerate() {
+                for (i, (st, en, _label, kind)) in s.skips.iter().enumerate() {
                     if !s.skipped.contains(&i) && s.pos >= *st && s.pos < *en - 2.0 {
-                        let is_intro = label.to_lowercase().contains("intro") || label.to_lowercase().contains("opening");
+                        let is_intro = kind != "recap";
                         s.skipped.push(i);
                         skip_cmd = Some((*en, s.autoskip && is_intro));
                         break;
@@ -509,21 +544,58 @@ async fn watch(app: Arc<App>, gen: u64) {
         if n % 5 == 0 { save(&app, &mut history).await; }
     }
     if !mine(&app) { return; }
-    save(&app, &mut history).await;
-    let s = app.mpv.s.lock().unwrap().take();
-    if let Some(s) = s {
-        let finished = s.next_triggered || (!s.live && s.dur > 60.0 && (
-            s.pos / s.dur >= 0.90
-            || s.credits.map_or(false, |c| c > s.dur * 0.6 && s.pos >= c - 5.0)
-        ));
+    let action_path = app.data.join("mpv-action.json");
+    let action_raw = std::fs::read_to_string(&action_path).ok();
+    let _ = std::fs::remove_file(&action_path);
+    let (mut action, target_ep_id, act_pos, act_dur) = action_raw
+        .as_deref()
+        .map(parse_action_file)
+        .unwrap_or_else(|| (String::new(), None, None, None));
+
+    let s = {
+        let mut g = app.mpv.s.lock().unwrap();
+        if g.as_ref().map_or(false, |s| s.gen == gen) { g.take() } else { None }
+    };
+    if let Some(mut s) = s {
+        if let Some(ap) = act_pos { s.pos = ap; }
+        if let Some(ad) = act_dur { s.dur = ad; }
+        if action == "next" {
+            s.next_triggered = true;
+        } else if action.is_empty() && s.next_triggered {
+            action = "next".into();
+        }
+        let finished = is_session_finished(s.live, s.pos, s.dur, s.credits, &action, s.next_triggered);
+        let final_pos = if finished && s.dur > 0.0 { s.dur } else { s.pos };
+        if !s.live && !s.key.is_empty() && final_pos >= 5.0 && s.dur > 0.0 {
+            let mut b = json!({ "key": s.key, "pos": final_pos, "dur": s.dur, "item": s.body["item"], "tmdb": s.body["tmdb"] });
+            if !history && final_pos > 60.0 {
+                b["historyKind"] = s.body["historyKind"].clone();
+                b["historyTitle"] = s.body["historyTitle"].clone();
+            }
+            let _ = crate::progress(State(app.clone()), Json(b)).await;
+        }
         *app.mpv.last_done.lock().unwrap() = Some(json!({
-            "gen": s.gen, "key": s.key, "finished": finished, "nextNow": s.next_triggered, "pos": s.pos, "dur": s.dur
+            "gen": s.gen,
+            "key": s.key,
+            "finished": finished,
+            "nextNow": s.next_triggered,
+            "action": action,
+            "targetEpId": target_ep_id,
+            "pos": final_pos,
+            "dur": s.dur
         }));
-        println!("[mpv] closed at {:.0}s (finished={finished} next_now={})", s.pos, s.next_triggered);
+        println!(
+            "[mpv] closed at {:.0}s (finished={finished} next_now={} action={})",
+            final_pos,
+            s.next_triggered,
+            if action.is_empty() { "-" } else { &action }
+        );
     }
     app.stream.mark_stop();
-    let a = app.clone();
-    let _ = tokio::task::spawn_blocking(move || crate::display::restore(&a)).await;
+    if app.mpv.s.lock().unwrap().is_none() {
+        let a = app.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::display::restore(&a)).await;
+    }
 }
 
 async fn save(app: &Arc<App>, history: &mut bool) {
@@ -578,4 +650,82 @@ pub async fn install(State(app): State<Arc<App>>) -> Response {
         }
     });
     crate::j(json!({ "ok": true }))
+}
+
+fn parse_skips_list(v: &Value) -> Vec<(f64, f64, String, String)> {
+    v.as_array().map(|arr| {
+        arr.iter().filter_map(|x| {
+            let st = x["s"].as_f64()?;
+            let en = x["e"].as_f64()?;
+            if !st.is_finite() || !en.is_finite() || en <= st { return None; }
+            let lbl = x["title"].as_str().unwrap_or("Intro").to_string();
+            let k = x["kind"].as_str().unwrap_or("").to_lowercase();
+            let kind = if k == "recap" || crate::re!(r"(?i)\b(recap|previously)\b").is_match(&lbl) {
+                "recap".to_string()
+            } else {
+                "intro".to_string()
+            };
+            Some((st, en, lbl, kind))
+        }).collect()
+    }).unwrap_or_default()
+}
+
+fn parse_action_file(raw: &str) -> (String, Option<i64>, Option<f64>, Option<f64>) {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else { return (String::new(), None, None, None); };
+    let action = match v["action"].as_str().unwrap_or("").trim().to_lowercase().as_str() {
+        "next" => "next".to_string(),
+        "prev" => "prev".to_string(),
+        "ep" => "ep".to_string(),
+        _ => String::new(),
+    };
+    let parse_id = |x: &Value| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok()));
+    let target_ep_id = parse_id(&v["targetEpId"])
+        .or_else(|| parse_id(&v["epId"]))
+        .or_else(|| parse_id(&v["ep_id"]))
+        .or_else(|| parse_id(&v["id"]))
+        .or_else(|| parse_id(&v["ep"]));
+    let pos = v["pos"].as_f64().filter(|x| x.is_finite() && *x >= 0.0);
+    let dur = v["dur"].as_f64().filter(|x| x.is_finite() && *x > 0.0);
+    (action, target_ep_id, pos, dur)
+}
+
+fn is_session_finished(live: bool, pos: f64, dur: f64, credits: Option<f64>, action: &str, next_triggered: bool) -> bool {
+    if live || dur <= 30.0 { return false; }
+    pos / dur >= 0.90
+        || credits.map_or(false, |c| c >= dur * 0.5 && pos >= c - 5.0)
+        || ((action == "next" || next_triggered) && pos / dur >= 0.70)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_action_file_variants() {
+        assert_eq!(parse_action_file(r#"{"action":"next"}"#), ("next".into(), None, None, None));
+        assert_eq!(parse_action_file(r#"{"action":"prev"}"#), ("prev".into(), None, None, None));
+        assert_eq!(parse_action_file(r#"{"action":"ep","targetEpId":42}"#), ("ep".into(), Some(42), None, None));
+        assert_eq!(parse_action_file(r#"{"action":"ep","id":"99","pos":120.5,"dur":1400.0}"#), ("ep".into(), Some(99), Some(120.5), Some(1400.0)));
+        assert_eq!(parse_action_file("not json"), (String::new(), None, None, None));
+    }
+
+    #[test]
+    fn parse_skips_list_separates_recap_and_intro() {
+        let skips = parse_skips_list(&json!([
+            { "s": 0.0, "e": 35.0, "title": "Previously On" },
+            { "s": 90.0, "e": 180.0, "title": "OP", "kind": "intro" }
+        ]));
+        assert_eq!(skips.len(), 2);
+        assert_eq!(skips[0].3, "recap");
+        assert_eq!(skips[1].3, "intro");
+    }
+
+    #[test]
+    fn session_finished_rules() {
+        assert!(is_session_finished(false, 900.0, 1000.0, None, "", false));
+        assert!(is_session_finished(false, 845.0, 1000.0, Some(850.0), "", false));
+        assert!(is_session_finished(false, 710.0, 1000.0, None, "next", true));
+        assert!(!is_session_finished(false, 200.0, 1000.0, None, "next", true));
+        assert!(!is_session_finished(true, 950.0, 1000.0, None, "next", true));
+    }
 }

@@ -119,12 +119,12 @@ async fn state(State(app): A, h: HeaderMap) -> Response {
     let (t, s) = app.remote.tv_state.lock().unwrap().clone();
     Json(json!({ "tv": app.remote.tx.receiver_count() > 0, "fresh": now() - t < 6000, "s": s })).into_response()
 }
-const CMDS: &[&str] = &["toggle", "seek", "seekto", "next", "subs", "vol", "mute", "full", "close", "key", "skip", "audio", "source", "tvmode", "last"];
+const CMDS: &[&str] = &["toggle", "seek", "seekto", "next", "prev", "subs", "vol", "mute", "full", "close", "key", "skip", "audio", "source", "tvmode", "last"];
 async fn cmd(State(app): A, h: HeaderMap, Json(b): Json<Value>) -> Response {
     if let Err(r) = authed(&app, &h) { return r; }
     let c = b["cmd"].as_str().unwrap_or("");
     if !CMDS.contains(&c) { return deny(StatusCode::BAD_REQUEST, "unknown command"); }
-    if crate::mpv::running(&app) && ["toggle", "seek", "seekto", "vol", "mute", "subs", "audio", "full", "skip", "close"].contains(&c) {
+    if crate::mpv::running(&app) && ["toggle", "seek", "seekto", "next", "prev", "vol", "mute", "subs", "audio", "full", "skip", "close"].contains(&c) {
         let a = app.clone();
         let cs = c.to_string();
         let v = b.get("v").cloned();

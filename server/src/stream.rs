@@ -107,12 +107,16 @@ impl Streamer {
         let audio: Vec<Value> = streams.iter().filter(|s| s["codec_type"] == "audio").enumerate().map(|(i, s)| json!({ "i": i, "codec": s["codec_name"], "ch": s["channels"], "lang": s["tags"]["language"].as_str().unwrap_or(""), "title": s["tags"]["title"].as_str().unwrap_or("") })).collect();
         let subs: Vec<Value> = streams.iter().filter(|s| s["codec_type"] == "subtitle").enumerate().map(|(i, s)| json!({ "i": i, "codec": s["codec_name"], "lang": s["tags"]["language"].as_str().unwrap_or(""), "title": s["tags"]["title"].as_str().unwrap_or(""), "forced": s["disposition"]["forced"].as_i64().unwrap_or(0) == 1 }))
             .filter(|s| TEXT_SUBS.contains(&s["codec"].as_str().unwrap_or(""))).collect();
-        let skips: Vec<Value> = j["chapters"].as_array().into_iter().flatten().map(|c| (c["start_time"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), c["end_time"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), c["tags"]["title"].as_str().unwrap_or("").to_string()))
-            .filter(|(s, e, t)| crate::re!(r"(?i)intro|opening|recap|previously|title sequence").is_match(t) && e - s < 300.0).map(|(s, e, t)| json!({ "s": s, "e": e, "title": t })).collect();
+        let dur = j["format"]["duration"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+        let (chapters, skips, credits_chapter) = extract_chapters(&j["chapters"], dur);
         let pic = streams.iter().find(|s| s["codec_type"] == "video").map(picture).unwrap_or(json!({}));
-        let mut r = json!({ "v": 2, "duration": j["format"]["duration"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), "video": video, "audio": audio, "subs": pick_subs(&Value::Array(subs)), "skips": skips, "pic": pic });
+        let mut r = json!({ "v": 2, "duration": dur, "video": video, "audio": audio, "subs": pick_subs(&Value::Array(subs)), "skips": skips, "pic": pic });
+        if !chapters.is_empty() { r["chapters"] = json!(chapters); }
+        if let Some(cc) = credits_chapter { r["creditsChapter"] = json!(cc); }
         r["pic"]["kbps"] = json!(j["format"]["bit_rate"].as_str().and_then(|x| x.parse::<f64>().ok()).map(|b| (b / 1000.0).round()).unwrap_or(0.0));
-        { let mut p = self.probes.lock().unwrap(); p.insert(k, r.clone()); let _ = std::fs::write(&self.probe_file, serde_json::to_vec(&*p).unwrap()); }
+        let body = { let mut p = self.probes.lock().unwrap(); p.insert(k, r.clone()); serde_json::to_vec(&*p).unwrap() };
+        let tmp = self.probe_file.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() { let _ = std::fs::rename(&tmp, &self.probe_file); }
         Some(r)
     }
 
@@ -293,4 +297,75 @@ pub fn snap_fps(f: f64) -> f64 { STD_FPS.iter().copied().min_by(|a, b| (a - f).a
 /// Cached entries from before snapping: an off-grid rate (24.417) is treated as 23.976 film.
 fn fix_fps(pic: &mut Value) {
     if let Some(f) = pic["fps"].as_f64() { if f > 0.0 && !is_std(f) { let s = snap_fps(f); pic["fps"] = json!(if is_std(s) { s } else if (f - 24.0).abs() < 1.0 { 23.976 } else { f }); } }
+}
+
+/// Extract all chapters, recap/intro skips, and the first end-credits chapter timestamp from ffprobe output.
+fn extract_chapters(raw_chapters: &Value, dur: f64) -> (Vec<Value>, Vec<Value>, Option<f64>) {
+    let mut chapters = vec![];
+    let mut skips = vec![];
+    let mut credits_chapter: Option<f64> = None;
+    for c in raw_chapters.as_array().into_iter().flatten() {
+        let s = c["start_time"].as_str().and_then(|x| x.parse::<f64>().ok()).or_else(|| c["start_time"].as_f64()).unwrap_or(0.0);
+        let e = c["end_time"].as_str().and_then(|x| x.parse::<f64>().ok()).or_else(|| c["end_time"].as_f64()).unwrap_or(0.0);
+        let title = c["tags"]["title"].as_str().unwrap_or("").trim().to_string();
+        chapters.push(json!({ "s": s, "e": e, "title": title }));
+        let len = e - s;
+        if len > 3.0 && len < 300.0 && s < 600.0
+            && crate::re!(r"(?i)\b(recap|previously|intro|opening|title sequence|prologue|cold open|op)\b").is_match(&title)
+        {
+            let kind = if crate::re!(r"(?i)\b(recap|previously)\b").is_match(&title) { "recap" } else { "intro" };
+            skips.push(json!({ "s": s, "e": e, "title": title, "kind": kind, "src": "chapter" }));
+        }
+        if credits_chapter.is_none()
+            && dur > 30.0
+            && s >= dur * 0.55
+            && s < dur - 3.0
+            && crate::re!(r"(?i)\b(credits|outro|ending|end credits|closing|epilogue|preview|next episode|ed)\b").is_match(&title)
+        {
+            credits_chapter = Some(s);
+        }
+    }
+    (chapters, skips, credits_chapter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_chapters_recap_intro_and_credits() {
+        let raw = json!([
+            { "start_time": "0.0", "end_time": "42.5", "tags": { "title": "Previously On" } },
+            { "start_time": "42.5", "end_time": "132.5", "tags": { "title": "OP" } },
+            { "start_time": "132.5", "end_time": "700.0", "tags": { "title": "Stop the Red Ship" } },
+            { "start_time": "700.0", "end_time": "1310.0", "tags": { "title": "Part B" } },
+            { "start_time": "1310.0", "end_time": "1400.0", "tags": { "title": "ED" } },
+            { "start_time": "1400.0", "end_time": "1430.0", "tags": { "title": "Next Episode Preview" } }
+        ]);
+        let (chapters, skips, credits) = extract_chapters(&raw, 1440.0);
+        assert_eq!(chapters.len(), 6);
+        assert_eq!(skips.len(), 2);
+        assert_eq!(skips[0]["kind"], "recap");
+        assert_eq!(skips[0]["s"], 0.0);
+        assert_eq!(skips[0]["e"], 42.5);
+        assert_eq!(skips[1]["kind"], "intro");
+        assert_eq!(skips[1]["s"], 42.5);
+        assert_eq!(skips[1]["e"], 132.5);
+        assert_eq!(credits, Some(1310.0));
+    }
+
+    #[test]
+    fn extract_chapters_enforces_bounds() {
+        let raw = json!([
+            { "start_time": "0.0", "end_time": "2.0", "tags": { "title": "Intro" } },
+            { "start_time": "0.0", "end_time": "320.0", "tags": { "title": "Recap" } },
+            { "start_time": "650.0", "end_time": "720.0", "tags": { "title": "Opening" } },
+            { "start_time": "500.0", "end_time": "560.0", "tags": { "title": "End Credits" } },
+            { "start_time": "1438.0", "end_time": "1440.0", "tags": { "title": "Outro" } }
+        ]);
+        let (chapters, skips, credits) = extract_chapters(&raw, 1440.0);
+        assert_eq!(chapters.len(), 5);
+        assert!(skips.is_empty());
+        assert_eq!(credits, None);
+    }
 }

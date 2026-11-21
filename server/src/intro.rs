@@ -93,9 +93,6 @@ pub fn best_match(a: &[u32], b: &[u32], min_secs: f64) -> Option<(f64, f64, f64,
     Some((s as f64 / FPS, e as f64 / FPS, (s as i64 + off) as f64 / FPS, (e as i64 + off) as f64 / FPS))
 }
 
-#[cfg(test)]
-mod tests {}
-
 // ---------------------------------------------------------------- per-episode store + analysis
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -211,4 +208,487 @@ pub async fn grab(sk: &Skips, url: &str, ua: &str, from: f64, len: f64) -> Optio
     let _ = child.wait().await;
     if bytes.len() < (20.0 * RATE as f64) as usize * 2 { return None; }
     Some(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+}
+
+// ---------------------------------------------------------------- online skip segments (IntroDB.app + AniSkip)
+use crate::app::App;
+use crate::util::{enc, norm, now_ms};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+const ONLINE_HIT_TTL_MS: i64 = 30 * 86_400_000;
+const ONLINE_MISS_TTL_MS: i64 = 3 * 86_400_000;
+const ONLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OnlineSkipEntry {
+    pub t: i64,
+    #[serde(default)]
+    pub recap: Option<(f64, f64)>,
+    #[serde(default)]
+    pub intro: Option<(f64, f64)>,
+    #[serde(default)]
+    pub outro: Option<(f64, f64)>,
+    #[serde(default)]
+    pub src: String, // "introdb" | "aniskip" | "none"
+}
+
+impl OnlineSkipEntry {
+    fn is_hit(&self) -> bool {
+        self.src != "none" && (self.recap.is_some() || self.intro.is_some() || self.outro.is_some())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MalIdEntry {
+    pub t: i64,
+    pub id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct OnlineSkipDb {
+    #[serde(default)]
+    entries: HashMap<String, OnlineSkipEntry>,
+    #[serde(default)]
+    mal_ids: HashMap<String, MalIdEntry>,
+}
+
+/// Persistent disk-backed cache for IntroDB.app + AniSkip lookups (`data/skip-online-cache.json`).
+pub struct OnlineSkips {
+    file: PathBuf,
+    db: Mutex<OnlineSkipDb>,
+}
+
+impl OnlineSkips {
+    pub fn new(data: &Path) -> Self {
+        let file = data.join("skip-online-cache.json");
+        let db: OnlineSkipDb = std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        OnlineSkips { file, db: Mutex::new(db) }
+    }
+
+    fn write_bytes(&self, bytes: Vec<u8>) {
+        let tmp = self.file.with_extension("tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.file);
+        }
+    }
+
+    fn get_entry(&self, key: &str, now: i64) -> Option<OnlineSkipEntry> {
+        let g = self.db.lock().unwrap();
+        let e = g.entries.get(key)?;
+        let ttl = if e.is_hit() { ONLINE_HIT_TTL_MS } else { ONLINE_MISS_TTL_MS };
+        if now - e.t < ttl { Some(e.clone()) } else { None }
+    }
+
+    fn put_entry(&self, key: String, entry: OnlineSkipEntry) {
+        let bytes = {
+            let mut g = self.db.lock().unwrap();
+            g.entries.insert(key, entry);
+            serde_json::to_vec(&*g).ok()
+        };
+        if let Some(b) = bytes { self.write_bytes(b); }
+    }
+
+    fn get_mal_id(&self, norm_title: &str, now: i64) -> Option<Option<i64>> {
+        let g = self.db.lock().unwrap();
+        let e = g.mal_ids.get(norm_title)?;
+        let ttl = if e.id.is_some() { ONLINE_HIT_TTL_MS } else { ONLINE_MISS_TTL_MS };
+        if now - e.t < ttl { Some(e.id) } else { None }
+    }
+
+    fn put_mal_id(&self, norm_title: String, id: Option<i64>, now: i64) {
+        let bytes = {
+            let mut g = self.db.lock().unwrap();
+            g.mal_ids.insert(norm_title, MalIdEntry { t: now, id });
+            serde_json::to_vec(&*g).ok()
+        };
+        if let Some(b) = bytes { self.write_bytes(b); }
+    }
+}
+
+fn online_cache_key(kind: &str, imdb: &str, norm_title: &str, season: Option<i64>, ep: Option<i64>, is_anime: bool) -> Option<String> {
+    match kind {
+        "series" => {
+            let e = ep.filter(|&x| x > 0)?;
+            if !imdb.is_empty() {
+                if let Some(s) = season.filter(|&x| x >= 0) {
+                    return Some(format!("tv:{imdb}:s{s}e{e}"));
+                }
+            }
+            if is_anime && !norm_title.is_empty() {
+                let s = season.filter(|&x| x >= 0).unwrap_or(1);
+                return Some(format!("an:{norm_title}:s{s}e{e}"));
+            }
+            None
+        }
+        "movie" if !imdb.is_empty() => Some(format!("movie:{imdb}")),
+        _ => None,
+    }
+}
+
+fn parse_introdb_seg(seg: &Value, allow_open_end: bool) -> Option<(f64, f64)> {
+    if seg.is_null() { return None; }
+    let obj = if let Some(arr) = seg.as_array() { arr.first()? } else { seg };
+    if !obj.is_object() { return None; }
+    let start = obj["start_sec"].as_f64()
+        .or_else(|| obj["start_ms"].as_f64().map(|ms| ms / 1000.0))?;
+    let end = obj["end_sec"].as_f64()
+        .or_else(|| obj["end_ms"].as_f64().map(|ms| ms / 1000.0));
+    if !start.is_finite() || start < 0.0 { return None; }
+    match end {
+        Some(e) if e.is_finite() && e > start => Some((start, e)),
+        None if allow_open_end => Some((start, start)),
+        _ => None,
+    }
+}
+
+/// Parse IntroDB.app `/segments` payload into `(recap, intro, outro)`.
+pub fn parse_introdb(v: &Value) -> (Option<(f64, f64)>, Option<(f64, f64)>, Option<(f64, f64)>) {
+    (
+        parse_introdb_seg(&v["recap"], false),
+        parse_introdb_seg(&v["intro"], false),
+        parse_introdb_seg(&v["outro"], true),
+    )
+}
+
+/// Parse AniSkip v2 `/skip-times` payload into `(recap, intro, outro)`.
+pub fn parse_aniskip(v: &Value) -> (Option<(f64, f64)>, Option<(f64, f64)>, Option<(f64, f64)>) {
+    let mut recap: Option<(f64, f64)> = None;
+    let mut intro: Option<(f64, f64)> = None;
+    let mut outro: Option<(f64, f64)> = None;
+    let mut mixed_intro: Option<(f64, f64)> = None;
+    let mut mixed_outro: Option<(f64, f64)> = None;
+    for r in v["results"].as_array().into_iter().flatten() {
+        let iv = &r["interval"];
+        let Some(s) = iv["startTime"].as_f64().or_else(|| iv["start_time"].as_f64()) else { continue };
+        let Some(e) = iv["endTime"].as_f64().or_else(|| iv["end_time"].as_f64()) else { continue };
+        if !s.is_finite() || !e.is_finite() || s < 0.0 || e <= s { continue; }
+        match r["skipType"].as_str().unwrap_or("") {
+            "op" if intro.is_none() => intro = Some((s, e)),
+            "ed" if outro.is_none() => outro = Some((s, e)),
+            "recap" if recap.is_none() => recap = Some((s, e)),
+            "mixed-op" if mixed_intro.is_none() => mixed_intro = Some((s, e)),
+            "mixed-ed" if mixed_outro.is_none() => mixed_outro = Some((s, e)),
+            _ => {}
+        }
+    }
+    (recap, intro.or(mixed_intro), outro.or(mixed_outro))
+}
+
+/// Pick the best-matching MAL ID from a Jikan `/v4/anime?q=...` search response.
+pub fn pick_jikan_mal_id(v: &Value, title: &str) -> Option<i64> {
+    let want = norm(title);
+    if want.is_empty() { return None; }
+    let want_words: Vec<&str> = want.split_whitespace().collect();
+    let mut best: Option<(i32, i64)> = None;
+    for d in v["data"].as_array().into_iter().flatten() {
+        let Some(mal_id) = d["mal_id"].as_i64().filter(|&id| id > 0) else { continue };
+        let mut cands: Vec<&str> = vec![];
+        if let Some(t) = d["title"].as_str() { cands.push(t); }
+        if let Some(t) = d["title_english"].as_str() { cands.push(t); }
+        for t in d["titles"].as_array().into_iter().flatten() {
+            if let Some(s) = t["title"].as_str() { cands.push(s); }
+        }
+        for s in d["title_synonyms"].as_array().into_iter().flatten() {
+            if let Some(s) = s.as_str() { cands.push(s); }
+        }
+        let mut text_score = 0i32;
+        for raw in cands {
+            let c = norm(raw);
+            if c.is_empty() { continue; }
+            let sc = if c == want {
+                100
+            } else if c.starts_with(&want) || want.starts_with(&c) {
+                80
+            } else {
+                let cw: Vec<&str> = c.split_whitespace().collect();
+                if cw.is_empty() || want_words.is_empty() {
+                    0
+                } else {
+                    let common = want_words.iter().filter(|w| cw.contains(w)).count();
+                    ((2.0 * common as f64 / (want_words.len() + cw.len()) as f64) * 70.0).round() as i32
+                }
+            };
+            if sc > text_score { text_score = sc; }
+        }
+        if text_score < 40 { continue; }
+        let bonus = match d["type"].as_str().unwrap_or("") { "TV" => 5, "ONA" => 3, _ => 0 };
+        let total = text_score + bonus;
+        if best.map_or(true, |(bs, _)| total > bs) {
+            best = Some((total, mal_id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Drop out-of-bounds or implausible segments against `dur`.
+pub fn clamp_online_entry(entry: &mut OnlineSkipEntry, dur: f64) {
+    let check_head = |seg: Option<(f64, f64)>| -> Option<(f64, f64)> {
+        let (s, e) = seg?;
+        if !s.is_finite() || !e.is_finite() || s < 0.0 || e <= s { return None; }
+        let e = if dur > 30.0 { e.min(dur) } else { e };
+        if e - s < 4.0 || e - s > 300.0 { return None; }
+        if dur > 30.0 && s >= dur * 0.5 { return None; }
+        Some((s, e))
+    };
+    entry.recap = check_head(entry.recap);
+    entry.intro = check_head(entry.intro);
+    entry.outro = entry.outro.and_then(|(s, e)| {
+        if !s.is_finite() || s < 0.0 { return None; }
+        if dur > 30.0 && (s < dur * 0.5 || s >= dur - 3.0) { return None; }
+        let e = if e.is_finite() && e >= s {
+            if dur > 30.0 { e.min(dur) } else { e }
+        } else if dur > 30.0 {
+            dur
+        } else {
+            s
+        };
+        Some((s, e))
+    });
+    if entry.recap.is_none() && entry.intro.is_none() && entry.outro.is_none() {
+        entry.src = "none".into();
+    }
+}
+
+/// Look up online skip segments (IntroDB.app, then AniSkip fallback for anime) with disk caching.
+pub async fn lookup_online(
+    app: &App,
+    kind: &str,
+    imdb: &str,
+    title: &str,
+    season: Option<i64>,
+    ep: Option<i64>,
+    dur: f64,
+    is_anime: bool,
+) -> Option<OnlineSkipEntry> {
+    let imdb = imdb.trim();
+    let norm_title = norm(title);
+    let key = online_cache_key(kind, imdb, &norm_title, season, ep, is_anime)?;
+    let now = now_ms();
+
+    if let Some(mut cached) = app.online_skips.get_entry(&key, now) {
+        clamp_online_entry(&mut cached, dur);
+        return Some(cached);
+    }
+
+    let mut entry = OnlineSkipEntry {
+        t: now,
+        recap: None,
+        intro: None,
+        outro: None,
+        src: "none".into(),
+    };
+
+    // Source 1: IntroDB.app (TV & Movies with IMDb ID)
+    if !imdb.is_empty() {
+        let url = if kind == "series" {
+            match (season, ep) {
+                (Some(s), Some(e)) => Some(format!(
+                    "https://api.introdb.app/segments?imdb_id={}&season={s}&episode={e}",
+                    enc(imdb)
+                )),
+                _ => None,
+            }
+        } else if kind == "movie" {
+            Some(format!("https://api.introdb.app/segments?imdb_id={}", enc(imdb)))
+        } else {
+            None
+        };
+        if let Some(url) = url {
+            if let Ok(resp) = app.http.get(&url)
+                .header(reqwest::header::USER_AGENT, "TV/1.0")
+                .timeout(ONLINE_TIMEOUT)
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(v) = resp.json::<Value>().await {
+                        let (recap, intro, outro) = parse_introdb(&v);
+                        entry.recap = recap;
+                        entry.intro = intro;
+                        entry.outro = outro;
+                        if entry.recap.is_some() || entry.intro.is_some() || entry.outro.is_some() {
+                            entry.src = "introdb".into();
+                        }
+                        clamp_online_entry(&mut entry, dur);
+                    }
+                }
+            }
+        }
+    }
+
+    // Source 2: AniSkip (Anime fallback when intro & outro are still missing)
+    if kind == "series" && is_anime && entry.intro.is_none() && entry.outro.is_none() {
+        if let (Some(ep_num), false) = (ep.filter(|&e| e > 0), norm_title.is_empty()) {
+            let mal_id = match app.online_skips.get_mal_id(&norm_title, now) {
+                Some(cached_id) => cached_id,
+                None => {
+                    let jikan_url = format!("https://api.jikan.moe/v4/anime?q={}&limit=3", enc(title.trim()));
+                    let mut resolved: Option<Option<i64>> = None;
+                    if let Ok(resp) = app.http.get(&jikan_url)
+                        .header(reqwest::header::USER_AGENT, "TV/1.0")
+                        .timeout(ONLINE_TIMEOUT)
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(v) = resp.json::<Value>().await {
+                                resolved = Some(pick_jikan_mal_id(&v, title));
+                            }
+                        }
+                    }
+                    if let Some(id_opt) = resolved {
+                        app.online_skips.put_mal_id(norm_title.clone(), id_opt, now_ms());
+                        id_opt
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(mal_id) = mal_id {
+                let ep_len = if dur > 0.0 { dur.round() as i64 } else { 0 };
+                let aniskip_url = format!(
+                    "https://api.aniskip.com/v2/skip-times/{mal_id}/{ep_num}?types[]=op&types[]=ed&types[]=recap&episodeLength={ep_len}"
+                );
+                if let Ok(resp) = app.http.get(&aniskip_url)
+                    .header(reqwest::header::USER_AGENT, "TV/1.0")
+                    .timeout(ONLINE_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            let (recap, intro, outro) = parse_aniskip(&v);
+                            if entry.recap.is_none() { entry.recap = recap; }
+                            entry.intro = intro;
+                            entry.outro = outro;
+                            if entry.recap.is_some() || entry.intro.is_some() || entry.outro.is_some() {
+                                entry.src = "aniskip".into();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    clamp_online_entry(&mut entry, dur);
+    entry.t = now_ms();
+    app.online_skips.put_entry(key, entry.clone());
+    Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_introdb_sec_and_ms_fallback() {
+        let v_sec = json!({
+            "recap": { "start_sec": 0.0, "end_sec": 38.5 },
+            "intro": { "start_sec": 120.2, "end_sec": 205.8 },
+            "outro": { "start_sec": 2510.0, "end_sec": 2640.0 }
+        });
+        let (recap, intro, outro) = parse_introdb(&v_sec);
+        assert_eq!(recap, Some((0.0, 38.5)));
+        assert_eq!(intro, Some((120.2, 205.8)));
+        assert_eq!(outro, Some((2510.0, 2640.0)));
+
+        let v_ms = json!({
+            "recap": null,
+            "intro": { "start_ms": 15500, "end_ms": 105500 },
+            "outro": { "start_ms": 1320000, "end_ms": null }
+        });
+        let (recap2, intro2, outro2) = parse_introdb(&v_ms);
+        assert_eq!(recap2, None);
+        assert_eq!(intro2, Some((15.5, 105.5)));
+        assert_eq!(outro2, Some((1320.0, 1320.0)));
+    }
+
+    #[test]
+    fn parse_aniskip_op_ed_recap() {
+        let v = json!({
+            "found": true,
+            "results": [
+                { "skipType": "recap", "interval": { "startTime": 0.0, "endTime": 52.0 } },
+                { "skipType": "op", "interval": { "startTime": 85.5, "endTime": 175.5 } },
+                { "skipType": "ed", "interval": { "startTime": 1310.0, "endTime": 1400.0 } }
+            ]
+        });
+        let (recap, intro, outro) = parse_aniskip(&v);
+        assert_eq!(recap, Some((0.0, 52.0)));
+        assert_eq!(intro, Some((85.5, 175.5)));
+        assert_eq!(outro, Some((1310.0, 1400.0)));
+    }
+
+    #[test]
+    fn clamp_online_entry_drops_implausible_segments() {
+        let mut e = OnlineSkipEntry {
+            t: 1,
+            recap: Some((0.0, 3.0)),      // too short (< 4s) -> dropped
+            intro: Some((800.0, 890.0)),  // past dur*0.5 -> dropped
+            outro: Some((600.0, 700.0)),  // before dur*0.5 -> dropped
+            src: "introdb".into(),
+        };
+        clamp_online_entry(&mut e, 1440.0);
+        assert_eq!(e.recap, None);
+        assert_eq!(e.intro, None);
+        assert_eq!(e.outro, None);
+        assert_eq!(e.src, "none");
+
+        let mut e2 = OnlineSkipEntry {
+            t: 1,
+            recap: Some((0.0, 350.0)),      // too long (> 300s) -> dropped
+            intro: Some((85.0, 175.0)),     // valid -> kept
+            outro: Some((1438.0, 1440.0)),  // too close to end (>= dur-3) -> dropped
+            src: "aniskip".into(),
+        };
+        clamp_online_entry(&mut e2, 1440.0);
+        assert_eq!(e2.recap, None);
+        assert_eq!(e2.intro, Some((85.0, 175.0)));
+        assert_eq!(e2.outro, None);
+        assert_eq!(e2.src, "aniskip");
+
+        let mut e3 = OnlineSkipEntry {
+            t: 1,
+            recap: Some((0.0, 45.0)),
+            intro: Some((90.0, 180.0)),
+            outro: Some((1315.0, 1405.0)),
+            src: "introdb".into(),
+        };
+        clamp_online_entry(&mut e3, 1440.0);
+        assert_eq!(e3.recap, Some((0.0, 45.0)));
+        assert_eq!(e3.intro, Some((90.0, 180.0)));
+        assert_eq!(e3.outro, Some((1315.0, 1405.0)));
+        assert_eq!(e3.src, "introdb");
+    }
+
+    #[test]
+    fn jikan_matching_and_cache_keys() {
+        let jikan = json!({
+            "data": [
+                { "mal_id": 999, "type": "Movie", "title": "Jujutsu Kaisen 0", "title_english": "Jujutsu Kaisen 0" },
+                { "mal_id": 40748, "type": "TV", "title": "Jujutsu Kaisen", "title_english": "Jujutsu Kaisen" }
+            ]
+        });
+        assert_eq!(pick_jikan_mal_id(&jikan, "Jujutsu Kaisen"), Some(40748));
+
+        assert_eq!(
+            online_cache_key("series", "tt0903747", "breaking bad", Some(1), Some(2), false),
+            Some("tv:tt0903747:s1e2".into())
+        );
+        assert_eq!(
+            online_cache_key("movie", "tt0133093", "the matrix", None, None, false),
+            Some("movie:tt0133093".into())
+        );
+        assert_eq!(
+            online_cache_key("series", "", "jujutsu kaisen", Some(1), Some(3), true),
+            Some("an:jujutsu kaisen:s1e3".into())
+        );
+        assert_eq!(online_cache_key("series", "", "unknown", Some(1), Some(1), false), None);
+    }
 }

@@ -93,6 +93,8 @@ const I = {
   star: '<svg viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8L3.5 9.7l5.9-.8z" fill="currentColor"/></svg>',
   starO: '<svg viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8L3.5 9.7l5.9-.8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>',
   next: '<svg viewBox="0 0 24 24"><path d="M5 5v14l10-7zM17 5h2.5v14H17z" fill="currentColor"/></svg>',
+  prev: '<svg viewBox="0 0 24 24"><path d="M19 5v14L9 12zM4.5 5H7v14H4.5z" fill="currentColor"/></svg>',
+  list: '<svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
   up: '<svg viewBox="0 0 24 24"><path d="M7 10v10H4V10zM7 10l4-7c1.5 0 2.5 1 2.2 2.6L12.6 9H18a2 2 0 0 1 2 2.3l-1.2 7A2 2 0 0 1 16.8 20H7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
   down: '<svg viewBox="0 0 24 24"><path d="M17 14V4h3v10zM17 14l-4 7c-1.5 0-2.5-1-2.2-2.6l.6-3.4H6a2 2 0 0 1-2-2.3l1.2-7A2 2 0 0 1 7.2 4H17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
   bell: '<svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 1 1 12 0v5l1.5 2h-15zM10 20.5a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
@@ -1781,14 +1783,29 @@ function playMovie(d, id, resume) {
 }
 function playEpisode(d, flat, ep, resume, extra = {}) {
   closeModal(true);
+  const playable = (x) => (!d.isAnime || x.dub !== 'no') && (!d.isAnime || !d.skipFiller || x.filler !== 'filler');
   const idx = flat.findIndex((x) => x.id === ep.id);
-  const nxt = flat.slice(idx + 1).find((x) => (!d.isAnime || x.dub !== 'no') && (!d.isAnime || !d.skipFiller || x.filler !== 'filler')) || null;
+  const nxt = flat.slice(idx + 1).find(playable) || null;
+  const prv = [...flat.slice(0, Math.max(0, idx))].reverse().find(playable) || null;
+  const seasonEps = flat.filter((x) => x.season === ep.season && (!d.isAnime || x.dub !== 'no')).map((x) => ({
+    id: x.id, season: x.season, n: x.n, title: x.title, still: x.still || d.backdrop || '',
+    progress: x.progress || 0, resume: x.resume || 0, filler: x.filler || '', dub: x.dub || 'yes',
+    current: x.id === ep.id,
+  }));
+  const goEp = (id, fresh = false) => {
+    const target = flat.find((x) => x.id === +id);
+    if (!target) return;
+    playEpisode(d, flat, target, fresh ? 0 : (target.progress < 0.94 ? target.resume : 0));
+  };
   Player.open({
     kind: 'series', id: ep.id, ext: ep.ext, sid: d.id, season: ep.season, epn: ep.n, title: d.title, sub: `S${ep.season}:E${ep.n} · ${ep.title}`,
     resume: resume || 0, duration: ep.duration || 0, isAnime: !!d.isAnime, allowSubOnly: !!extra.allowSubOnly,
     progressKey: `e:${ep.id}`, tmdb: d.tmdb, imdb: d.imdb || '', extSub: ep.extSub || null, historyKind: 's', historyTitle: d.title,
     item: { k: 'e', id: ep.id, sid: d.id, title: d.title, sub: `S${ep.season}:E${ep.n} · ${ep.title}`, backdrop: ep.still || d.backdrop, poster: d.poster },
-    next: nxt ? { label: `S${nxt.season}:E${nxt.n} · ${nxt.title}`, still: nxt.still, go: () => playEpisode(d, flat, nxt, nxt.progress < 0.94 ? nxt.resume : 0) } : null,
+    prev: prv ? { id: prv.id, label: `S${prv.season}:E${prv.n} · ${prv.title}`, go: () => playEpisode(d, flat, prv, 0) } : null,
+    next: nxt ? { id: nxt.id, label: `S${nxt.season}:E${nxt.n} · ${nxt.title}`, still: nxt.still, go: () => playEpisode(d, flat, nxt, nxt.progress < 0.94 ? nxt.resume : 0) } : null,
+    episodes: seasonEps,
+    goEp,
   });
 }
 let LAST_LIVE = null;
@@ -2625,8 +2642,12 @@ const Player = (() => {
       h: pic.h || 0, w: pic.w || 0, ch: curAud?.ch || 2, sc: SURROUND_OUT,
       night: localGet('night', '0') === '1', deint: !!(o.live && localGet('di.' + o.id, '0') === '1'),
       isAnime: !!o.isAnime, skips: SKIPS, credits,
-      hasNext: !!o.next, nextLabel: o.next?.label || '', autoplay: localGet('autoplay', '1') === '1',
+      hasPrev: !!o.prev, prevLabel: o.prev?.label || '',
+      hasNext: !!o.next, nextLabel: o.next?.label || '',
+      episodes: (o.episodes || []).map((ep) => ({ id: ep.id, season: ep.season, n: ep.n, title: ep.title, progress: ep.progress, current: ep.current, filler: ep.filler })),
+      autoplay: localGet('autoplay', '1') === '1',
       autoskip: localGet('autoskip', '0') === '1',
+      autoSkipCredits: localGet('autoSkipCredits', '1') === '1',
       audioDelay: +localGet('ad.' + sk(), 0) || 0, subDelay: +localGet('subshift.' + sk(), 0) || 0,
       progress: o.live ? {} : { key: o.progressKey, item: o.item, tmdb: o.tmdb, historyKind: o.historyKind, historyTitle: o.historyTitle },
     };
@@ -2641,36 +2662,47 @@ const Player = (() => {
       if (pro) pro.gen = res?.gen || 0;
     } catch (e) { pro = null; toast(e.message); if (started) load(); return false; }
     showMsg(`<h4>${I.pro} Playing in the pro player</h4>
-      <p>Full screen on your OLED with true black levels & display-synced motion. Space pauses, arrows seek, Q or Esc closes it.</p>
+      <p>Full screen on your OLED with true black levels &amp; display-synced motion. Space pauses, S skips intro/credits, N next episode, E episodes list, Q or Esc closes.</p>
       <div class="btns" style="justify-content:center">
         <button class="btn btn-ghost btn-sm" id="proPause">Pause / Play</button>
-        ${!o.live ? '<button class="btn btn-ghost btn-sm" id="proSkip">Skip intro</button>' : ''}
-        ${o.next ? '<button class="btn btn-accent btn-sm" id="proNext">Next episode</button>' : ''}
+        ${!o.live ? '<button class="btn btn-ghost btn-sm" id="proSkip">Skip intro / start</button>' : ''}
+        ${o.prev ? '<button class="btn btn-ghost btn-sm" id="proPrev">⏮ Prev episode</button>' : ''}
+        ${o.next ? `<button class="btn btn-accent btn-sm" id="proNext">⏭ Next: ${esc(o.next.label.slice(0, 32))}</button>` : ''}
         <button class="btn btn-ghost btn-sm" id="proBack">Play here instead</button>
       </div>`);
     $('#proPause').onclick = () => post('/api/mpv/control', { cmd: 'toggle' }).catch(() => {});
     if ($('#proSkip')) $('#proSkip').onclick = () => post('/api/mpv/control', { cmd: 'skip' }).catch(() => {});
+    if ($('#proPrev')) $('#proPrev').onclick = async () => { await post('/api/mpv/stop', {}).catch(() => {}); clearInterval(proPoll); pro = null; o.prev.go(); };
     if ($('#proNext')) $('#proNext').onclick = async () => { await post('/api/mpv/stop', {}).catch(() => {}); clearInterval(proPoll); pro = null; o.next.go(); };
     $('#proBack').onclick = async () => { const at = offset; await post('/api/mpv/stop', {}).catch(() => {}); clearInterval(proPoll); pro = null; showMsg(null); offset = at; load(); };
     clearInterval(proPoll); proPoll = setInterval(async () => {
       const st = await api('/api/mpv').catch(() => null); if (!pro || !o) return clearInterval(proPoll);
       if (st?.session && !o.live) { offset = st.session.pos; if (st.session.dur) duration = st.session.dur; tick(); }
-      if (st && !st.playing && Date.now() - pro.since > 4000) {
+      if (st && !st.playing && Date.now() - pro.since > 1800) {
         const done = st.lastDone && (!pro.gen || st.lastDone.gen === pro.gen) ? st.lastDone : null;
         clearInterval(proPoll); pro = null;
-        if (done?.nextNow && o.next) {
+        if (done?.action === 'ep' && done.targetEpId && o.goEp) {
+          AUTOPLAY.chain = 0;
+          return o.goEp(done.targetEpId);
+        }
+        if (done?.action === 'prev' && o.prev) {
+          AUTOPLAY.chain = 0;
+          toast(`Playing previous: ${o.prev.label}`);
+          return o.prev.go();
+        }
+        if ((done?.action === 'next' || done?.nextNow) && o.next) {
           AUTOPLAY.chain = 0;
           toast(`Playing next: ${o.next.label}`);
           return o.next.go();
         }
-        if (done?.finished && o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 3) {
+        if (done?.finished && o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 5) {
           AUTOPLAY.chain++;
           toast(`Up next: ${o.next.label}`);
           return o.next.go();
         }
         close();
       }
-    }, 2000);
+    }, 650);
     return true;
   }
 
@@ -2731,7 +2763,7 @@ const Player = (() => {
     document.body.classList.add('playing');
     if (o) await close(true);
     if (my !== openGen) return;
-    o = opts; credits = null; skipped = new Set(); stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false;
+    o = opts; credits = null; skipped = new Set(); startSkipDismissed = false; stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false;
     subSel = -1; subTrack = null; clearInterval(subTimer);
     mseFailed = false; mseActive = false; mseTarget = offset; mseSessionStart = offset;
     liveBack = 0; liveBufSecs = 0; liveBehind = 0; livePausedAt = 0; clearInterval(livePollTimer); clearTimeout(liveEpgTimer); clearTimeout(liveBannerTimer);
@@ -2739,27 +2771,30 @@ const Player = (() => {
     const canLast = o.live && LAST_LIVE && LAST_LIVE.id !== o.id;
     el.innerHTML = `<video playsinline></video><div class="spinner"></div><div class="p-msg" hidden></div>
       ${o.live ? '<div class="live-banner" id="pLiveBanner"></div><aside class="live-drawer" id="pDrawer" hidden></aside>' : ''}
+      ${!o.live && o.episodes?.length > 1 ? '<aside class="live-drawer" id="pEpDrawer" hidden></aside>' : ''}
       <div class="pc">
         <div class="pc-top"><button class="pbtn" id="pBack" title="Back (Esc)">${I.back}</button>
           <div style="min-width:0"><div class="pt">${esc(o.title)}</div><div class="ps" id="pSub">${o.live ? '<span class="live-badge"><span class="live-dot"></span>LIVE</span> ' : ''}${esc(o.sub || '')}</div></div></div>
         <div class="pc-bottom">
-          <div class="seek" id="pSeek" tabindex="0" role="slider" aria-label="Seek"><div class="track"><div class="fill"></div><div class="knob"></div></div><div class="hover-t"></div></div>
+          <div class="seek" id="pSeek" tabindex="0" role="slider" aria-label="Seek"><div class="track"><div class="seek-marks" id="pMarks"></div><div class="fill"></div><div class="knob"></div></div><div class="hover-t"></div></div>
           <div class="pc-row">
             <button class="pbtn" id="pPlay" title="Play/Pause (Space)">${I.pause}</button>
             <button class="pbtn" id="pRew" title="Back 10s (←)">${I.rew}</button><button class="pbtn" id="pFwd" title="Forward 10s (→)">${I.fwd}</button>
             ${!o.live ? `<button class="pbtn pbtn-txt" id="pReplay" title="What did they say? Replay 8s with subtitles (R)">⟲ 8s</button>` : ''}
+            ${o.prev ? `<button class="pbtn" id="pPrevEp" title="Previous episode: ${esc(o.prev.label)} (Shift+P)">${I.prev}</button>` : ''}
+            ${o.next ? `<button class="pbtn pbtn-txt pbtn-next" id="pNextEp" title="Next episode: ${esc(o.next.label)} (N)">${I.next}<span>Next</span></button>` : ''}
             ${o.live ? `<button class="live-edge" id="pLiveEdge" title="Jump to live (End)"><span class="live-dot"></span>LIVE</button>` : ''}
             ${o.live && o.channels?.length > 1 ? `<button class="pbtn" id="pPrev" title="Previous channel (↑)">${I.left}</button><button class="pbtn" id="pNext" title="Next channel (↓)">${I.right}</button>` : ''}
             ${canLast ? `<button class="pbtn pbtn-txt" id="pLast" title="Last channel: ${esc(LAST_LIVE.title)} (L)">⇄ Last</button>` : ''}
             ${o.live ? `<button class="pbtn pbtn-txt" id="pGuide" title="Mini-guide & live scores (G)">Guide</button>` : ''}
             <button class="pbtn" id="pMute" title="Mute (M)">${I.vol}</button><input class="vol" id="pVol" type="range" min="0" max="1" step="0.05" value="${localGet('vol', 1)}" aria-label="Volume">
             <span class="time" id="pTime"></span><span class="spacer"></span>
+            ${!o.live && o.episodes?.length > 1 ? `<button class="pbtn pbtn-txt" id="pEpsBtn" title="Season episodes (E)">${I.list}<span>Episodes</span></button>` : ''}
             <select id="pSubs" hidden title="Subtitles (C)"></select>
             <select id="pAudio" hidden title="Audio track"></select>
             <select id="pSrc" hidden title="${o.live ? 'Backup feeds' : 'Version'}"></select>
             ${o.live ? `<button class="pbtn pbtn-txt ${localGet('di.' + o.id, '0') === '1' ? 'on' : ''}" id="pDeint" title="Deinterlace 1080i broadcast to 50fps">50fps</button>` : ''}
             <button class="pbtn pbtn-txt ${localGet('night', '0') === '1' ? 'on' : ''}" id="pNight" title="Clear Voice / Night Mode (evens out loud & quiet scenes)">Voice</button>
-            ${o.next ? `<button class="pbtn" id="pNextEp" title="Next episode (N)">${I.next}</button>` : ''}
             <button class="pbtn" id="pInfo" title="Playback info (I)">${I.info}</button>
             <button class="pbtn" id="pPro" title="Open in the pro player (P)" hidden>${I.pro}</button>
             <button class="pbtn" id="pCast" title="Play on a TV">${I.cast}</button>
@@ -2823,8 +2858,12 @@ const Player = (() => {
       applyTracks(null, null);
       if (offset > 5) toast(`Resuming from ${fmtTime(offset)}`);
       SKIPS = (probe?.skips || []).slice();
-      if (Array.isArray(probe?.intro)) SKIPS.push({ s: Math.max(0, probe.intro[0] - 1), e: probe.intro[1], title: 'Intro' });
+      if (Array.isArray(probe?.intro) && !SKIPS.some((s) => Math.abs(s.s - probe.intro[0]) < 15)) {
+        SKIPS.push({ s: Math.max(0, probe.intro[0] - 1), e: probe.intro[1], title: 'Intro', kind: 'intro' });
+      }
+      SKIPS.sort((a, b) => a.s - b.s);
       credits = typeof probe?.credits === 'number' ? probe.credits : null;
+      renderSeekMarks();
       const ql = qLabel(probe?.pic, probe?.audio); if (ql) $('#pSub').insertAdjacentHTML('beforeend', ` <span class="qbadge">${esc(ql)}</span>`);
       if (proRule(probe?.pic) && (await proInfo()).available) { renderSources(); setMediaSession(); if (await toPro()) return; }
       if (probe?.pic?.hdr === 'DV' && !(await proInfo()).available) toast('Dolby Vision: colours may look off in this player. The pro player shows it properly (Settings › Picture & display)');
@@ -2982,38 +3021,116 @@ const Player = (() => {
     }
   }, 350);
 
+  let startSkipDismissed = false;
+  function renderSeekMarks() {
+    const box = $('#pMarks', el);
+    if (!box || !duration || o?.live) return;
+    let html = '';
+    for (const sk of SKIPS) {
+      if (sk.e > sk.s && sk.s < duration) {
+        const l = Math.max(0, Math.min(100, (sk.s / duration) * 100));
+        const w = Math.max(0.6, Math.min(100 - l, ((sk.e - sk.s) / duration) * 100));
+        html += `<span class="seek-mark intro" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc(sk.title || 'Intro')}"></span>`;
+      }
+    }
+    if (credits && credits > duration * 0.5 && credits < duration - 3) {
+      const l = Math.max(0, Math.min(99.4, (credits / duration) * 100));
+      html += `<span class="seek-mark credits" style="left:${l.toFixed(2)}%;width:${(100 - l).toFixed(2)}%" title="Credits"></span>`;
+    }
+    box.innerHTML = html;
+  }
+  function creditsTriggerAt() {
+    if (!duration) return Infinity;
+    if (credits && credits > duration * 0.5 && credits < duration - 3) return credits;
+    if (o?.kind === 'series') return duration >= 2400 ? duration - 120 : duration >= 1200 ? duration - 90 : Math.max(60, duration - 45);
+    return duration - 40;
+  }
+  function markCurrentFinished() {
+    if (!o || o.live || !duration || !o.progressKey) return;
+    post('/api/progress', { key: o.progressKey, pos: duration, dur: duration, item: o.item, tmdb: o.tmdb }).catch(() => {});
+  }
+  function goNextEpisode(byUser = true) {
+    if (!o?.next) return;
+    if (duration && pos() >= duration * 0.65) markCurrentFinished();
+    if (byUser) AUTOPLAY.chain = 0; else AUTOPLAY.chain++;
+    o.next.go();
+  }
+  function skipStartTarget(p) {
+    const ch2 = (probe?.chapters || []).find((c) => c.s >= Math.max(25, p + 8) && c.s <= 210);
+    return ch2 ? ch2.s : Math.min(duration - 10, p + 85);
+  }
   function tick() {
     if (!o) return;
     if (o.live) { updateLiveEdgeUi(); return; }
     const p = pos();
     const sk = SKIPS.find((c) => p >= c.s && p < c.e - 2);
+    const showSoftStart = !sk && !startSkipDismissed && o.kind === 'series' && !SKIPS.length && duration > 300 && p >= 2 && p <= 165 && !nextShown;
     let btn = $('#pSkip', el);
-    if (sk && !btn) { btn = document.createElement('button'); btn.id = 'pSkip'; btn.className = 'btn btn-primary skip-btn'; el.appendChild(btn); }
-    if (btn) { if (!sk) btn.remove(); else { btn.textContent = /recap|previously/i.test(sk.title) ? 'Skip recap' : 'Skip intro'; btn.onclick = () => { skipped.add(sk); seekTo(sk.e); }; } }
-    if (sk && started && !skipped.has(sk) && localGet('autoskip', '0') === '1' && /intro|opening/i.test(sk.title)) { skipped.add(sk); toast('Skipped the intro'); seekTo(sk.e); return; }
+    if ((sk || showSoftStart) && !btn) {
+      btn = document.createElement('button');
+      btn.id = 'pSkip';
+      btn.className = 'btn skip-btn';
+      el.appendChild(btn);
+    }
+    if (btn) {
+      if (!sk && !showSoftStart) {
+        btn.remove();
+      } else if (sk) {
+        btn.className = 'btn btn-primary skip-btn';
+        btn.textContent = (sk.kind === 'recap' || /recap|previously/i.test(sk.title || '')) ? 'Skip Recap ›' : 'Skip Intro ›';
+        btn.onclick = () => { skipped.add(sk); seekTo(sk.e); };
+      } else {
+        const tgt = skipStartTarget(p);
+        btn.className = 'btn btn-ghost skip-btn soft';
+        btn.textContent = `Skip Start (+${Math.round(tgt - p)}s) ›`;
+        btn.onclick = () => { startSkipDismissed = true; btn.remove(); seekTo(tgt); toast('Skipped ahead'); };
+      }
+    }
+    if (sk && started && !skipped.has(sk) && localGet('autoskip', '0') === '1') {
+      skipped.add(sk);
+      toast((sk.kind === 'recap' || /recap|previously/i.test(sk.title || '')) ? 'Auto-skipped recap' : 'Auto-skipped intro');
+      seekTo(sk.e);
+      return;
+    }
     if (duration) {
       const pct = Math.min(100, (p / duration) * 100);
       const f = $('#pSeek .fill'); if (f) { f.style.width = pct + '%'; $('#pSeek .knob').style.left = pct + '%'; }
       $('#pTime').textContent = `${fmtTime(p)} / ${fmtTime(duration)}`;
-      const nextAt = credits && credits > duration * 0.6 ? credits : duration - 40;
+      const nextAt = creditsTriggerAt();
       if (o.next && !nextShown && p >= nextAt && p > 60) showNextUp();
+      else if (nextShown && p < nextAt - 15) {
+        nextShown = false;
+        $('.next-up', el)?.remove();
+      }
     } else $('#pTime').textContent = fmtTime(p);
   }
 
-  // Up next at the end credits: counts down and plays the next episode (unless switched off, or
-  // three episodes have auto-played with nobody touching anything: then it asks first).
+  // Up next / Skip Credits: counts down and plays the next episode automatically (5s when Skip Credits is on)
   function showNextUp() {
     nextShown = true;
-    const auto = localGet('autoplay', '1') === '1'; const ask = AUTOPLAY.chain >= 3;
+    const auto = localGet('autoplay', '1') === '1';
+    const fastSkip = localGet('autoSkipCredits', '1') === '1';
+    const ask = AUTOPLAY.chain >= 5;
+    let left = fastSkip ? 5 : 10;
     const n = document.createElement('div'); n.className = 'next-up';
-    n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : 'Up next'}</small><b>${esc(o.next.label)}</b></div>
-      <div class="nu-btns"><button class="btn btn-primary btn-sm" id="nuPlay">${I.play}<span>${ask ? 'Keep watching' : 'Play now'}</span></button><button class="btn btn-ghost btn-sm" id="nuStay">${credits ? 'Watch credits' : 'Dismiss'}</button></div>`;
+    n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : (credits || fastSkip ? 'Skip credits · Up next' : 'Up next')}</small><b>${esc(o.next.label)}</b></div>
+      <div class="nu-btns"><button class="btn btn-primary btn-sm" id="nuPlay">${I.play}<span>${ask ? 'Keep watching' : 'Play next now'}</span></button><button class="btn btn-ghost btn-sm" id="nuStay">Watch credits</button></div>`;
     el.appendChild(n);
-    let left = 10; let t = null;
-    const go = (byUser) => { clearInterval(t); if (byUser) AUTOPLAY.chain = 0; else AUTOPLAY.chain++; o.next.go(); };
+    let t = null;
+    const go = (byUser) => { clearInterval(t); n.remove(); goNextEpisode(byUser); };
     $('#nuPlay', n).onclick = () => go(true);
     $('#nuStay', n).onclick = () => { clearInterval(t); n.remove(); };
-    if (auto && !ask) { const lab = $('#nuPlay span', n); lab.textContent = `Next episode in ${left}`; t = setInterval(() => { if (!o || !n.isConnected) return clearInterval(t); if (video.paused) return; left--; lab.textContent = `Next episode in ${left}`; if (left <= 0) go(false); }, 1000); }
+    if (auto && !ask) {
+      const lab = $('#nuPlay span', n);
+      lab.textContent = `Next in ${left}s`;
+      t = setInterval(() => {
+        if (!o || !n.isConnected) return clearInterval(t);
+        if (video.paused) return;
+        left--;
+        lab.textContent = left > 0 ? `Next in ${left}s` : 'Starting…';
+        if (left <= 0) go(false);
+      }, 1000);
+    }
   }
 
   function wire() {
@@ -3054,7 +3171,7 @@ const Player = (() => {
       // the stream stopped well before the end (connection dropped): that's not the end of the film
       const realEnd = credits && credits > duration * 0.6 ? credits - 30 : duration - 90;
       if (duration && pos() < realEnd && resumeHere()) return;
-      save(); if (o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 3) { AUTOPLAY.chain++; o.next.go(); } else close();
+      save(); if (o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 5) { goNextEpisode(false); } else close();
     });
     video.addEventListener('pause', () => { $('#pPlay').innerHTML = I.play; pausedSaver(); });
     video.addEventListener('play', () => { $('#pPlay').innerHTML = I.pause; clearTimeout(saverTimer); });
@@ -3084,7 +3201,9 @@ const Player = (() => {
       toast(next ? 'Clear Voice / Night Mode on' : 'Clear Voice off');
       const at = pos(); offset = at; load({ target: at, splice: mseActive && started && !o.live });
     };
-    if ($('#pNextEp')) $('#pNextEp').onclick = () => o.next.go();
+    if ($('#pPrevEp')) $('#pPrevEp').onclick = () => o.prev?.go();
+    if ($('#pNextEp')) $('#pNextEp').onclick = () => goNextEpisode(true);
+    if ($('#pEpsBtn')) $('#pEpsBtn').onclick = () => toggleEpisodesDrawer();
     $('#pCast').onclick = (e) => { e.stopPropagation(); castMenu(); };
     $('#pInfo').onclick = () => toggleStats();
     $('#pPro').onclick = () => toPro();
@@ -3261,6 +3380,29 @@ const Player = (() => {
     renderBody();
   }
 
+  function toggleEpisodesDrawer(force) {
+    if (!o || o.live || !o.episodes?.length) return;
+    const dr = $('#pEpDrawer', el); if (!dr) return;
+    const show = force !== undefined ? !!force : dr.hidden;
+    if (!show) { dr.hidden = true; $('#pEpsBtn', el)?.classList.remove('on'); return; }
+    dr.hidden = false; $('#pEpsBtn', el)?.classList.add('on');
+    dr.innerHTML = `<div class="ld-head">
+      <div class="ld-tabs"><span style="font-weight:700;font-size:14px">Season ${o.season || 1} · ${o.episodes.length} Episodes</span></div>
+      <button class="pbtn" id="epDrClose" title="Close (E / Esc)">${I.close}</button></div>
+      <div class="ld-body">${o.episodes.map((ep) => `<div class="ld-item ep-dr-item ${ep.current ? 'cur' : ''}" data-ep-jump="${ep.id}" tabindex="0" role="button">
+        <div class="ld-top"><span>S${ep.season}:E${ep.n}${ep.filler === 'filler' ? ' · <em class="badge-filler inline">FILLER</em>' : ''}</span>${ep.current ? '<span class="ok">Playing</span>' : ep.progress >= 0.94 ? '<span class="muted">Watched</span>' : ep.progress > 0.02 ? `<span class="muted">${Math.round(ep.progress * 100)}%</span>` : ''}</div>
+        <div class="ld-title">${esc(ep.title || `Episode ${ep.n}`)}</div>
+        ${ep.progress > 0.02 ? `<div class="ep-dr-bar"><i style="width:${Math.min(100, Math.round(ep.progress * 100))}%"></i></div>` : ''}
+      </div>`).join('')}</div>`;
+    $('#epDrClose', dr).onclick = () => toggleEpisodesDrawer(false);
+    $$('[data-ep-jump]', dr).forEach((row) => (row.onclick = () => {
+      const eid = +row.dataset.epJump;
+      toggleEpisodesDrawer(false);
+      if (eid !== o.id && o.goEp) o.goEp(eid);
+    }));
+    dr.querySelector('.cur')?.scrollIntoView({ block: 'center' });
+  }
+
   async function close(switching = false) {
     if (!o) return;
     Mse.destroy();
@@ -3322,16 +3464,19 @@ const Player = (() => {
     else if (k === 'g' && o.live) { e.preventDefault(); toggleMiniGuide(); }
     else if (k === 'r' && !o.live) { e.preventDefault(); replayWithSubs(); }
     else if (k === 'f') fullscreen();
-    else if (k === 'n' && o.next) o.next.go();
+    else if (k === 'n' && o.next) { e.preventDefault(); goNextEpisode(true); }
+    else if (e.key === 'P' && e.shiftKey && o.prev) { e.preventDefault(); o.prev.go(); }
+    else if (k === 'e' && !o.live && o.episodes?.length > 1) { e.preventDefault(); toggleEpisodesDrawer(); }
     else if (k === 'g' && subSel >= 0) nudgeSubs(-250);
     else if (k === 'h' && subSel >= 0) nudgeSubs(250);
     else if (e.key === '[') nudgeAudio(-100);
     else if (e.key === ']') nudgeAudio(100);
     else if (k === 'c') cycleSubs();
-    else if (k === 's' && $('#pSkip', el)) $('#pSkip', el).click();
+    else if (k === 's') { const b = $('#pSkip', el) || $('#nuPlay', el); if (b) { e.preventDefault(); b.click(); } }
     else if (k === 'm') $('#pMute').click();
     else if (k === 'i') toggleStats();
-    else if (k === 'p' && !$('#pPro').hidden) toPro();
+    else if (k === 'p' && !e.shiftKey && !$('#pPro').hidden) toPro();
+    else if (k === 'escape' && $('#pEpDrawer', el) && !$('#pEpDrawer', el).hidden) { e.preventDefault(); toggleEpisodesDrawer(false); }
     else if (k === 'escape' && o.live && $('#pDrawer', el) && !$('#pDrawer', el).hidden) { e.preventDefault(); toggleMiniGuide(false); }
     else if ((k === 'escape' || k === 'backspace') && !document.fullscreenElement) {
       if (inCtrl && !el.classList.contains('idle')) { e.target.blur(); }
@@ -3373,7 +3518,8 @@ const Player = (() => {
     if (c === 'toggle') togglePlay();
     else if (c === 'seek') seekBy(+v || 0);
     else if (c === 'seekto' && !o.live) seekTo(+v || 0);
-    else if (c === 'next' && o.next) o.next.go();
+    else if (c === 'next' && o.next) goNextEpisode(true);
+    else if (c === 'prev' && o.prev) o.prev.go();
     else if (c === 'last' && o.live) toggleLastChannel();
     else if (c === 'subs') cycleSubs();
     else if (c === 'audio') switchAudio(v);
@@ -3454,10 +3600,11 @@ async function openSettings() {
     <div class="btns" style="margin-top:14px"><button class="btn btn-ghost btn-sm" id="syncNow">Refresh catalogue now</button></div>
     <h4>Playback</h4>
     <div class="hide-grid"><label class="tog"><input type="checkbox" id="optAutoplay" ${localGet('autoplay', '1') === '1' ? 'checked' : ''}> Play the next episode automatically</label>
-      <label class="tog"><input type="checkbox" id="optAutoskip" ${localGet('autoskip', '0') === '1' ? 'checked' : ''}> Skip intros automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoskip" ${localGet('autoskip', '0') === '1' ? 'checked' : ''}> Skip intros &amp; recaps automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoSkipCredits" ${localGet('autoSkipCredits', '1') === '1' ? 'checked' : ''}> Skip end credits &amp; start next episode (5s countdown)</label>
       <label class="tog"><input type="checkbox" id="optSkipFillerSet" ${prefs.skipFiller ? 'checked' : ''}> Skip anime filler episodes automatically</label>
       <label class="tog"><input type="checkbox" id="optTv" ${document.body.classList.contains('tv') ? 'checked' : ''}> TV mode (big screen, arrows / gamepad)</label></div>
-    <p class="muted">Intros and end credits are detected from the audio, using episodes you watch and short clips fetched only while nothing is playing and your account is free. When a version stutters, playback moves to another copy of the same title, and the smoothest copy is picked first next time.</p>
+    <p class="muted">Recaps, intros and end credits use embedded MKV chapters, instant online timestamps (IntroDB &amp; AniSkip), and local audio fingerprinting. When a version stutters, playback moves to another copy of the same title automatically.</p>
     <h4>Picture & display</h4><div id="dispBox"><p>…</p></div>
     <h4>System & network health</h4><div id="sysHealthBox"><p>…</p></div>
     <h4>Phone remote</h4><div id="remoteBox"><p>…</p></div>
@@ -3482,8 +3629,9 @@ async function openSettings() {
     try { await post('/api/settings', { omdbKey: v }); toast('OMDb connected. Scores now show on detail pages'); closeModal(); }
     catch (e) { toast(e.message); $('#saveOmdb').textContent = 'Save'; }
   };
-  $('#optAutoplay').onchange = (e) => localSet('autoplay', e.target.checked ? '1' : '0');
-  $('#optAutoskip').onchange = (e) => localSet('autoskip', e.target.checked ? '1' : '0');
+  $('#optAutoplay').onchange = (e) => { localSet('autoplay', e.target.checked ? '1' : '0'); post('/api/prefs', { autoplay: e.target.checked }).catch(() => {}); };
+  $('#optAutoskip').onchange = (e) => { localSet('autoskip', e.target.checked ? '1' : '0'); post('/api/prefs', { autoskip: e.target.checked }).catch(() => {}); };
+  $('#optAutoSkipCredits').onchange = (e) => { localSet('autoSkipCredits', e.target.checked ? '1' : '0'); post('/api/prefs', { autoSkipCredits: e.target.checked }).catch(() => {}); toast(e.target.checked ? 'Auto-skip credits (5s) on' : 'Standard 10s end countdown'); };
   $('#optSkipFillerSet').onchange = (e) => post('/api/prefs', { skipFiller: e.target.checked }).then(() => toast(e.target.checked ? 'Anime filler skipping on' : 'Anime filler skipping off')).catch(() => {});
   $('#optTv').onchange = (e) => setTvMode(e.target.checked);
   renderRemote(); renderTrakt(); renderDisplay(prefs); renderSysHealth();
@@ -3774,7 +3922,7 @@ window.__player = Player;
 })();
 async function renderTrakt() {
   const box = $('#traktBox'); if (!box) return;
-  const t = await api('/api/trakt').catch(() => null); if (!t) return;
+  const t = await api('/api/trakt').catch(() => null); if (!t || !box.isConnected) return;
   if (t.connected) {
     box.innerHTML = `<p><b>Trakt</b>: connected${t.user ? ` as <b>${esc(t.user)}</b>` : ''}. History, ratings and watchlist sync every 6 hours; what you finish, rate or add here is sent to Trakt.${t.lastSync ? ` Last sync ${new Date(t.lastSync).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}.` : ''}</p>
       ${t.result ? `<p class="muted">Last pull: ${t.result.watched} films, ${t.result.episodes} episodes, ${t.result.ratings} ratings, ${t.result.watchlist} watchlist.</p>` : ''}
@@ -3800,6 +3948,7 @@ async function renderTrakt() {
 async function renderDisplay(prefs) {
   const box = $('#dispBox'); if (!box) return;
   const [d, m] = await Promise.all([api('/api/display').catch(() => null), api('/api/mpv').catch(() => ({}))]);
+  if (!box.isConnected) return;
   if (!d) { box.innerHTML = '<p class="muted">Display info unavailable.</p>'; return; }
   const t = d.displays.find((x) => x.target) || d.displays[0]; const max = t ? Math.max(...t.rates) : 0;
   const tog = (id, on, label) => `<label class="tog"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
@@ -3850,6 +3999,7 @@ async function renderDisplay(prefs) {
 async function renderSysHealth() {
   const box = $('#sysHealthBox'); if (!box) return;
   const h = await api('/api/syshealth').catch(() => null);
+  if (!box.isConnected) return;
   if (!h || !h.net) {
     box.innerHTML = '<p class="muted">System health activates after the queued server update finishes.</p>';
     return;
@@ -3882,7 +4032,7 @@ async function renderSysHealth() {
 
 async function renderRemote() {
   const box = $('#remoteBox'); if (!box) return;
-  const r = await api('/api/remote').catch(() => null); if (!r) return;
+  const r = await api('/api/remote').catch(() => null); if (!r || !box.isConnected) return;
   REMOTE_ON = r.enabled;
   box.innerHTML = r.enabled ? `<div class="remote-pair">${r.qr ? `<div class="qr">${r.qr}</div>` : ''}<div>
       <p>On your phone (same Wi-Fi), open<br><b class="mono">${esc(r.url || 'this PC’s address, port 7880')}</b><br>or scan the code, then enter</p>
