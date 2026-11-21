@@ -1,4 +1,4 @@
-// Personal streaming front-end for an Xtream Codes subscription — Rust server.
+// Phosphor — pure-black OLED streaming front-end for Xtream Codes IPTV (Rust server).
 mod subsync; mod fmp4; mod intro; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
 pub use extras::notify;
 
@@ -34,7 +34,7 @@ fn not_ready(app: &App) -> Option<Response> {
 
 #[tokio::main]
 async fn main() {
-    // Self-test hook: tv.exe --subsync <audio.pcm> <subs.vtt>
+    // Self-test hook: phosphor.exe --subsync <audio.pcm> <subs.vtt>
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 4 && args[1] == "--intro" {
         let rd = |p: &str| -> Vec<i16> { std::fs::read(p).unwrap_or_default().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect() };
@@ -45,12 +45,12 @@ async fn main() {
     if args.len() == 5 && args[1] == "--subsync-at" { println!("{}", subsync::sync_at(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), args[4].parse().unwrap_or(0))); return; }
     if args.len() == 2 && args[1] == "--display" { display::self_test(); return; }
     if args.len() == 4 && args[1] == "--subsync" { println!("{}", subsync::sync(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]))); return; }
-    let root = std::env::var("TV_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let root = std::env::var("PHOSPHOR_ROOT").or_else(|_| std::env::var("TV_ROOT")).map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::current_dir().unwrap());
     let data = root.join("data"); let _ = std::fs::create_dir_all(data.join("raw"));
     let cfg = Arc::new(store::Config::load(root.join("config.json")));
     let http = reqwest::Client::builder().gzip(true).pool_max_idle_per_host(16).build().unwrap();
     let app = Arc::new(App {
-        public: std::env::var("TV_PUBLIC").map(std::path::PathBuf::from).unwrap_or_else(|_| root.join("public")),
+        public: std::env::var("PHOSPHOR_PUBLIC").or_else(|_| std::env::var("TV_PUBLIC")).map(std::path::PathBuf::from).unwrap_or_else(|_| root.join("public")),
         state: store::State::load(data.join("state.json")),
         xc: xc::Xc::new(cfg.clone(), http.clone()),
         tmdb: tmdb::Tmdb::new(cfg.clone(), http.clone(), data.join("tmdb-cache.json")),
@@ -97,12 +97,12 @@ async fn main() {
     // no-cache: the browser revalidates (cheap 304s), so front-end updates always load.
     let router = api.fallback_service(static_files).layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache")));
     let port = app.cfg.get("port").as_u64().unwrap_or(7878);
-    let addr = std::env::var("TV_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(port as u16);
+    let addr = std::env::var("PHOSPHOR_PORT").or_else(|_| std::env::var("TV_PORT")).ok().and_then(|p| p.parse().ok()).unwrap_or(port as u16);
     spool::set_port(addr);
     livebuf::set_port(addr);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", addr)).await.expect("port in use");
     if let Ok(l6) = tokio::net::TcpListener::bind(("::1", addr)).await { let r6 = router.clone(); tokio::spawn(async move { let _ = axum::serve(l6, r6).await; }); }
-    println!("TV running at http://localhost:{addr}");
+    println!("Phosphor running at http://localhost:{addr}");
     axum::serve(listener, router).await.unwrap();
 }
 

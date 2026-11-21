@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<meta name="theme-color" content="#0b0d10">
+<meta name="theme-color" content="#000000">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>Remote</title>
+<title>Phosphor Remote</title>
 <style>
-  :root { --bg: #0b0d10; --bg2: #151920; --bg3: #1e232c; --line: #2a303a; --fg: #f2f4f7; --muted: #8b93a1; --accent: #e50914; }
+  :root { --bg: #000000; --bg2: #0d0f12; --bg3: #16191f; --line: rgba(255,255,255,.10); --fg: #f2f3f5; --muted: #8b93a1; --accent: #ffb547; --accent-ink: #1b1204; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
   body { padding: env(safe-area-inset-top) 16px calc(76px + env(safe-area-inset-bottom)); max-width: 520px; margin: 0 auto; }
   h1 { font-size: 18px; margin: 18px 0 12px; }
   button { font: inherit; color: inherit; background: var(--bg3); border: 0; border-radius: 12px; padding: 12px; cursor: pointer; }
-  button:active { transform: scale(.96); background: #2a303a; }
-  .primary { background: var(--accent); }
+  button:active { transform: scale(.96); background: #232832; }
+  .primary { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
   .hidden { display: none !important; }
   .muted { color: var(--muted); font-size: 13px; }
   .np { background: var(--bg2); border-radius: 16px; overflow: hidden; margin-top: 14px; }
@@ -33,8 +33,8 @@
   select { width: 100%; background: var(--bg3); color: var(--fg); border: 0; border-radius: 12px; padding: 12px; font: inherit; }
   .pad { display: grid; grid-template-columns: repeat(3, 72px); grid-template-rows: repeat(3, 64px); gap: 8px; justify-content: center; margin: 14px 0; }
   .pad button { font-size: 22px; }
-  .pad .ok { background: var(--accent); font-weight: 800; font-size: 16px; border-radius: 50%; }
-  .tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: rgba(11,13,16,.96); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); backdrop-filter: blur(10px); }
+  .pad .ok { background: var(--accent); color: var(--accent-ink); font-weight: 800; font-size: 16px; border-radius: 50%; }
+  .tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: rgba(0,0,0,.96); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); backdrop-filter: blur(10px); }
   .tabs button { flex: 1; background: none; border-radius: 0; padding: 14px 0; color: var(--muted); font-weight: 600; }
   .tabs button.on { color: var(--fg); box-shadow: inset 0 2px 0 var(--accent); }
   .list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
@@ -143,8 +143,8 @@
 
   function render(r) {
     const p = r.s?.player; st = p;
-    if (!r.tv) { $('#idle').classList.remove('hidden'); $('#idleMsg').textContent = 'The TV app isn’t open on the PC. Picking something to play will open it.'; }
-    else $('#idleMsg').textContent = 'Pick something from Continue or Search, or move around the TV with the pad below.';
+    if (!r.tv) { $('#idle').classList.remove('hidden'); $('#idleMsg').textContent = 'Phosphor isn’t open on the PC. Picking something to play will open it.'; }
+    else $('#idleMsg').textContent = 'Pick something from Continue or Search, or navigate Phosphor with the pad below.';
     $('#idle').classList.toggle('hidden', !!p); $('#np').classList.toggle('hidden', !p);
     ['ctl', 'row2'].forEach((id) => $('#' + id).classList.toggle('hidden', !p));
     if (!p) { $('#skip').classList.add('hidden'); $('#srcBox').classList.add('hidden'); $('#audBox').classList.add('hidden'); return; }

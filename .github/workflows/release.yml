@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Build Phosphor release binary
+        working-directory: server
+        run: cargo build --release --locked
+
+      - name: Package Windows bundle
+        shell: pwsh
+        run: |
+          $stage = "dist\Phosphor"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "server\target\release\phosphor.exe" "$stage\phosphor-server.exe"
+          Copy-Item "public" "$stage\public" -Recurse
+          Copy-Item "mpv-scripts" "$stage\mpv-scripts" -Recurse
+          Copy-Item "mpv-shaders" "$stage\mpv-shaders" -Recurse
+          Copy-Item "scripts\*" "$stage\" -Force
+          Copy-Item "config.example.json", "README.md", "LICENSE", "AGENTS.md" "$stage\"
+          New-Item -ItemType Directory -Path "$stage\data" -Force | Out-Null
+          Compress-Archive -Path "$stage\*" -DestinationPath "Phosphor-windows-x64.zip" -Force
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: Phosphor-windows-x64.zip

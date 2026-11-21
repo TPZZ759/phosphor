@@ -387,7 +387,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         add_opt("shader_preset", shader_preset.into());
         add_opt("night", if night { "yes" } else { "no" }.into());
         add_opt("is_live", if live { "yes" } else { "no" }.into());
-        let port = std::env::var("TV_PORT").ok().unwrap_or_else(|| app.cfg.get("port").as_u64().unwrap_or(7878).to_string());
+        let port = std::env::var("PHOSPHOR_PORT").or_else(|_| std::env::var("TV_PORT")).ok().unwrap_or_else(|| app.cfg.get("port").as_u64().unwrap_or(7878).to_string());
         add_opt("api_base", format!("http://127.0.0.1:{port}"));
     }
 

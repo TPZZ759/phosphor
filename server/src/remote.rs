@@ -44,7 +44,8 @@ impl Remote {
 
 fn open_app() {
     let root = std::env::current_dir().unwrap_or_default();
-    let vbs = root.join("Open TV.vbs");
+    let vbs = root.join("Open Phosphor.vbs");
+    let vbs = if vbs.exists() { vbs } else { root.join("Open TV.vbs") };
     if vbs.exists() { let _ = std::process::Command::new("wscript").arg(vbs).spawn(); }
 }
 
@@ -72,8 +73,8 @@ pub fn ensure_listener(app: Arc<App>) {
             .route("/", get(page)).route("/r/pair", post(pair)).route("/r/state", get(state)).route("/r/cmd", post(cmd))
             .route("/r/home", get(home)).route("/c/{tok}/{kind}/{file}", get(crate::cast::lan_stream)).route("/r/search", get(search)).route("/r/play", post(play))
             .with_state(app.clone());
-        // TV_REMOTE_HOST=127.0.0.1 keeps test instances off the network
-        let host = std::env::var("TV_REMOTE_HOST").unwrap_or_else(|_| "0.0.0.0".into());
+        // PHOSPHOR_REMOTE_HOST=127.0.0.1 (or TV_REMOTE_HOST) keeps test instances off the network
+        let host = std::env::var("PHOSPHOR_REMOTE_HOST").or_else(|_| std::env::var("TV_REMOTE_HOST")).unwrap_or_else(|_| "0.0.0.0".into());
         match tokio::net::TcpListener::bind((host.as_str(), PORT)).await {
             Ok(l) => { println!("[remote] listening on {host}:{PORT}"); let _ = axum::serve(l, r).await; }
             Err(e) => { println!("[remote] can't listen on {PORT}: {e}"); app.remote.started.store(false, Ordering::SeqCst); }

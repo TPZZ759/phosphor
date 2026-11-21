@@ -1,5 +1,5 @@
-' Keeps the TV server running: started at logon and every 5 minutes by Task Scheduler ("TV server ...").
-' Starts tv-server.exe (hidden) only if it isn't answering. No window, no browser.
+' Keeps the Phosphor server running: started at logon and every 5 minutes by Task Scheduler.
+' Starts phosphor-server.exe (hidden) only if it isn't answering. No window, no browser.
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 dir = fso.GetParentFolderName(WScript.ScriptFullName)
@@ -27,9 +27,12 @@ If Up() Then WScript.Quit
 WScript.Sleep 5000
 If Up() Then WScript.Quit
 Set wmi = GetObject("winmgmts:\\.\root\cimv2")
-If wmi.ExecQuery("select * from Win32_Process where Name='tv-server.exe'").Count > 0 Then WScript.Quit
+If wmi.ExecQuery("select * from Win32_Process where Name='phosphor-server.exe' or Name='tv-server.exe'").Count > 0 Then WScript.Quit
 
 sh.CurrentDirectory = dir
-If fso.FileExists(dir & "\tv-server.exe") Then
+If Not fso.FolderExists(dir & "\data") Then fso.CreateFolder(dir & "\data")
+If fso.FileExists(dir & "\phosphor-server.exe") Then
+  sh.Run "cmd /c """ & dir & "\phosphor-server.exe"" >> data\server-rs.log 2>&1", 0, False
+ElseIf fso.FileExists(dir & "\tv-server.exe") Then
   sh.Run "cmd /c """ & dir & "\tv-server.exe"" >> data\server-rs.log 2>&1", 0, False
 End If

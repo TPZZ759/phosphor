@@ -3815,7 +3815,7 @@ const Player = (() => {
     m.innerHTML = '<b>Play on</b>' + r.devices.map((d) => `<button data-cast="${esc(d.id)}">${I.cast}<span>${esc(d.name)}<small>${esc(d.model || 'Smart TV')}</small></span></button>`).join('')
       + (chrome ? `<button data-chromecast="1">${I.cast}<span>Chromecast / Google TV…<small>uses the browser's cast</small></span></button>` : '')
       + (!r.devices.length ? `<div class="muted">No TVs found. Turn the TV on and make sure it's on the same Wi-Fi${chrome ? '' : ''}.</div>` : '')
-      + '<div class="muted">The first time, Windows may ask to allow tv-server on private networks: choose Allow.</div>';
+      + '<div class="muted">The first time, Windows may ask to allow phosphor-server on private networks: choose Allow.</div>';
     $$('[data-cast]', m).forEach((b) => (b.onclick = () => { m.remove(); startCast(b.dataset.cast, b.querySelector('span').firstChild.textContent); }));
     $('[data-chromecast]', m)?.addEventListener('click', () => { m.remove(); video.remote.prompt().catch((e) => toast(e?.message || 'Casting was cancelled')); });
     setTimeout(() => document.addEventListener('click', function off(e) { if (!m.contains(e.target) && e.target.closest('#pCast') === null) { m.remove(); document.removeEventListener('click', off); } }), 0);
@@ -4591,7 +4591,7 @@ async function renderRemote() {
   box.innerHTML = r.enabled ? `<div class="remote-pair">${r.qr ? `<div class="qr">${r.qr}</div>` : ''}<div>
       <p>On your phone (same Wi-Fi), open<br><b class="mono">${esc(r.url || 'this PC’s address, port 7880')}</b><br>or scan the code, then enter</p>
       <div class="pair-code">${esc((r.code || '').replace(/(\d{3})(\d{3})/, '$1 $2'))}</div>
-      <p class="muted">${r.paired ? `${r.paired} phone${r.paired === 1 ? '' : 's'} paired. ` : ''}If Windows asks whether to allow “tv-server” on private networks, choose Allow.</p>
+      <p class="muted">${r.paired ? `${r.paired} phone${r.paired === 1 ? '' : 's'} paired. ` : ''}If Windows asks whether to allow “phosphor-server” on private networks, choose Allow.</p>
       <div class="btns"><button class="btn btn-ghost btn-sm" id="remoteOff">Turn off</button>${r.paired ? '<button class="btn btn-ghost btn-sm" id="remoteForget">Unpair phones</button>' : ''}</div></div></div>`
     : `<p>Control playback, browse and search from your phone over your home Wi-Fi. Off until you switch it on, and phones need a one-time pairing code.</p><div class="btns"><button class="btn btn-accent btn-sm" id="remoteOn">Turn on phone remote</button></div>`;
   $('#remoteOn', box)?.addEventListener('click', async () => { await post('/api/remote', { enabled: true }); renderRemote(); });

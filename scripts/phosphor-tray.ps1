@@ -1,27 +1,27 @@
-# Unbranded personal TV system tray companion (lightweight WinForms NotifyIcon).
-# Double-click opens TV in your default browser; right-click controls mpv, OLED display restore,
+# Phosphor system tray companion (lightweight WinForms NotifyIcon).
+# Double-click opens Phosphor in your default browser; right-click controls mpv, OLED display restore,
 # logon auto-start, and dynamically binds global Windows media keys ONLY while mpv is playing.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $createdNew = $false
-$mutex = New-Object System.Threading.Mutex($true, "Local\PersonalTvAppTray", [ref]$createdNew)
+$mutex = New-Object System.Threading.Mutex($true, "Local\PhosphorAppTray", [ref]$createdNew)
 if (-not $createdNew) { exit 0 }
 
-if (-not ([System.Management.Automation.PSTypeName]'TvMediaHotkeyWindow').Type) {
+if (-not ([System.Management.Automation.PSTypeName]'PhosphorMediaHotkeyWindow').Type) {
   Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-public class TvHotkeyEventArgs : EventArgs {
+public class PhosphorHotkeyEventArgs : EventArgs {
     private readonly int _id;
     public int Id { get { return _id; } }
-    public TvHotkeyEventArgs(int id) { _id = id; }
+    public PhosphorHotkeyEventArgs(int id) { _id = id; }
 }
 
-public class TvMediaHotkeyWindow : NativeWindow, IDisposable {
+public class PhosphorMediaHotkeyWindow : NativeWindow, IDisposable {
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
@@ -45,13 +45,13 @@ public class TvMediaHotkeyWindow : NativeWindow, IDisposable {
     private bool _active = false;
     private bool _disposed = false;
 
-    public event EventHandler<TvHotkeyEventArgs> HotkeyPressed;
+    public event EventHandler<PhosphorHotkeyEventArgs> HotkeyPressed;
 
     public bool IsActive { get { return _active; } }
 
-    public TvMediaHotkeyWindow() {
+    public PhosphorMediaHotkeyWindow() {
         CreateParams cp = new CreateParams();
-        cp.Caption = "PersonalTvAppMediaHotkeys";
+        cp.Caption = "PhosphorMediaHotkeys";
         CreateHandle(cp);
     }
 
@@ -91,9 +91,9 @@ public class TvMediaHotkeyWindow : NativeWindow, IDisposable {
 
     protected override void WndProc(ref Message m) {
         if (m.Msg == WM_HOTKEY) {
-            EventHandler<TvHotkeyEventArgs> handler = HotkeyPressed;
+            EventHandler<PhosphorHotkeyEventArgs> handler = HotkeyPressed;
             if (handler != null) {
-                handler(this, new TvHotkeyEventArgs(m.WParam.ToInt32()));
+                handler(this, new PhosphorHotkeyEventArgs(m.WParam.ToInt32()));
             }
         }
         base.WndProc(ref m);
@@ -113,16 +113,17 @@ public class TvMediaHotkeyWindow : NativeWindow, IDisposable {
 
 $base = "http://127.0.0.1:7878"
 $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
-$startupLnk = Join-Path $startupDir "TV Tray.lnk"
-$vbsPath = Join-Path $PSScriptRoot "Start TV Tray.vbs"
+$startupLnk = Join-Path $startupDir "Phosphor Tray.lnk"
+$vbsPath = Join-Path $PSScriptRoot "Start Phosphor Tray.vbs"
 
-# Draw a crisp 32x32 unbranded TV icon in memory
+# Draw a crisp 32x32 Phosphor icon (pure black + warm amber #ffb547)
 $bmp = New-Object System.Drawing.Bitmap(32, 32)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
 $g.Clear([System.Drawing.Color]::Transparent)
-$bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 18, 18, 22))
-$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 229, 9, 20), 2.5)
+$bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 8, 9, 12))
+$amber = [System.Drawing.Color]::FromArgb(255, 255, 181, 71)
+$pen = New-Object System.Drawing.Pen($amber, 2.5)
 $g.FillRectangle($bgBrush, 2, 5, 28, 22)
 $g.DrawRectangle($pen, 2, 5, 28, 22)
 $tri = [System.Drawing.Point[]]@(
@@ -130,21 +131,21 @@ $tri = [System.Drawing.Point[]]@(
   (New-Object System.Drawing.Point(23, 16)),
   (New-Object System.Drawing.Point(12, 22))
 )
-$playBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+$playBrush = New-Object System.Drawing.SolidBrush($amber)
 $g.FillPolygon($playBrush, $tri)
 $g.Dispose()
 $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 
 $tray = New-Object System.Windows.Forms.NotifyIcon
 $tray.Icon = $icon
-$tray.Text = "TV: Starting..."
+$tray.Text = "Phosphor: Starting..."
 $tray.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
-$miStatus = $menu.Items.Add("TV: Checking...")
+$miStatus = $menu.Items.Add("Phosphor: Checking...")
 $miStatus.Enabled = $false
 $menu.Items.Add("-") | Out-Null
-$miOpen = $menu.Items.Add("Open TV")
+$miOpen = $menu.Items.Add("Open Phosphor")
 $menu.Items.Add("-") | Out-Null
 $miPause = $menu.Items.Add("Pause / Play (mpv)")
 $miSkip = $menu.Items.Add("Skip Intro (mpv)")
@@ -158,7 +159,7 @@ $menu.Items.Add("-") | Out-Null
 $miQuit = $menu.Items.Add("Quit Tray Icon")
 $tray.ContextMenuStrip = $menu
 
-$hk = New-Object TvMediaHotkeyWindow
+$hk = New-Object PhosphorMediaHotkeyWindow
 
 function Post-Api($path, $bodyObj) {
   try {
@@ -183,7 +184,7 @@ $miStop.Add_Click({
 })
 $miRestore.Add_Click({
   Post-Api "/api/display/restore" @{} | Out-Null
-  $tray.ShowBalloonTip(2000, "TV", "Display refresh rate and HDR restored.", [System.Windows.Forms.ToolTipIcon]::Info)
+  $tray.ShowBalloonTip(2000, "Phosphor", "Display refresh rate and HDR restored.", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 
 $menu.Add_Opening({
@@ -195,7 +196,7 @@ $miAutoStart.Add_Click({
     if (Test-Path -LiteralPath $startupLnk) {
       Remove-Item -LiteralPath $startupLnk -Force -ErrorAction Stop
       $miAutoStart.Checked = $false
-      $tray.ShowBalloonTip(2000, "TV", "Logon auto-start disabled.", [System.Windows.Forms.ToolTipIcon]::Info)
+      $tray.ShowBalloonTip(2000, "Phosphor", "Logon auto-start disabled.", [System.Windows.Forms.ToolTipIcon]::Info)
     } else {
       if (-not (Test-Path -LiteralPath $startupDir)) {
         New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
@@ -206,17 +207,17 @@ $miAutoStart.Add_Click({
         $sc.TargetPath = "$env:WINDIR\System32\wscript.exe"
         $sc.Arguments = "`"$vbsPath`""
         $sc.WorkingDirectory = Split-Path -Parent $vbsPath
-        $sc.Description = "Personal TV System Tray Companion"
+        $sc.Description = "Phosphor System Tray Companion"
         $sc.Save()
       } finally {
         [System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh) | Out-Null
       }
       $miAutoStart.Checked = Test-Path -LiteralPath $startupLnk
-      $tray.ShowBalloonTip(2000, "TV", "TV Tray will start automatically at Windows logon.", [System.Windows.Forms.ToolTipIcon]::Info)
+      $tray.ShowBalloonTip(2000, "Phosphor", "Phosphor Tray will start automatically at Windows logon.", [System.Windows.Forms.ToolTipIcon]::Info)
     }
   } catch {
     $miAutoStart.Checked = Test-Path -LiteralPath $startupLnk
-    $tray.ShowBalloonTip(2500, "TV", "Could not update Startup shortcut.", [System.Windows.Forms.ToolTipIcon]::Warning)
+    $tray.ShowBalloonTip(2500, "Phosphor", "Could not update Startup shortcut.", [System.Windows.Forms.ToolTipIcon]::Warning)
   }
 })
 
@@ -262,25 +263,25 @@ $refresh = {
     $hk.SetActive($mpvPlaying)
     if ($mpvPlaying -and $mp.session) {
       $t = ($mp.session.title -as [string])
-      if ($t.Length -gt 45) { $t = $t.Substring(0, 42) + "..." }
-      $txt = "TV (mpv): $t"
+      if ($t.Length -gt 40) { $t = $t.Substring(0, 37) + "..." }
+      $txt = "Phosphor (mpv): $t"
       $miPause.Enabled = $true; $miSkip.Enabled = $true; $miStop.Enabled = $true
     } elseif ($mpvPlaying) {
-      $txt = "TV (mpv): Playing"
+      $txt = "Phosphor (mpv): Playing"
       $miPause.Enabled = $true; $miSkip.Enabled = $true; $miStop.Enabled = $true
     } elseif ($st.streaming) {
-      $txt = "TV: Streaming in browser"
+      $txt = "Phosphor: Streaming in browser"
       $miPause.Enabled = $false; $miSkip.Enabled = $false; $miStop.Enabled = $false
     } else {
-      $txt = "TV: Ready"
+      $txt = "Phosphor: Ready"
       $miPause.Enabled = $false; $miSkip.Enabled = $false; $miStop.Enabled = $false
     }
     $miStatus.Text = $txt
     $tray.Text = if ($txt.Length -gt 63) { $txt.Substring(0, 63) } else { $txt }
   } catch {
     $hk.SetActive($false)
-    $miStatus.Text = "TV: Server offline"
-    $tray.Text = "TV: Server offline"
+    $miStatus.Text = "Phosphor: Server offline"
+    $tray.Text = "Phosphor: Server offline"
     $miPause.Enabled = $false; $miSkip.Enabled = $false; $miStop.Enabled = $false
   }
 }

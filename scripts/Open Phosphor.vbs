@@ -1,4 +1,4 @@
-' Starts the TV server (hidden) if it isn't running, then opens the app window.
+' Starts the Phosphor server (hidden) if it isn't running, then opens the app window.
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 dir = fso.GetParentFolderName(WScript.ScriptFullName)
@@ -16,10 +16,11 @@ On Error GoTo 0
 
 If Not running Then
   sh.CurrentDirectory = dir
-  If fso.FileExists(dir & "\tv-server.exe") Then
+  If Not fso.FolderExists(dir & "\data") Then fso.CreateFolder(dir & "\data")
+  If fso.FileExists(dir & "\phosphor-server.exe") Then
+    sh.Run "cmd /c """ & dir & "\phosphor-server.exe"" >> data\server.log 2>&1", 0, False
+  ElseIf fso.FileExists(dir & "\tv-server.exe") Then
     sh.Run "cmd /c """ & dir & "\tv-server.exe"" >> data\server.log 2>&1", 0, False
-  Else
-    sh.Run "cmd /c node server.js >> data\server.log 2>&1", 0, False
   End If
   WScript.Sleep 2500
 End If
