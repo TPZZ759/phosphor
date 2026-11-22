@@ -178,7 +178,7 @@ impl Streamer {
         // live: a short probe so channels start fast (MPEG-TS announces its streams up front)
         // reconnect on network drops too, and never hang forever on a silent provider (rw_timeout, microseconds)
         if live { for x in ["-probesize", "1500000", "-analyzeduration", "1500000", "-rw_timeout", "10000000", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "6", "-fflags", "+genpts+discardcorrupt+igndts"] { a.push(x.into()); } }
-        else { for x in ["-analyzeduration", "3000000", "-probesize", "3000000", "-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "4xx,5xx", "-reconnect_delay_max", "10"] { a.push(x.into()); } }
+        else { for x in ["-analyzeduration", "3000000", "-probesize", "3000000", "-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "5xx", "-reconnect_delay_max", "10"] { a.push(x.into()); } }
         // A/V sync on seek/resume: copied video can only start at the keyframe BEFORE the target,
         // while accurate seeking trims audio to the exact target. Fragmented MP4 (empty_moov) can't
         // carry per-track start offsets, so both tracks would begin at 0 and the audio would play

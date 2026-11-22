@@ -12,12 +12,13 @@
 // Live TV / catch-up don't use it (no ranges; they can't run ahead of the broadcast).
 use crate::util::now_ms;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -26,6 +27,25 @@ const BLOCK: u64 = 1 << 20;
 const MEM_CAP: u64 = 900 << 20; // most memory the cache may hold
 const BEHIND: u64 = 96 << 20; // kept behind the playhead (quick back-seeks)
 const AHEAD_SECS: f64 = 150.0;
+const REOPEN_WAIT_MS: i64 = 1500; // polite gap so single-connection IPTV edges release the old slot
+
+enum OpenErr {
+    Unsupported,      // provider ignores Range -> fall back to direct playback
+    RateOrSlot(u16),  // 401/403/429/460 (slot still releasing, max connections, or IP block)
+    Transient,        // network drop or 5xx
+}
+
+fn is_slot_or_auth_status(code: u16) -> bool {
+    matches!(code, 401 | 403 | 429 | 460)
+}
+
+fn slot_backoff_ms(consecutive: u32) -> u64 {
+    match consecutive {
+        0 | 1 => 3000,
+        2 => 6000,
+        _ => 10_000,
+    }
+}
 
 static PORT: AtomicU16 = AtomicU16::new(7878);
 static GEN: AtomicU64 = AtomicU64::new(0);
@@ -106,13 +126,20 @@ pub struct Spool { pub gen: u64, pub url: String, ua: String, st: Mutex<St>, dat
 
 impl Spool {
     fn local_url(&self) -> String { format!("http://127.0.0.1:{}/spool/{}", PORT.load(SeqCst), self.gen) }
-    fn close(&self) { self.closed.store(true, SeqCst); self.data.notify_waiters(); self.demand.notify_one(); }
+    fn close(&self) {
+        if !self.closed.swap(true, SeqCst) {
+            LAST_CLOSE.store(now_ms(), SeqCst);
+        }
+        self.data.notify_waiters();
+        self.demand.notify_one();
+    }
 
     /// The download loop: keeps one provider connection at the right place, reconnecting with
     /// backoff after errors, closing it when the buffer is full or nobody is reading.
     async fn run(self: Arc<Self>) {
         let mut body: Option<std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>> = None;
-        let mut backoff = 500u64;
+        let mut backoff = 1000u64;
+        let mut slot_errs = 0u32;
         loop {
             if self.closed.load(SeqCst) { break; }
             let (target, idle) = { let mut st = self.st.lock().unwrap();
@@ -131,17 +158,48 @@ impl Spool {
             if !reuse {
                 if body.take().is_some() { LAST_CLOSE.store(now_ms(), SeqCst); }
                 let start = t / BLOCK * BLOCK + { let st = self.st.lock().unwrap(); st.blocks.get(&(t / BLOCK)).map_or(0, |b| b.len() as u64) };
-                let since = now_ms() - LAST_CLOSE.load(SeqCst); if since < 400 { tokio::time::sleep(std::time::Duration::from_millis((400 - since) as u64)).await; }
+                let since = now_ms() - LAST_CLOSE.load(SeqCst);
+                if since < REOPEN_WAIT_MS {
+                    tokio::time::sleep(std::time::Duration::from_millis((REOPEN_WAIT_MS - since) as u64)).await;
+                }
+                if self.closed.load(SeqCst) { break; }
                 match self.open(start).await {
-                    Ok(s) => { body = Some(s); backoff = 500; let mut st = self.st.lock().unwrap(); st.connected = true; st.upstream_pos = start; st.failing_since = None; }
-                    Err(unsupported) => {
+                    Ok(s) => {
+                        body = Some(s); backoff = 1000; slot_errs = 0;
+                        let mut st = self.st.lock().unwrap(); st.connected = true; st.upstream_pos = start; st.failing_since = None;
+                    }
+                    Err(OpenErr::Unsupported) => {
+                        { let mut st = self.st.lock().unwrap(); st.connected = false; st.reconnects += 1; st.unsupported = true; }
+                        self.close();
+                        break;
+                    }
+                    Err(OpenErr::RateOrSlot(code)) => {
+                        slot_errs += 1;
+                        LAST_CLOSE.store(now_ms(), SeqCst);
+                        let have_total = {
+                            let mut st = self.st.lock().unwrap(); st.connected = false; st.reconnects += 1;
+                            if st.failing_since.is_none() { st.failing_since = Some(now_ms()); }
+                            st.total.is_some()
+                        };
+                        self.data.notify_waiters();
+                        let limit = if have_total { 5 } else { 3 };
+                        if slot_errs >= limit {
+                            println!("[spool] giving up after {slot_errs} consecutive {code} rejections (total={have_total})");
+                            self.close();
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(slot_backoff_ms(slot_errs))).await;
+                        continue;
+                    }
+                    Err(OpenErr::Transient) => {
+                        slot_errs = 0;
                         {
                             let mut st = self.st.lock().unwrap(); st.connected = false; st.reconnects += 1;
-                            if unsupported { st.unsupported = true; } else if st.failing_since.is_none() { st.failing_since = Some(now_ms()); }
+                            if st.failing_since.is_none() { st.failing_since = Some(now_ms()); }
                         }
-                        if unsupported { self.close(); break; }
                         self.data.notify_waiters();
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await; backoff = (backoff * 2).min(8000);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        backoff = (backoff * 2).min(8000);
                         continue;
                     }
                 }
@@ -160,14 +218,18 @@ impl Spool {
         LAST_CLOSE.store(now_ms(), SeqCst);
     }
 
-    /// Open the provider at `start`. Err(true) = the provider doesn't support ranges (use direct playback).
-    async fn open(&self, start: u64) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>, bool> {
+    /// Open the provider at `start`.
+    async fn open(&self, start: u64) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>, OpenErr> {
         let r = self.http.get(&self.url).header(header::USER_AGENT, &self.ua).header(header::RANGE, format!("bytes={start}-"))
-            .timeout(std::time::Duration::from_secs(3600 * 6)).send().await.map_err(|_| false)?;
+            .timeout(std::time::Duration::from_secs(3600 * 6)).send().await.map_err(|_| OpenErr::Transient)?;
         let status = r.status();
-        if status == reqwest::StatusCode::OK && start == 0 && r.headers().get(header::ACCEPT_RANGES).and_then(|v| v.to_str().ok()) != Some("bytes") { println!("[spool] provider ignores ranges: playing directly"); return Err(true); }
-        if status == reqwest::StatusCode::OK && start > 0 { return Err(true); }
-        if !status.is_success() { println!("[spool] provider said {status} at {} MB", start >> 20); return Err(false); }
+        if status == reqwest::StatusCode::OK && start == 0 && r.headers().get(header::ACCEPT_RANGES).and_then(|v| v.to_str().ok()) != Some("bytes") { println!("[spool] provider ignores ranges: playing directly"); return Err(OpenErr::Unsupported); }
+        if status == reqwest::StatusCode::OK && start > 0 { return Err(OpenErr::Unsupported); }
+        if !status.is_success() {
+            println!("[spool] provider said {status} at {} MB", start >> 20);
+            let code = status.as_u16();
+            return Err(if is_slot_or_auth_status(code) { OpenErr::RateOrSlot(code) } else { OpenErr::Transient });
+        }
         let total = r.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(|v| v.rsplit('/').next()).and_then(|t| t.parse::<u64>().ok())
             .or_else(|| r.content_length().map(|l| l + start));
         if let Some(t) = total { self.st.lock().unwrap().total = Some(t); }
@@ -183,7 +245,11 @@ pub async fn attach(url: &str, ua: &str) -> Option<String> {
     let cur = CUR.lock().unwrap().clone();
     if let Some(s) = cur.as_ref().filter(|s| s.url == url && !s.closed.load(SeqCst)) { return Some(s.local_url()); }
     if let Some(s) = cur { s.close(); }
-    let http = reqwest::Client::builder().pool_max_idle_per_host(0).connect_timeout(std::time::Duration::from_secs(10)).build().ok()?;
+    let http = reqwest::Client::builder()
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .pool_max_idle_per_host(0)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build().ok()?;
     let sp = Arc::new(Spool { gen: GEN.fetch_add(1, SeqCst) + 1, url: url.to_string(), ua: ua.to_string(), st: Mutex::new(St { prime: true, ..Default::default() }), data: Notify::new(), demand: Notify::new(), closed: AtomicBool::new(false), http });
     *CUR.lock().unwrap() = Some(sp.clone());
     tokio::spawn(sp.clone().run());
@@ -250,4 +316,24 @@ pub async fn serve(Path(gen): Path<u64>, headers: HeaderMap) -> Response {
         .header(header::CONTENT_TYPE, "application/octet-stream").header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}")).header(header::CONTENT_LENGTH, end - start + 1)
         .body(Body::from_stream(stream)).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_and_auth_status_classification_and_backoff() {
+        for code in [401, 403, 429, 460] {
+            assert!(is_slot_or_auth_status(code), "expected {code} to be slot/auth");
+        }
+        for code in [200, 206, 404, 500, 502, 503, 504] {
+            assert!(!is_slot_or_auth_status(code), "expected {code} not to be slot/auth");
+        }
+        assert_eq!(slot_backoff_ms(1), 3000);
+        assert_eq!(slot_backoff_ms(2), 6000);
+        assert_eq!(slot_backoff_ms(3), 10_000);
+        assert_eq!(slot_backoff_ms(9), 10_000);
+        assert_eq!(REOPEN_WAIT_MS, 1500);
+    }
 }

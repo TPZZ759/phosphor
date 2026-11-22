@@ -48,7 +48,11 @@ async fn main() {
     let root = std::env::var("PHOSPHOR_ROOT").or_else(|_| std::env::var("TV_ROOT")).map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::current_dir().unwrap());
     let data = root.join("data"); let _ = std::fs::create_dir_all(data.join("raw"));
     let cfg = Arc::new(store::Config::load(root.join("config.json")));
-    let http = reqwest::Client::builder().gzip(true).pool_max_idle_per_host(16).build().unwrap();
+    let http = reqwest::Client::builder()
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .gzip(true)
+        .pool_max_idle_per_host(16)
+        .build().unwrap();
     let app = Arc::new(App {
         public: std::env::var("PHOSPHOR_PUBLIC").or_else(|_| std::env::var("TV_PUBLIC")).map(std::path::PathBuf::from).unwrap_or_else(|_| root.join("public")),
         state: store::State::load(data.join("state.json")),

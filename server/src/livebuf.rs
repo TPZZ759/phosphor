@@ -157,12 +157,15 @@ impl LiveBuf {
         }
     }
     fn close(&self) {
-        self.closed.store(true, SeqCst);
+        if !self.closed.swap(true, SeqCst) {
+            LAST_CLOSE.store(now_ms(), SeqCst);
+        }
         self.data.notify_waiters();
     }
 
     async fn run(self: Arc<Self>) {
-        let mut backoff = 500u64;
+        let mut backoff = 1000u64;
+        let mut slot_errs = 0u32;
         loop {
             if self.closed.load(SeqCst) { break; }
             {
@@ -182,7 +185,7 @@ impl LiveBuf {
                 }
             }
             let since = now_ms() - LAST_CLOSE.load(SeqCst);
-            if since < 400 { tokio::time::sleep(std::time::Duration::from_millis((400 - since) as u64)).await; }
+            if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; }
             if self.closed.load(SeqCst) { break; }
             let resp = self.http.get(&self.url)
                 .header(header::USER_AGENT, &self.ua)
@@ -190,18 +193,41 @@ impl LiveBuf {
                 .send().await;
             let mut stream = match resp {
                 Ok(r) if r.status().is_success() => {
-                    backoff = 500;
+                    backoff = 1000;
+                    slot_errs = 0;
                     { let mut st = self.st.lock().unwrap(); st.connected = true; st.failing_since = None; }
                     Box::pin(r.bytes_stream())
                 }
                 Ok(r) => {
+                    let code = r.status().as_u16();
                     println!("[livebuf] provider said {}", r.status());
-                    { let mut st = self.st.lock().unwrap(); st.connected = false; st.reconnects += 1; if st.failing_since.is_none() { st.failing_since = Some(now_ms()); } }
+                    let have_data = {
+                        let mut st = self.st.lock().unwrap();
+                        st.connected = false;
+                        st.reconnects += 1;
+                        if st.failing_since.is_none() { st.failing_since = Some(now_ms()); }
+                        !st.chunks.is_empty()
+                    };
+                    if matches!(code, 401 | 403 | 429 | 460) {
+                        slot_errs += 1;
+                        LAST_CLOSE.store(now_ms(), SeqCst);
+                        let limit = if have_data { 5 } else { 3 };
+                        if slot_errs >= limit {
+                            println!("[livebuf] giving up after {slot_errs} consecutive {code} rejections");
+                            self.close();
+                            break;
+                        }
+                        let wait = match slot_errs { 1 => 3000, 2 => 6000, _ => 10_000 };
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                        continue;
+                    }
+                    slot_errs = 0;
                     tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                     backoff = (backoff * 2).min(6000);
                     continue;
                 }
                 Err(e) => {
+                    slot_errs = 0;
                     println!("[livebuf] connect failed ({e})");
                     { let mut st = self.st.lock().unwrap(); st.connected = false; st.reconnects += 1; if st.failing_since.is_none() { st.failing_since = Some(now_ms()); } }
                     tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
@@ -315,7 +341,11 @@ pub async fn attach(url: &str, ua: &str, back_secs: f64) -> Option<String> {
         return Some(s.local_url(back_secs));
     }
     if let Some(s) = cur { s.close(); }
-    let http = reqwest::Client::builder().pool_max_idle_per_host(0).connect_timeout(std::time::Duration::from_secs(10)).build().ok()?;
+    let http = reqwest::Client::builder()
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .pool_max_idle_per_host(0)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build().ok()?;
     let lb = Arc::new(LiveBuf {
         gen: GEN.fetch_add(1, SeqCst) + 1,
         url: url.to_string(),
