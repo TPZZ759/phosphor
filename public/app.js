@@ -3365,6 +3365,7 @@ const Player = (() => {
           toast(`Up next: ${o.next.label}`);
           return o.next.go();
         }
+        if (done?.error) toast(done.error);
         close();
       }
     }, 2000);

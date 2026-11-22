@@ -16,6 +16,8 @@ pub struct Session {
     pub gen: u64,
     pub child: std::process::Child,
     pub key: String,
+    pub url: String,
+    pub used_spool: bool,
     pub body: Value,
     pub pos: f64,
     pub dur: f64,
@@ -176,11 +178,8 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
     let Some(exe) = find(&app) else { return crate::err(404, "The pro player (mpv) isn't installed") };
     stop_inner(&app, false).await;
     app.stream.stop("pro player");
-    crate::spool::detach();
     crate::livebuf::detach();
     crate::yield_background(&app).await;
-    let since = crate::util::now_ms() - app.stream.last_stop();
-    if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; }
 
     let kind = b["kind"].as_str().unwrap_or("movie").to_string();
     let live = kind == "live";
@@ -198,6 +197,19 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
     } else {
         crate::upstream(&app, &kind, &id, b["ext"].as_str().map(String::from).as_ref(), false)
     };
+
+    // If /api/probe just warmed up the read-ahead spool for this exact title, reuse it directly!
+    // That eliminates destroying 15-30 MB of already-buffered 4K data, eliminates the 1.5s slot
+    // release wait, eliminates a second provider 302+TTFB roundtrip, and keeps mpv on IPv4!
+    let warm_spool = if !live && kind != "catchup" { crate::spool::local_for(&url) } else { None };
+    let used_spool = warm_spool.is_some();
+    if used_spool {
+        let dur_hint = b["dur"].as_f64().unwrap_or(0.0);
+        if dur_hint > 60.0 { crate::spool::set_duration(&url, dur_hint); }
+    } else {
+        crate::spool::detach();
+    }
+    let play_url = warm_spool.unwrap_or_else(|| url.clone());
 
     let t = if live { 0.0 } else { b["t"].as_f64().unwrap_or(0.0) };
     let title = b["title"].as_str().unwrap_or("").to_string();
@@ -227,23 +239,34 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         st["prefs"]["mpvShaders"].as_str().unwrap_or("auto").to_string(),
     ));
 
-    // Match OLED refresh rate + True Black HDR/SDR switch, then WAIT for DWM to finish switching
-    // before spawning mpv so its D3D11 swapchain latches onto the exact final colour space!
+    // Match OLED refresh rate + True Black HDR/SDR switch, overlapping any provider slot cooldown
+    // with the display settle window so 4K startup doesn't double-sleep 3+ seconds sequentially.
     let dm = crate::display::match_for(&app, fps, hdr).await;
-    let disp_changed = dm["changed"].as_array().map_or(false, |a| !a.is_empty());
+    let changed_arr = dm["changed"].as_array();
+    let hdr_toggled = changed_arr.map_or(false, |arr| arr.iter().any(|x| x.as_str().map_or(false, |s| s.contains("HDR"))));
+    let hz_changed = changed_arr.map_or(false, |arr| arr.iter().any(|x| x.as_str().map_or(false, |s| s.ends_with("Hz"))));
+    let disp_wait_ms: i64 = if hdr_toggled { 1200 } else if hz_changed { 350 } else { 0 };
+    let slot_wait_ms: i64 = if used_spool { 0 } else { (1500 - (crate::util::now_ms() - app.stream.last_stop())).max(0) };
+    let settle_ms = disp_wait_ms.max(slot_wait_ms);
+    if settle_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms as u64)).await;
+    }
     let gdi = dm["gdi"].as_str().unwrap_or("").to_string();
     let hdr_now = dm["hdrOn"].as_bool().unwrap_or(hdr);
-    if disp_changed {
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    }
 
     let use_vsr = mpv_vsr && !hdr && dv == 0 && (live || (vh > 0 && vh < 1800));
     let is_native_4k = vh >= 1800 || vw >= 3600;
+    let shader_cache_dir = app.data.join("mpv-shader-cache");
+    let _ = std::fs::create_dir_all(&shader_cache_dir);
     let mut a: Vec<String> = vec![
-        url,
+        play_url,
         "--no-config".into(),
         "--fs".into(),
         "--force-window=immediate".into(),
+        "--msg-level=all=error,cplayer=warn".into(),
+        "--gpu-shader-cache=yes".into(),
+        format!("--gpu-shader-cache-dir={}", shader_cache_dir.to_string_lossy()),
+        "--demuxer-mkv-probe-start-time=no".into(),
         format!("--title={title}"),
         format!("--force-media-title={title}"),
         "--vo=gpu-next".into(),
@@ -269,10 +292,10 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         "--keep-open=no".into(),
         "--save-position-on-quit=no".into(),
         "--cache=yes".into(),
-        format!("--demuxer-max-bytes={}", if live { "256MiB" } else { "1024MiB" }),
-        format!("--demuxer-max-back-bytes={}", if live { "128MiB" } else { "256MiB" }),
-        format!("--demuxer-readahead-secs={}", if live { "30" } else { "180" }),
-        format!("--cache-secs={}", if live { "30" } else { "180" }),
+        format!("--demuxer-max-bytes={}", if live || used_spool { "256MiB" } else { "1024MiB" }),
+        format!("--demuxer-max-back-bytes={}", if live || used_spool { "128MiB" } else { "256MiB" }),
+        format!("--demuxer-readahead-secs={}", if live || used_spool { "30" } else { "180" }),
+        format!("--cache-secs={}", if live || used_spool { "30" } else { "180" }),
         "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5".into(),
         "--audio-channels=auto".into(),
         "--osd-font-size=36".into(),
@@ -448,8 +471,12 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         _ => a.push("--sid=no".into()),
     }
 
+    let err_log = app.data.join("mpv-last.log");
+    let stderr_io = std::fs::File::create(&err_log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(&a).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.args(&a).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(stderr_io);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return crate::err(500, &format!("mpv failed to start: {e}")),
@@ -461,6 +488,8 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         gen,
         child,
         key,
+        url,
+        used_spool,
         body: b["progress"].clone(),
         pos: t,
         dur: b["dur"].as_f64().unwrap_or(0.0),
@@ -473,7 +502,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         next_triggered: false,
         has_osd,
     });
-    println!("[mpv] playing {kind}:{id} from {t:.0}s (hdr={hdr} hdr_now={hdr_now} shader={shader_preset} osd={has_osd} vsr={use_vsr} oled={gdi})");
+    println!("[mpv] playing {kind}:{id} from {t:.0}s (hdr={hdr} hdr_now={hdr_now} spool={used_spool} shader={shader_preset} osd={has_osd} vsr={use_vsr} oled={gdi})");
     let a2 = app.clone();
     tokio::spawn(async move { watch(a2, gen).await });
     crate::j(json!({ "ok": true, "gen": gen }))
@@ -537,8 +566,42 @@ async fn watch(app: Arc<App>, gen: u64) {
             s.pos / s.dur >= 0.90
             || s.credits.map_or(false, |c| c > s.dur * 0.6 && s.pos >= c - 5.0)
         ));
+        let mut err_msg: Option<String> = None;
+        if s.pos < 1.0 && !s.next_triggered && n <= 8 {
+            if let Ok(raw) = std::fs::read_to_string(app.data.join("mpv-last.log")) {
+                let low = raw.to_lowercase();
+                if low.contains("403 forbidden") || low.contains("404 not found") || low.contains("460") {
+                    app.xc.mark_stream_failed(&s.url);
+                }
+                let pick = raw.lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty() && !l.starts_with("Exiting"))
+                    .rev()
+                    .find(|l| l.contains("HTTP error") || l.contains("Failed to open") || l.contains("error") || l.contains("403") || l.contains("404") || l.contains("460"));
+                if let Some(line) = pick {
+                    // Never leak provider credentials in logs or UI toasts
+                    let clean = if line.contains("403") {
+                        "Provider returned 403 Forbidden (check VPN / split tunneling)".to_string()
+                    } else if line.contains("404") {
+                        "Provider stream returned 404 Not Found (rotated server — try again)".to_string()
+                    } else if line.contains("460") {
+                        "Provider connection busy (460 — 1/1 active slot)".to_string()
+                    } else {
+                        let u = app.cfg.str("username");
+                        let p = app.cfg.str("password");
+                        let mut c = line.to_string();
+                        if !u.is_empty() { c = c.replace(&u, "***"); }
+                        if !p.is_empty() { c = c.replace(&p, "***"); }
+                        c.chars().take(160).collect()
+                    };
+                    println!("[mpv] early exit reason: {clean}");
+                    err_msg = Some(clean);
+                }
+            }
+        }
+        if s.used_spool { crate::spool::detach(); }
         *app.mpv.last_done.lock().unwrap() = Some(json!({
-            "gen": s.gen, "key": s.key, "finished": finished, "nextNow": s.next_triggered, "pos": s.pos, "dur": s.dur
+            "gen": s.gen, "key": s.key, "finished": finished, "nextNow": s.next_triggered, "pos": s.pos, "dur": s.dur, "error": err_msg
         }));
         println!("[mpv] closed at {:.0}s (finished={finished} next_now={})", s.pos, s.next_triggered);
     }
@@ -570,6 +633,7 @@ async fn stop_inner(app: &Arc<App>, restore: bool) {
     if let Some(mut s) = s {
         let _ = s.child.kill();
         let _ = s.child.wait();
+        if s.used_spool { crate::spool::detach(); }
         app.stream.mark_stop();
     }
     if restore {

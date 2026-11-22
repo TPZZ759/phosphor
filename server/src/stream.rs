@@ -94,7 +94,9 @@ impl Streamer {
         let src = src.unwrap_or_else(|| url.to_string());
         let out = tokio::time::timeout(std::time::Duration::from_secs(25), {
             let mut c = Command::new("ffprobe");
-            c.args(["-v", "error", "-user_agent", ua, "-rw_timeout", "15000000", "-show_entries",
+            c.args(["-v", "error", "-user_agent", ua, "-rw_timeout", "15000000",
+                "-probesize", "2000000", "-analyzeduration", "1500000",
+                "-show_entries",
                 "format=duration,bit_rate:stream=index,codec_type,codec_name,codec_tag_string,profile,channels,width,height,pix_fmt,color_transfer,color_primaries,avg_frame_rate,r_frame_rate,field_order,bit_rate:stream_side_data=side_data_type,dv_profile:stream_tags=language,title:stream_disposition=forced,default", "-show_chapters", "-of", "json", &src]);
             #[cfg(windows)] c.creation_flags(0x08000000);
             c.kill_on_drop(true).output()

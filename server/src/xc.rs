@@ -96,6 +96,18 @@ impl Xc {
         format!("{}/{seg}/{u}/{p}/{id}.{ext}", servers.get(idx).cloned().unwrap_or_default())
     }
 
+    /// Rotate away from a server whose stream URL returned 403/404 even if player_api.php answered 200.
+    pub fn mark_stream_failed(&self, failed_url: &str) {
+        let servers = self.servers();
+        if servers.len() < 2 { return; }
+        let cur = self.active.load(Ordering::Relaxed) % servers.len();
+        if failed_url.starts_with(&servers[cur]) {
+            let next = (cur + 1) % servers.len();
+            self.active.store(next, Ordering::Relaxed);
+            println!("[xc] rotating stream server {} -> {}", servers[cur], servers[next]);
+        }
+    }
+
     pub async fn account(&self) -> anyhow_lite::Result<Account> {
         let j = self.api("", "", 8000).await?;
         let u = &j["user_info"];

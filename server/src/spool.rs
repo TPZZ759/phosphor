@@ -27,7 +27,8 @@ const BLOCK: u64 = 1 << 20;
 const MEM_CAP: u64 = 900 << 20; // most memory the cache may hold
 const BEHIND: u64 = 96 << 20; // kept behind the playhead (quick back-seeks)
 const AHEAD_SECS: f64 = 150.0;
-const REOPEN_WAIT_MS: i64 = 1500; // polite gap so single-connection IPTV edges release the old slot
+const REOPEN_WAIT_MS: i64 = 1500; // polite gap when switching titles or recovering from a slot error
+const SAME_URL_REOPEN_MS: i64 = 250; // fast intra-file Range seek (e.g. MKV Cues at EOF) on same title
 
 enum OpenErr {
     Unsupported,      // provider ignores Range -> fall back to direct playback
@@ -36,7 +37,7 @@ enum OpenErr {
 }
 
 fn is_slot_or_auth_status(code: u16) -> bool {
-    matches!(code, 401 | 403 | 429 | 460)
+    matches!(code, 401 | 403 | 404 | 429 | 460)
 }
 
 fn slot_backoff_ms(consecutive: u32) -> u64 {
@@ -71,6 +72,7 @@ struct St {
     failing_since: Option<i64>,
     unsupported: bool,
     no_readers_since: i64,
+    resolved_url: Option<String>, // cached final 302 CDN URL so MKV Cues / seeks skip portal redirect
 }
 impl St {
     /// Bytes available at `pos` (a slice of the block holding it), if downloaded.
@@ -140,6 +142,7 @@ impl Spool {
         let mut body: Option<std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>> = None;
         let mut backoff = 1000u64;
         let mut slot_errs = 0u32;
+        let mut opened_once = false;
         loop {
             if self.closed.load(SeqCst) { break; }
             let (target, idle) = { let mut st = self.st.lock().unwrap();
@@ -158,14 +161,15 @@ impl Spool {
             if !reuse {
                 if body.take().is_some() { LAST_CLOSE.store(now_ms(), SeqCst); }
                 let start = t / BLOCK * BLOCK + { let st = self.st.lock().unwrap(); st.blocks.get(&(t / BLOCK)).map_or(0, |b| b.len() as u64) };
+                let wait_ms = if opened_once && slot_errs == 0 { SAME_URL_REOPEN_MS } else { REOPEN_WAIT_MS };
                 let since = now_ms() - LAST_CLOSE.load(SeqCst);
-                if since < REOPEN_WAIT_MS {
-                    tokio::time::sleep(std::time::Duration::from_millis((REOPEN_WAIT_MS - since) as u64)).await;
+                if since < wait_ms {
+                    tokio::time::sleep(std::time::Duration::from_millis((wait_ms - since) as u64)).await;
                 }
                 if self.closed.load(SeqCst) { break; }
                 match self.open(start).await {
                     Ok(s) => {
-                        body = Some(s); backoff = 1000; slot_errs = 0;
+                        body = Some(s); backoff = 1000; slot_errs = 0; opened_once = true;
                         let mut st = self.st.lock().unwrap(); st.connected = true; st.upstream_pos = start; st.failing_since = None;
                     }
                     Err(OpenErr::Unsupported) => {
@@ -182,13 +186,14 @@ impl Spool {
                             st.total.is_some()
                         };
                         self.data.notify_waiters();
-                        let limit = if have_total { 5 } else { 3 };
+                        let limit = if code == 404 { 2 } else if have_total { 5 } else { 3 };
                         if slot_errs >= limit {
                             println!("[spool] giving up after {slot_errs} consecutive {code} rejections (total={have_total})");
                             self.close();
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(slot_backoff_ms(slot_errs))).await;
+                        let wait = if code == 404 { 1500 } else { slot_backoff_ms(slot_errs) };
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                         continue;
                     }
                     Err(OpenErr::Transient) => {
@@ -218,10 +223,24 @@ impl Spool {
         LAST_CLOSE.store(now_ms(), SeqCst);
     }
 
-    /// Open the provider at `start`.
+    /// Open the provider at `start`, reusing the cached 302 CDN URL for fast intra-file Range seeks.
     async fn open(&self, start: u64) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>, OpenErr> {
-        let r = self.http.get(&self.url).header(header::USER_AGENT, &self.ua).header(header::RANGE, format!("bytes={start}-"))
-            .timeout(std::time::Duration::from_secs(3600 * 6)).send().await.map_err(|_| OpenErr::Transient)?;
+        let cached = self.st.lock().unwrap().resolved_url.clone();
+        let req_url = cached.as_deref().unwrap_or(&self.url);
+        let mut r = match self.http.get(req_url).header(header::USER_AGENT, &self.ua).header(header::RANGE, format!("bytes={start}-"))
+            .timeout(std::time::Duration::from_secs(3600 * 6)).send().await {
+            Ok(resp) => resp,
+            Err(_) => {
+                if cached.is_some() { self.st.lock().unwrap().resolved_url = None; }
+                return Err(OpenErr::Transient);
+            }
+        };
+        // If a cached CDN token expired (non-2xx), immediately clear it and retry via the portal URL once.
+        if !r.status().is_success() && cached.is_some() {
+            self.st.lock().unwrap().resolved_url = None;
+            r = self.http.get(&self.url).header(header::USER_AGENT, &self.ua).header(header::RANGE, format!("bytes={start}-"))
+                .timeout(std::time::Duration::from_secs(3600 * 6)).send().await.map_err(|_| OpenErr::Transient)?;
+        }
         let status = r.status();
         if status == reqwest::StatusCode::OK && start == 0 && r.headers().get(header::ACCEPT_RANGES).and_then(|v| v.to_str().ok()) != Some("bytes") { println!("[spool] provider ignores ranges: playing directly"); return Err(OpenErr::Unsupported); }
         if status == reqwest::StatusCode::OK && start > 0 { return Err(OpenErr::Unsupported); }
@@ -230,9 +249,14 @@ impl Spool {
             let code = status.as_u16();
             return Err(if is_slot_or_auth_status(code) { OpenErr::RateOrSlot(code) } else { OpenErr::Transient });
         }
+        let final_url = r.url().as_str().to_string();
         let total = r.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(|v| v.rsplit('/').next()).and_then(|t| t.parse::<u64>().ok())
             .or_else(|| r.content_length().map(|l| l + start));
-        if let Some(t) = total { self.st.lock().unwrap().total = Some(t); }
+        {
+            let mut st = self.st.lock().unwrap();
+            if let Some(t) = total { st.total = Some(t); }
+            if !final_url.is_empty() && final_url != self.url { st.resolved_url = Some(final_url); }
+        }
         Ok(Box::pin(r.bytes_stream()))
     }
 }
@@ -279,6 +303,7 @@ pub fn stats() -> serde_json::Value {
 /// GET /spool/{gen}: the cached file with Range support (127.0.0.1 only, like the rest of the API).
 pub async fn serve(Path(gen): Path<u64>, headers: HeaderMap) -> Response {
     let Some(sp) = CUR.lock().unwrap().clone().filter(|s| s.gen == gen && !s.closed.load(SeqCst)) else { return (StatusCode::NOT_FOUND, "gone").into_response() };
+    let has_range = headers.get(header::RANGE).is_some();
     let (start, end) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes="))
         .map(|r| { let mut it = r.split('-'); (it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0), it.next().and_then(|x| x.parse::<u64>().ok())) }).unwrap_or((0, None));
     let Some(total) = sp.st.lock().unwrap().total else { return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response() };
@@ -312,10 +337,15 @@ pub async fn serve(Path(gen): Path<u64>, headers: HeaderMap) -> Response {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
         }
     });
-    Response::builder().status(StatusCode::PARTIAL_CONTENT)
-        .header(header::CONTENT_TYPE, "application/octet-stream").header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}")).header(header::CONTENT_LENGTH, end - start + 1)
-        .body(Body::from_stream(stream)).unwrap()
+    let mut rb = Response::builder()
+        .status(if has_range { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, end - start + 1);
+    if has_range {
+        rb = rb.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+    }
+    rb.body(Body::from_stream(stream)).unwrap()
 }
 
 #[cfg(test)]
@@ -324,10 +354,10 @@ mod tests {
 
     #[test]
     fn slot_and_auth_status_classification_and_backoff() {
-        for code in [401, 403, 429, 460] {
+        for code in [401, 403, 404, 429, 460] {
             assert!(is_slot_or_auth_status(code), "expected {code} to be slot/auth");
         }
-        for code in [200, 206, 404, 500, 502, 503, 504] {
+        for code in [200, 206, 500, 502, 503, 504] {
             assert!(!is_slot_or_auth_status(code), "expected {code} not to be slot/auth");
         }
         assert_eq!(slot_backoff_ms(1), 3000);
