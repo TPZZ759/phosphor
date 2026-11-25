@@ -4,18 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Phosphor | Pure-Black OLED Windows Player for Xtream Codes IPTV</title>
-  <meta name="description" content="Phosphor is an open-source Windows OLED front-end for Xtream Codes IPTV built with a single Rust binary, Win32 refresh-rate and HDR switching, mpv neural shaders, a 900 MB single-connection spool, and embedded VAD/alass subtitle sync.">
+  <meta name="description" content="Phosphor is an open-source Windows OLED cinema front-end for Xtream Codes IPTV in Rust — featuring a focus-free keyboard &amp; wheel MSE web player, 5-layer universal auto-skip/auto-next, Win32 auto-Hz/HDR, mpv neural shaders, a 900 MB single-connection spool, and embedded VAD/alass subtitle sync.">
   <link rel="canonical" href="https://tpzz759.github.io/phosphor/">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <meta name="theme-color" content="#000000">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://tpzz759.github.io/phosphor/">
   <meta property="og:title" content="Phosphor | Pure-Black OLED Windows Player for Xtream Codes IPTV">
-  <meta property="og:description" content="Single-binary Rust backend, pure #000000 web UI, native Windows refresh-rate and HDR switching, mpv HDR10/Dolby Vision with Anime4K and FSRCNNX shaders, and a 900 MB single-connection spool.">
+  <meta property="og:description" content="Single-binary Rust backend, pure #000000 OLED UI, focus-free MSE cinema web player, 5-layer auto-skip/auto-next, Win32 auto-Hz/HDR, mpv HDR10/Dolby Vision + Anime4K/FSRCNNX shaders, and a 900 MB single-connection spool.">
   <meta property="og:image" content="https://tpzz759.github.io/phosphor/assets/banner.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Phosphor | Pure-Black OLED Windows Player for Xtream Codes IPTV">
-  <meta name="twitter:description" content="Open-source Rust and mpv OLED front-end for Xtream Codes IPTV on Windows 10 and 11.">
+  <meta name="twitter:description" content="Open-source Rust, MSE web player, and mpv OLED cinema client for Xtream Codes IPTV on Windows 10 and 11.">
   <meta name="twitter:image" content="https://tpzz759.github.io/phosphor/assets/banner.png">
   <script type="application/ld+json">
   {
@@ -24,12 +24,11 @@
     "name": "Phosphor",
     "operatingSystem": "Windows 10, Windows 11",
     "applicationCategory": "MultimediaApplication",
-    "softwareVersion": "1.0.0",
     "license": "https://opensource.org/licenses/MIT",
     "url": "https://tpzz759.github.io/phosphor/",
     "downloadUrl": "https://github.com/TPZZ759/phosphor/releases/latest",
     "codeRepository": "https://github.com/TPZZ759/phosphor",
-    "description": "Local Windows OLED front-end for Xtream Codes IPTV built in Rust with native Win32 refresh-rate and HDR switching, mpv neural shaders, a 900 MB single-connection spool, and embedded WebRTC VAD and alass subtitle alignment.",
+    "description": "Local Windows OLED cinema front-end for Xtream Codes IPTV built in Rust with a focus-free keyboard and scroll-wheel MSE browser player, 5-layer universal auto-skip and auto-next, multi-variant 4K/HDR/Dolby catalog ranking, native Win32 refresh-rate and HDR switching, mpv neural shaders, a 900 MB single-connection spool, and embedded WebRTC VAD and alass subtitle alignment.",
     "offers": {
       "@type": "Offer",
       "price": "0",
@@ -73,12 +72,12 @@
     .hero { padding: 64px 0 40px; }
     .kicker { color: var(--accent); font-size: 12.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 14px; }
     h1 { font-size: clamp(34px, 5vw, 56px); line-height: 1.06; letter-spacing: -.03em; margin: 0 0 18px; max-width: 820px; }
-    .lead { color: #c4cad4; font-size: 18px; max-width: 720px; margin: 0 0 28px; }
+    .lead { color: #c4cad4; font-size: 18px; max-width: 740px; margin: 0 0 28px; }
     .hero-img { margin-top: 40px; border-radius: 16px; border: 1px solid var(--line); overflow: hidden; box-shadow: 0 24px 80px rgba(0,0,0,.85); }
 
     section { padding: 56px 0; border-top: 1px solid var(--line); }
     h2 { font-size: 28px; letter-spacing: -.02em; margin: 0 0 10px; }
-    .sub { color: var(--muted); margin: 0 0 28px; max-width: 680px; }
+    .sub { color: var(--muted); margin: 0 0 28px; max-width: 720px; }
 
     .prompt-box { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; }
     .prompt-box pre { margin: 0; white-space: pre-wrap; font: 13.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #e5e7eb; background: #07080a; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
@@ -131,11 +130,11 @@
 
   <main class="wrap">
     <div class="hero">
-      <div class="kicker">Open-source Rust and mpv client for Windows 10 and 11</div>
+      <div class="kicker">Open-source Rust, MSE web player, and mpv client for Windows 10 &amp; 11</div>
       <h1>Pure-black OLED cinema for Xtream Codes IPTV.</h1>
-      <p class="lead">One compiled Rust binary serves a #000000 web interface, switches Windows display refresh rates and HDR modes through Win32 APIs, drives mpv with HDR10, Dolby Vision, and neural shaders, and buffers 900 MB in memory so single-connection accounts do not stall.</p>
+      <p class="lead">One compiled Rust binary serves a #000000 web interface and focus-free keyboard &amp; scroll-wheel MSE player, auto-skips recaps, intros, and end credits across 5 detection layers, switches Windows display refresh rates and HDR modes via Win32, drives mpv with HDR10, Dolby Vision, and neural shaders, and buffers 900 MB in memory so single-connection accounts never stall.</p>
       <div class="btns">
-        <a class="btn btn-primary" href="https://github.com/TPZZ759/phosphor/releases/latest">Download Windows zip (v1.0.0)</a>
+        <a class="btn btn-primary" href="https://github.com/TPZZ759/phosphor/releases/latest">Download Windows zip</a>
         <a class="btn btn-ghost" href="https://github.com/TPZZ759/phosphor">View source on GitHub</a>
       </div>
       <div class="hero-img">
@@ -157,13 +156,27 @@
 
     <section id="screenshots">
       <h2>Interface gallery</h2>
-      <p class="sub">Every screen renders on pure #000000 black for zero glow on OLED panels. Captured from Phosphor using synthetic catalog data.</p>
+      <p class="sub">Every screen renders on pure #000000 black for zero glow on OLED panels. Captured directly from Phosphor using synthetic catalog data.</p>
       <div class="shots">
+        <article class="shot">
+          <img src="assets/screenshots/08-web-player.png" alt="Phosphor cinema browser player with OSD HUDs and timeline markers" loading="lazy">
+          <div class="cap">
+            <b>Cinema browser player with OSD HUDs</b>
+            <span>0 ms in-buffer MSE seeks, drag-to-scrub with buffered track and Intro/Credits markers, scroll-wheel volume HUD, Ends-at clock, playback speed, Picture Fit/Crop, subtitle size, and Picture-in-Picture.</span>
+          </div>
+        </article>
+        <article class="shot">
+          <img src="assets/screenshots/09-autoskip-shortcuts.png" alt="Phosphor 5-layer universal auto-skip, 3-second credits countdown, and focus-free keyboard shortcuts" loading="lazy">
+          <div class="cap">
+            <b>5-layer auto-skip &amp; focus-free shortcuts</b>
+            <span>IntroDB, TheIntroDB, AniSkip, MKV chapters, and local acoustic fingerprinting power automatic recap/intro skipping, 3 s credits auto-next, and capture-phase shortcuts that work from anywhere.</span>
+          </div>
+        </article>
         <article class="shot">
           <img src="assets/screenshots/02-4k-showcase.png" alt="Phosphor 4K OLED catalog and CAM filter" loading="lazy">
           <div class="cap">
-            <b>4K OLED catalog and CAM filter</b>
-            <span>Hides CAM and Telesync rips from discovery rows, separates 4K Dolby Vision, 4K UHD, and Blu-Ray copies, and records clean upgrades.</span>
+            <b>4K OLED catalog &amp; multi-variant quality engine</b>
+            <span>Hides CAM and Telesync rips, ranks 4K Dolby Vision, 4K HDR, 4K Dolby Audio, and Blu-Ray copies, merges cross-variant series episodes, and attaches clean 4K upgrades with an English-audio safety gate.</span>
           </div>
         </article>
         <article class="shot">
@@ -211,32 +224,32 @@
         <div class="card">
           <div class="stat">Single-connection engine</div>
           <h3>900 MB VOD spool and 384 MB live ring</h3>
-          <p>A preflight lock closes the prior upstream socket before opening a new stream, pauses background workers during playback, and absorbs seeks and live TV pauses in memory.</p>
+          <p>A preflight lock closes the prior upstream socket before opening a new stream, pins IPv4 on dual-stack VPNs, pauses background workers during playback, and absorbs seeks and live TV pauses in memory.</p>
         </div>
         <div class="card">
-          <div class="stat">Win32 OLED pipeline</div>
-          <h3>Auto refresh rate and 0-nit SDR blacks</h3>
-          <p>Calls QueryDisplayConfig to match 24, 25, 30, 50, or 60 Hz multiples, turns Windows HDR off for SDR video so blacks stay at 0 nits, checks your Windows HDR ICC profile, and restores desktop settings on exit.</p>
+          <div class="stat">Cinema browser player</div>
+          <h3>Focus-free keyboard, wheel volume &amp; 0 ms MSE</h3>
+          <p>Global capture-phase keys and scroll-wheel volume work regardless of focus, paired with instant in-buffer MSE seeks, drag-to-scrub Intro/Credits markers, playback speed, Picture Fit/Crop, PiP, and translucent OSD HUDs.</p>
         </div>
         <div class="card">
-          <div class="stat">mpv neural shaders</div>
-          <h3>Anime4K, FSRCNNX, and RTX VSR</h3>
-          <p>Ships with a custom pure-black Lua HUD and bundled GLSL shaders switchable live with Ctrl+0, 1, 2, and 3, plus optional NVIDIA RTX Video Super Resolution and auto black-bar cropping.</p>
+          <div class="stat">5-layer binge engine</div>
+          <h3>Universal auto-skip &amp; zero-race auto-next</h3>
+          <p>Combines IntroDB, TheIntroDB v2, AniSkip, MKV chapters, and local rustfft acoustic fingerprinting with zero provider connections, prefetching upcoming episodes and skipping recaps, intros, and end credits automatically.</p>
         </div>
         <div class="card">
-          <div class="stat">Embedded Rust DSP</div>
-          <h3>WebRTC VAD, alass, and rustfft</h3>
-          <p>Aligns embedded and zero-key OpenSubtitles tracks against speech timestamps in-process, fingerprints intros and credits locally with rustfft, and rewinds 8 seconds with temporary English subtitles when you press R.</p>
+          <div class="stat">Win32 OLED &amp; mpv shaders</div>
+          <h3>Auto-Hz, 0-nit SDR, HDR10/DV &amp; Anime4K</h3>
+          <p>Calls QueryDisplayConfig to match 24–60 Hz multiples, turns Windows HDR off for SDR video, ships pure-black mpv Lua HUD + Anime4K/FSRCNNX/KrigBilateral shaders (Ctrl+0–3), and supports NVIDIA RTX VSR.</p>
         </div>
         <div class="card">
-          <div class="stat">Curated hubs</div>
-          <h3>Anime dub checks, marathons, and radar</h3>
-          <p>Verifies English-dubbed anime episodes with ffprobe, skips filler episodes, tracks 15 franchise marathons in chronological or release order, and surfaces ESPN scoreboards and digital drop calendars.</p>
+          <div class="stat">Multi-variant quality engine</div>
+          <h3>Smart 4K/HDR ranking &amp; episode merging</h3>
+          <p>Folds Unicode superscripts without category collisions, merges seasons across series variants in parallel, attaches clean cross-market 4K/HDR/Dolby upgrades with an English-audio probe safety gate, and blocks CAM rips.</p>
         </div>
         <div class="card">
-          <div class="stat">Living room ready</div>
-          <h3>Gamepad, DLNA, Trakt, and tray keys</h3>
-          <p>Navigate with arrow keys or a controller, cast to DLNA TVs, import Letterboxd zip archives, sync two-way with Trakt, and bind hardware media keys dynamically while mpv is active.</p>
+          <div class="stat">Embedded Rust DSP &amp; living room</div>
+          <h3>VAD/alass SubSync, Remote, DLNA &amp; Trakt</h3>
+          <p>Aligns embedded and zero-key OpenSubtitles tracks against speech in-process, rewinds 8 s with English subs on R, pairs a LAN QR phone remote, casts to DLNA TVs, imports Letterboxd zips, and syncs two-way with Trakt.</p>
         </div>
       </div>
     </section>

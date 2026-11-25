@@ -251,20 +251,20 @@ select.sel { height: 36px; border-radius: 8px; background: var(--bg-3); color: v
 .seek:hover .knob, .seek.dragging .knob { transform: scale(1.2); }
 .seek .hover-t { position: absolute; bottom: 24px; transform: translateX(-50%); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; padding: 4px 9px; background: rgba(8,10,14,.92); border: 1px solid rgba(255,255,255,.14); border-radius: 6px; display: none; white-space: nowrap; pointer-events: none; }
 .seek:hover .hover-t, .seek.dragging .hover-t { display: block; }
-.pc-row { display: flex; align-items: center; gap: 6px; }
-.pc-row .time, .pc-row .time-btn { font-size: 13.5px; color: #ddd; font-variant-numeric: tabular-nums; margin-left: 6px; background: none; border: 0; padding: 4px 6px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+.pc-row { display: flex; align-items: center; gap: 4px; }
+.pc-row .time, .pc-row .time-btn { font-size: 13px; color: #ddd; font-variant-numeric: tabular-nums; margin-left: 4px; background: none; border: 0; padding: 4px 6px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
 .pc-row .time-btn:hover { background: rgba(255,255,255,.1); color: #fff; }
-.pc-row .ends-at { color: var(--muted); font-size: 12.5px; }
-@media (max-width: 1120px) { .pc-row .ends-at { display: none; } }
-.pbtn { width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; color: #fff; flex: none; }
+.pc-row .ends-at { color: var(--muted); font-size: 12px; }
+@media (max-width: 1200px) { .pc-row .ends-at { display: none; } }
+.pbtn { width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; color: #fff; flex: none; }
 .pbtn:hover { background: rgba(255,255,255,.12); }
-.pbtn svg { width: 22px; height: 22px; }
-.pc-row .spacer { flex: 1; }
-.pc-row select { height: 34px; border-radius: 8px; background: rgba(255,255,255,.12); color: #fff; border: 0; padding: 0 8px; font: inherit; font-size: 13px; max-width: 175px; }
+.pbtn svg { width: 21px; height: 21px; }
+.pc-row .spacer { flex: 1; min-width: 8px; }
+.pc-row select { height: 34px; border-radius: 8px; background: rgba(255,255,255,.12); color: #fff; border: 0; padding: 0 7px; font: inherit; font-size: 12.5px; max-width: 138px; text-overflow: ellipsis; }
 .pc-row select option { background: #1a1e25; }
 .vol-wrap { display: inline-flex; align-items: center; gap: 4px; }
 .vol {
-  -webkit-appearance: none; appearance: none; width: 88px; height: 4px; border-radius: 999px; cursor: pointer; outline: none;
+  -webkit-appearance: none; appearance: none; width: 78px; height: 4px; border-radius: 999px; cursor: pointer; outline: none;
   background: linear-gradient(90deg, var(--accent) var(--vol-pct, 100%), rgba(255,255,255,.26) var(--vol-pct, 100%));
 }
 .vol::-webkit-slider-thumb {
@@ -352,8 +352,9 @@ select.sel { height: 36px; border-radius: 8px; background: var(--bg-3); color: v
 .p-msg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; max-width: 460px; padding: 22px 26px; background: rgba(18,21,26,.95); border-radius: 12px; border: 1px solid var(--line); }
 .p-msg h4 { margin: 0 0 6px; font-size: 17px; }
 .p-msg p { margin: 0 0 14px; color: var(--muted); font-size: 14px; }
-.next-up { position: absolute; right: 28px; bottom: 120px; padding: 14px 16px; border-radius: 12px; background: rgba(18,21,26,.95); border: 1px solid var(--line); display: flex; gap: 14px; align-items: center; max-width: 420px; }
-.next-up small { color: var(--muted); display: block; font-size: 12px; }
+.next-up { position: absolute; right: 28px; bottom: 116px; padding: 14px 16px; border-radius: 12px; background: rgba(14,17,22,.96); border: 1px solid rgba(255,255,255,.14); display: flex; gap: 14px; align-items: center; max-width: 500px; box-shadow: 0 20px 50px rgba(0,0,0,.75); }
+.next-up small { color: var(--muted); display: block; font-size: 12px; white-space: nowrap; }
+.next-up b { white-space: nowrap; }
 .live-badge { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 800; letter-spacing: .06em; color: var(--live); }
 
 /* ---------- toast, settings, loading */

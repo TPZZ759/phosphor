@@ -3489,7 +3489,7 @@ const Player = (() => {
   async function learnStart() {
     baseKnown = true; const me = o; const g = loadGen;
     const r = await api('/api/streamstart').catch(() => null);
-    if (!r?.ok || o !== me || g !== loadGen) return;
+    if (!r?.ok || !Number.isFinite(r.start) || o !== me || g !== loadGen) return;
     offset = r.start; base = r.start; rebuildCues(); tick();
   }
   function nudgeSubs(ms) {
@@ -3671,7 +3671,11 @@ const Player = (() => {
     audio = 0; const as = $('#pAudio');
     if (probe?.audio?.length > 1) {
       as.hidden = false;
-      as.innerHTML = probe.audio.map((a, i) => `<option value="${i}">${esc(langName(a.lang) || `Track ${i + 1}`)}${a.title ? ` · ${esc(a.title)}` : ''}${a.ch > 2 ? ' · 5.1' : ''}</option>`).join('');
+      as.innerHTML = probe.audio.map((a, i) => {
+        const ln = langName(a.lang) || `Track ${i + 1}`;
+        const showT = a.title && a.title.trim().toLowerCase() !== ln.toLowerCase() && !/^(english|eng|stereo|5\.1|2\.0)$/i.test(a.title.trim());
+        return `<option value="${i}">${esc(ln)}${showT ? ` · ${esc(a.title.slice(0, 20))}` : ''}${a.ch > 2 ? ' · 5.1' : ''}</option>`;
+      }).join('');
       const keep = keepAudio ? probe.audio.findIndex((a) => a.lang === keepAudio) : -1;
       const en = probe.audio.findIndex(isEnAudioTrack);
       audio = keep >= 0 ? keep : en >= 0 ? en : 0; as.value = audio;
@@ -4823,7 +4827,7 @@ async function openSettings() {
     <p><b>Letterboxd</b>: on <a href="https://letterboxd.com/settings/data/" target="_blank" rel="noopener">letterboxd.com/settings/data</a> choose <i>Export your data</i>, then pick the .zip here. Watched films, ratings (3½★+ = like, 2★ or less = dislike) and your watchlist come across.</p>
     <div class="btns"><label class="btn btn-ghost btn-sm" style="cursor:pointer">Choose Letterboxd export<input type="file" id="lbFile" accept=".zip,.csv" multiple hidden></label><span class="muted" id="lbStatus"></span></div>
     <div id="traktBox"><p>…</p></div>
-    <h4>Keyboard</h4><p>Arrows move around (and navigate player controls) · Enter opens · Backspace goes back · Space play/pause (pauses live TV too) · R replay 8s with subtitles ("What did they say?") · B auto-crop bars (mpv) · Ctrl+0–3 RTX shaders (mpv) · I playback info · P pro player · G live mini-guide & scores (or earlier subs on VOD) · S skip intro · ← → skip 10s (or rewind live) · ↑ ↓ change channel · L last channel · End jump to live · C subtitles · G/H subtitle timing · [ ] audio timing · N next episode · F fullscreen · M mute · / search · Esc back</p>
+    <h4>Keyboard &amp; mouse</h4><p>In the player (works regardless of focus): Space / K play or pause · ← → or J / L skip 10s (Shift: 30s) · Scroll wheel or ↑ ↓ volume (±5%) · M mute · F or double-click fullscreen · Shift+P Picture-in-Picture · 0–9 jump 0%–90% · &lt; &gt; speed · , . frame step · Z picture fit/crop · C subtitles · A audio track · V Clear Voice · R replay 8s with subtitles · S skip intro · N / B next / prev episode · G / H subtitle delay · [ ] audio delay · I stats · P pro player (mpv) · ? shortcuts sheet · Live TV: G mini-guide, L last channel, PgUp/PgDn or Shift+↑/↓ zap, End live edge · Browse: Arrows navigate, / search, Esc back</p>
   </div>`);
   $('#saveKey').onclick = async () => {
     const v = $('#tmdbKey').value.trim(); if (!v) return;
