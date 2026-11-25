@@ -896,17 +896,37 @@ async fn movie_detail(State(app): A, Path(id): Path<i64>) -> Response {
     let card = app.card(&it, d.as_ref());
     let imdb = d.as_ref().map(|d| s(&d["imdb_id"])).filter(|x| !x.is_empty()).or_else(|| tm.as_ref().and_then(|t| app.meta_get("movie", t)).map(|m| m.im)).unwrap_or_default();
     let similar = match &tm { Some(t) => { let r = app.tmdb.get(format!("/movie/{t}/recommendations"), crate::tmdb::NO, TTL_D).await; rec::match_results(&app, r.as_ref().and_then(|r| r["results"].as_array()).map(|a| a.as_slice()).unwrap_or(&[]), Some("movie"), 18) } None => vec![] };
-    let mut variants = vec![(it.id, it.uhd, it.cam, it.dv, it.bluray, it.dolby_audio, it.cat.clone(), cat.cat_name("movie", &it.cat))];
+    let mut variants = vec![(it.id, it.uhd, it.hdr, it.cam, it.dv, it.bluray, it.dolby_audio, false, it.ext.clone(), it.cat.clone(), cat.cat_name("movie", &it.cat))];
     for v in &it.variants {
-        let cid = cat.movie_raw.get(&v.id).map(|x| x.cat.clone()).unwrap_or_default();
+        let raw_v = cat.movie_raw.get(&v.id);
+        let cid = raw_v.map(|x| x.cat.clone()).unwrap_or_default();
+        let ext = raw_v.map(|x| x.ext.clone()).unwrap_or_else(|| "mp4".into());
         let cname = cat.cat_name("movie", &cid);
-        variants.push((v.id, v.uhd, v.cam, v.dv, v.bluray, v.dolby_audio, cid, cname));
+        variants.push((v.id, v.uhd, v.hdr, v.cam, v.dv, v.bluray, v.dolby_audio, v.sub_market, ext, cid, cname));
     }
-    let mut n: HashMap<&str, usize> = HashMap::new();
-    let mut variants: Vec<Value> = variants.into_iter().map(|(id, uhd, cam, dv, bluray, dolby_audio, cid, c)| {
-        let b = if cam { "CAM" } else if dv { "4K DV" } else if uhd && dolby_audio { "4K · Dolby" } else if uhd { "4K" } else if bluray { "Blu-Ray" } else if dolby_audio { "HD · Dolby" } else { "HD" };
-        let k = n.entry(b).or_insert(0); *k += 1;
-        json!({ "id": id, "cat": c, "catId": cid, "uhd": uhd, "cam": cam, "dv": dv, "bluray": bluray, "dolbyAudio": dolby_audio, "label": if *k > 1 { format!("{b} {k}") } else { b.into() }, "health": source_health(&app, id), "q": app.stream.quality_of(id) })
+    let mut n: HashMap<String, usize> = HashMap::new();
+    let mut variants: Vec<Value> = variants.into_iter().map(|(id, uhd, hdr, cam, dv, bluray, dolby_audio, sub_mkt, ext, cid, c)| {
+        let base = if cam { "CAM" }
+            else if dv { "4K DV" }
+            else if uhd && hdr { "4K HDR" }
+            else if uhd && dolby_audio { "4K · Dolby Audio" }
+            else if uhd { "4K" }
+            else if bluray { "Blu-Ray" }
+            else if dolby_audio { "HD · Dolby Audio" }
+            else { "HD" };
+        let base_s = if sub_mkt {
+            let tag = if c.to_uppercase().starts_with("NL") { "NL" } else { "Nordic" };
+            format!("{base} · {tag}")
+        } else { base.to_string() };
+        let k = n.entry(base_s.clone()).or_insert(0); *k += 1;
+        let label = if *k > 1 { format!("{base_s} {k}") } else { base_s };
+        let non_en = sub_mkt && app.dubs.get(&format!("m:{id}")).map_or(false, |d| !d.has_en);
+        json!({
+            "id": id, "ext": ext, "cat": c, "catId": cid,
+            "uhd": uhd, "hdr": hdr, "cam": cam, "dv": dv, "bluray": bluray, "dolbyAudio": dolby_audio,
+            "subMarket": sub_mkt, "nonEn": non_en, "label": label,
+            "health": source_health(&app, id), "q": app.stream.quality_of(id)
+        })
     }).collect();
     rank_sources(&app, &mut variants); apply_pick(&app, &format!("m:{}", it.id), &mut variants);
     let mut out = card;
@@ -1552,6 +1572,7 @@ fn quality_score(v: &Value, pro: bool, hdr_pref: bool) -> f64 {
     let cat = v["cat"].as_str().unwrap_or("").to_uppercase();
     let is_uhd = v["uhd"].as_bool().unwrap_or(false);
     let is_dv = v["dv"].as_bool().unwrap_or(false) || (cat.contains("DOLBY") && cat.contains("VISION"));
+    let is_hdr = !is_dv && (v["hdr"].as_bool().unwrap_or(false) || crate::re!(r"\bHDR(?:10\+?)?\b").is_match(&cat));
     let is_da = v["dolbyAudio"].as_bool().unwrap_or(false) || (cat.contains("DOLBY") && !cat.contains("VISION"));
     let is_br = v["bluray"].as_bool().unwrap_or(false) || cat.contains("BLURAY") || cat.contains("BLU-RAY") || cat.contains("REMUX");
     let is_sub_mkt = v["subMarket"].as_bool().unwrap_or(false);
@@ -1571,11 +1592,11 @@ fn quality_score(v: &Value, pro: bool, hdr_pref: bool) -> f64 {
         let mut b = 0.0;
         if is_br { b += 1.8; }
         if is_dv { b += if pro { 2.5 } else { -1.5 }; }
+        else if is_hdr { b += if pro || hdr_pref { 1.8 } else { -0.8 }; }
         else if is_da { b += 1.5; }
         if cat.contains("HEVC") { b += 0.4; }
-        // Platform WEB-DL categories (Netflix, Apple+, Disney+, HBO, Amazon, etc.) are reliably 1080p 5.1
-        // compared to generic `ENGLISH SERIES` which frequently carries lower-bitrate 720p/1080p stereo rips.
-        let is_platform = ["NETFLIX", "APPLE+", "DISNEY+", "HBO", "AMAZON", "PARAMOUNT+", "SHOWTIME", "PEACOCK", "SKY", "MARVEL", "OSN+"]
+        // Platform/Studio WEB-DL categories are reliably high-bitrate 1080p/4K 5.1 compared to generic genre folders.
+        let is_platform = ["NETFLIX", "APPLE+", "DISNEY+", "HBO", "AMAZON", "PARAMOUNT", "SHOWTIME", "PEACOCK", "SKY", "MARVEL", "OSN+", "UNIVERSAL", "DREAMWORKS"]
             .iter().any(|p| cat.contains(p));
         if is_platform { b += 1.0; }
         b
@@ -1927,5 +1948,20 @@ mod quality_tests {
         ];
         apply_pick_val(&json!({ "catId": "1852", "cat": "HBO MAX SERIES" }), &mut v);
         assert_eq!(v[0]["id"].as_i64(), Some(20));
+    }
+
+    #[test]
+    fn movie_ranking_prefers_4k_dv_over_4k_hdr_over_4k_dolby_over_bluray_over_hd_over_cam() {
+        let mut v = vec![
+            json!({ "id": 1, "uhd": false, "hdr": false, "dv": false, "bluray": false, "dolbyAudio": false, "cam": true,  "subMarket": false, "cat": "EN - NEW RELEASE", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 2, "uhd": false, "hdr": false, "dv": false, "bluray": false, "dolbyAudio": false, "cam": false, "subMarket": false, "cat": "EN - ACTION", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 3, "uhd": false, "hdr": false, "dv": false, "bluray": true,  "dolbyAudio": false, "cam": false, "subMarket": false, "cat": "TOP MOVIES BLURAY (MULTI-SUBS)", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 4, "uhd": true,  "hdr": false, "dv": false, "bluray": false, "dolbyAudio": true,  "cam": false, "subMarket": true,  "cat": "NORDIC FILM 4K 3840P DOLBY AUDIO", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 5, "uhd": true,  "hdr": true,  "dv": false, "bluray": false, "dolbyAudio": false, "cam": false, "subMarket": true,  "cat": "NORDIC 4K HDR", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 6, "uhd": true,  "hdr": true,  "dv": true,  "bluray": false, "dolbyAudio": false, "cam": false, "subMarket": false, "cat": "APPLE+ MOVIES 4K 3840P Dolby Vision", "health": 0.0, "q": Value::Null }),
+        ];
+        rank_sources_with(&mut v, true, true, false);
+        let ids: Vec<i64> = v.iter().map(|x| x["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![6, 5, 4, 3, 2, 1]);
     }
 }

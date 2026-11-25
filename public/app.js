@@ -2468,12 +2468,14 @@ async function resumeItem(it) {
 // ---------------------------------------------------------------- playback entry points
 function playMovie(d, id, resume) {
   closeModal(true); // the player takes over the detail sheet's history entry (no history.back race)
+  const v = (d.variants || []).find((x) => x.id === id) || {};
   Player.open({
-    kind: 'movie', id, title: d.title, sub: [d.year, d.runtime ? runtime(d.runtime) : ''].filter(Boolean).join(' · '),
+    kind: 'movie', id, ext: v.ext || '', title: d.title, sub: [d.year, d.runtime ? runtime(d.runtime) : ''].filter(Boolean).join(' · '),
     resume: resume || 0, duration: d.duration || 0, isAnime: !!d.isAnime,
     progressKey: `m:${d.id}`, tmdb: d.tmdb, imdb: d.imdb || '', extSub: d.extSub || null, historyKind: 'm', historyTitle: d.title,
     item: { k: 'm', id: d.id, title: d.title, year: d.year, poster: d.poster, backdrop: d.backdrop },
-    label: (d.variants || []).find((v) => v.id === id)?.label, alternates: (d.variants || []).filter((v) => v.id !== id),
+    label: v.label, cat: v.cat || '', catId: v.catId || '', subMarket: !!v.subMarket,
+    alternates: (d.variants || []).filter((x) => x.id !== id),
   });
 }
 function playEpisode(d, flat, ep, resume, extra = {}) {

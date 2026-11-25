@@ -254,11 +254,13 @@ struct ProbeSummary {
     ch: i64,
 }
 
-fn flag_tier(cam: bool, uhd: bool, dv: bool, bluray: bool) -> QualityTier {
+fn flag_tier(cam: bool, uhd: bool, hdr: bool, dv: bool, bluray: bool) -> QualityTier {
     if cam {
         QualityTier::Cam
     } else if dv {
         QualityTier::Dv4k
+    } else if uhd && hdr {
+        QualityTier::Hdr4k
     } else if uhd {
         QualityTier::Uhd4k
     } else if bluray {
@@ -340,7 +342,7 @@ fn assess_quality(app: &App, it: &Item, check_probes: bool) -> ItemQuality {
         };
     }
 
-    let mut best = flag_tier(it.cam, it.uhd, it.dv, it.bluray);
+    let mut best = flag_tier(it.cam, it.uhd, it.hdr, it.dv, it.bluray);
     let mut is_dv = !it.cam && it.dv;
     let mut is_bluray = !it.cam && it.bluray;
     let mut has_dolby_audio = !it.cam && it.dolby_audio;
@@ -349,7 +351,7 @@ fn assess_quality(app: &App, it: &Item, check_probes: bool) -> ItemQuality {
         if v.cam {
             continue;
         }
-        let vt = flag_tier(false, v.uhd, v.dv, v.bluray);
+        let vt = flag_tier(false, v.uhd, v.hdr, v.dv, v.bluray);
         if vt > best {
             best = vt;
         }
@@ -413,10 +415,10 @@ pub fn best_tier(app: &App, it: &Item) -> QualityTier {
     if is_cam_only_item(it) {
         return QualityTier::Cam;
     }
-    let mut best = flag_tier(it.cam, it.uhd, it.dv, it.bluray);
+    let mut best = flag_tier(it.cam, it.uhd, it.hdr, it.dv, it.bluray);
     for v in &it.variants {
         if !v.cam {
-            best = best.max(flag_tier(false, v.uhd, v.dv, v.bluray));
+            best = best.max(flag_tier(false, v.uhd, v.hdr, v.dv, v.bluray));
         }
     }
     if best < QualityTier::Dv4k && it.k == "m" && app.stream.probe_count() > 0 {

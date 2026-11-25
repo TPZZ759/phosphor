@@ -11,12 +11,13 @@ pub const RAW: [&str; 6] = ["get_live_categories", "get_vod_categories", "get_se
 pub struct Variant {
     pub id: i64,
     pub uhd: bool,
+    pub hdr: bool,
     pub cam: bool,
     pub dv: bool,
     pub bluray: bool,
     pub dolby_audio: bool,
-    /// True for clean subtitle-only cross-market 4K/Dolby-Audio upgrade variants
-    /// (e.g. Nordic 4K Dolby Audio) attached to an existing English show by TMDB ID.
+    /// True for clean subtitle-only cross-market 4K/HDR/Dolby-Audio upgrade variants
+    /// (e.g. Nordic 4K Dolby Audio, Nordic 4K HDR, NL Bioscoop 4K) attached by TMDB ID.
     pub sub_market: bool,
 }
 
@@ -37,6 +38,7 @@ pub struct Item {
     pub en: bool,
     pub sport: bool,
     pub uhd: bool,
+    pub hdr: bool,
     pub cam: bool,
     pub dv: bool,
     pub bluray: bool,
@@ -94,12 +96,17 @@ pub fn clean_title(name: &str) -> Clean {
 
 fn is_en_vod(n: &str) -> bool {
     if re!(r"(?i)^ENGLISH SERIES \(TR\)").is_match(n) { return false; }
-    re!(r"(?i)^(EN\s*-|NETFLIX|DISNEY\+|APPLE\+|AMAZON|HBO|OSN\+\s*SERIES|PARAMOUNT|PEACOCK|SHOWTIME|SKY$|UNIVERSAL|MARVEL|DREAMWORKS|TOP (MOVIES|KIDS)|JAMES BOND|ENGLISH (SERIES|REALITY|KIDS)|NICKELODEON|CRUNCHYROLL|DISCOVERY\+ (SERIES|MOVIES)(?:\s|$)|CHRISTIAN MOVIES|ASIA (MOVIES|SERIES) \(MULTI)").is_match(n)
+    re!(r"(?i)^(EN\s*-|NETFLIX|DISNEY\+|APPLE\+|AMAZON|HBO|OSN\+\s*(?:SERIES|MOVIES)|PARAMOUNT|PEACOCK|SHOWTIME|SKY$|UNIVERSAL|MARVEL|DREAMWORKS|TOP (MOVIES|KIDS)|JAMES BOND|ENGLISH (SERIES|REALITY|KIDS)|NICKELODEON|CRUNCHYROLL|DISCOVERY\+ (SERIES|MOVIES)(?:\s|$)|CHRISTIAN MOVIES|ASIA (MOVIES|SERIES) \(MULTI)").is_match(n)
 }
 /// Clean subtitle-only cross-market 4K / Dolby Audio TV series categories whose
 /// English shows carry original English audio + soft subtitles (never dubbed, no burned-in subs).
 fn is_sub_market_en_upgrade(clean_cat_name: &str) -> bool {
     re!(r"(?i)^NORDIC\s+(?:SERIES?|KIDS)\b.*(?:4K|3840|2160|UHD|DOLBY)").is_match(clean_cat_name)
+}
+/// Clean subtitle-only adult cinema 4K / 4K HDR / Dolby Audio movie categories whose
+/// English movies carry original English audio + soft subtitles (excludes kids categories that may be dubbed).
+fn is_sub_market_en_movie_upgrade(clean_cat_name: &str) -> bool {
+    re!(r"(?i)^(?:NORDIC\s+FILM\b.*(?:4K|3840|2160|UHD|DOLBY)|NORDIC\s+4K\s+HDR|NL\s*-\s*BIOSCOOP\s+4K)").is_match(clean_cat_name)
 }
 fn has_arabic_script(s: &str) -> bool {
     s.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c))
@@ -170,8 +177,10 @@ impl Catalog {
                 c.cats.insert(key, Cat { id, kind, name, en, sport, uhd: is_uhd(&raw), count: 0 });
             }
         }
-        // movies
+        // movies (two-pass: build EN catalog & deduplicate by TMDB + (title, year) fallback; then attach clean subtitle-only 4K/HDR/Dolby upgrades!)
         let vod = read(&dir, "get_vod_streams");
+        let mut movie_sub_candidates: Vec<(String, Variant, i64)> = vec![];
+        let mut en_movie_by_ty: HashMap<(String, i32), usize> = HashMap::new();
         for v in vod.as_array().into_iter().flatten() {
             let cat_id = s(&v["category_id"]);
             let cat_key = format!("movie:{cat_id}");
@@ -183,24 +192,71 @@ impl Catalog {
             let tm = s(&v["tmdb"]); let tm = if tm.is_empty() || tm == "0" { None } else { Some(tm) };
             let cam = crate::showcase::is_cam_release(&raw_name, raw_cat);
             let dv = !cam && crate::showcase::is_dv_tag(&raw_name, raw_cat);
+            let hdr = !cam && (dv || crate::showcase::is_hdr_tag(&raw_name, raw_cat));
             let bluray = !cam && crate::showcase::is_bluray_tag(&raw_name, raw_cat);
             let dolby_audio = !cam && crate::showcase::is_dolby_audio_tag(&raw_name, raw_cat);
-            let uhd = !cam && (cat.uhd || dv || crate::showcase::is_uhd_tag(&raw_name, raw_cat));
+            let uhd = !cam && (cat.uhd || dv || hdr || crate::showcase::is_uhd_tag(&raw_name, raw_cat));
+            let is_osn_non_en = cat.name.to_uppercase().starts_with("OSN+") && has_arabic_script(&raw_name);
+            let en = cat.en && !is_osn_non_en;
             let it = Item { k: "m", id: i(&v["stream_id"]), title: cl.title, year: cl.year, origin: cl.origin, poster: s(&v["stream_icon"]), rating: rating(&v["rating"]),
-                tmdb: tm, added: i(&v["added"]), cat: cat_id, ext: { let e = s(&v["container_extension"]); if e.is_empty() { "mp4".into() } else { e } },
-                en: cat.en, sport: cat.sport, uhd, cam, dv, bluray, dolby_audio, trailer: s(&v["trailer"]), ..Default::default() };
+                tmdb: tm.clone(), added: i(&v["added"]), cat: cat_id, ext: { let e = s(&v["container_extension"]); if e.is_empty() { "mp4".into() } else { e } },
+                en, sport: cat.sport, uhd, hdr, cam, dv, bluray, dolby_audio, trailer: s(&v["trailer"]), ..Default::default() };
             c.movie_raw.insert(it.id, it.clone());
-            if it.en { if let Some(t) = it.tmdb.clone() {
-                if let Some(&ix) = c.movie_by_tmdb.get(&t) {
-                    let prev = &mut c.movies[ix];
-                    prev.variants.push(Variant { id: it.id, uhd: it.uhd, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
-                    if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
-                    prev.added = prev.added.max(it.added);
-                    continue;
+            if !en && !cam && (uhd || hdr || dolby_audio) && is_sub_market_en_movie_upgrade(&cat.name) {
+                if let Some(ref t) = tm {
+                    movie_sub_candidates.push((t.clone(), Variant { id: it.id, uhd, hdr, cam: false, dv, bluray, dolby_audio, sub_market: true }, it.added));
                 }
-                c.movie_by_tmdb.insert(t, c.movies.len());
-            } }
+            }
+            if en {
+                let ty_key = it.year.and_then(|y| { let nt = crate::util::norm(&it.title); if nt.is_empty() { None } else { Some((nt, y)) } });
+                if let Some(t) = it.tmdb.clone() {
+                    if let Some(&ix) = c.movie_by_tmdb.get(&t) {
+                        let prev = &mut c.movies[ix];
+                        prev.variants.push(Variant { id: it.id, uhd: it.uhd, hdr: it.hdr, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
+                        if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
+                        prev.added = prev.added.max(it.added);
+                        continue;
+                    }
+                    if let Some(ref tyk) = ty_key {
+                        if let Some(&ix) = en_movie_by_ty.get(tyk) {
+                            if c.movies[ix].tmdb.is_none() {
+                                let prev = &mut c.movies[ix];
+                                prev.tmdb = Some(t.clone());
+                                prev.variants.push(Variant { id: it.id, uhd: it.uhd, hdr: it.hdr, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
+                                if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
+                                prev.added = prev.added.max(it.added);
+                                c.movie_by_tmdb.insert(t, ix);
+                                continue;
+                            }
+                        }
+                    }
+                    let ix = c.movies.len();
+                    c.movie_by_tmdb.insert(t, ix);
+                    if let Some(tyk) = ty_key { en_movie_by_ty.entry(tyk).or_insert(ix); }
+                } else if let Some(tyk) = ty_key {
+                    if let Some(&ix) = en_movie_by_ty.get(&tyk) {
+                        let prev = &mut c.movies[ix];
+                        prev.variants.push(Variant { id: it.id, uhd: it.uhd, hdr: it.hdr, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
+                        if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
+                        prev.added = prev.added.max(it.added);
+                        continue;
+                    }
+                    en_movie_by_ty.insert(tyk, c.movies.len());
+                }
+            }
             c.movies.push(it);
+        }
+        // Pass 2 (movies): attach clean subtitle-only 4K / 4K HDR / Dolby Audio upgrade variants onto existing English movies by TMDB ID
+        let mut attached_movie_4k = 0usize;
+        for (tmdb, v, added) in movie_sub_candidates {
+            if let Some(&ix) = c.movie_by_tmdb.get(&tmdb) {
+                let prev = &mut c.movies[ix];
+                if prev.id != v.id && !prev.variants.iter().any(|x| x.id == v.id) {
+                    prev.variants.push(v);
+                    prev.added = prev.added.max(added);
+                    attached_movie_4k += 1;
+                }
+            }
         }
         drop(vod);
         // series (two-pass: first build EN catalog & deduplicate; then attach clean subtitle-only 4K/Dolby-Audio upgrades!)
@@ -219,9 +275,10 @@ impl Catalog {
             let tm = s(&x["tmdb"]); let tm = if tm.is_empty() || tm == "0" { None } else { Some(tm) };
             let cam = crate::showcase::is_cam_release(&raw_name, raw_cat);
             let dv = !cam && crate::showcase::is_dv_tag(&raw_name, raw_cat);
+            let hdr = !cam && (dv || crate::showcase::is_hdr_tag(&raw_name, raw_cat));
             let bluray = !cam && crate::showcase::is_bluray_tag(&raw_name, raw_cat);
             let dolby_audio = !cam && crate::showcase::is_dolby_audio_tag(&raw_name, raw_cat);
-            let uhd = !cam && (cat.uhd || dv || crate::showcase::is_uhd_tag(&raw_name, raw_cat));
+            let uhd = !cam && (cat.uhd || dv || hdr || crate::showcase::is_uhd_tag(&raw_name, raw_cat));
             // OSN+ 4K is an EN HBO/Sky/Showtime category, except occasional Arabic-script standup specials
             let is_osn_non_en = cat.name.to_uppercase().starts_with("OSN+") && has_arabic_script(&raw_name);
             let en = cat.en && !is_osn_non_en;
@@ -229,11 +286,11 @@ impl Catalog {
                 year: cl.year.or_else(|| rd.get(0..4).and_then(|y| y.parse().ok())), poster: s(&x["cover"]),
                 backdrop: x["backdrop_path"].as_array().and_then(|a| a.first()).map(s).unwrap_or_default(),
                 rating: rating(&x["rating"]), tmdb: tm.clone(), added: i(&x["last_modified"]), cat: cat_id, genre: s(&x["genre"]), plot: s(&x["plot"]),
-                en, sport: cat.sport, uhd, cam, dv, bluray, dolby_audio, ..Default::default() };
+                en, sport: cat.sport, uhd, hdr, cam, dv, bluray, dolby_audio, ..Default::default() };
             c.series_raw.insert(it.id, it.clone());
-            if !en && !cam && (uhd || dolby_audio) && is_sub_market_en_upgrade(&cat.name) {
+            if !en && !cam && (uhd || hdr || dolby_audio) && is_sub_market_en_upgrade(&cat.name) {
                 if let Some(ref t) = tm {
-                    sub_market_candidates.push((t.clone(), Variant { id: it.id, uhd, cam: false, dv, bluray, dolby_audio, sub_market: true }, it.added));
+                    sub_market_candidates.push((t.clone(), Variant { id: it.id, uhd, hdr, cam: false, dv, bluray, dolby_audio, sub_market: true }, it.added));
                 }
             }
             if en {
@@ -241,7 +298,7 @@ impl Catalog {
                 if let Some(t) = it.tmdb.clone() {
                     if let Some(&ix) = c.series_by_tmdb.get(&t) {
                         let prev = &mut c.series[ix];
-                        prev.variants.push(Variant { id: it.id, uhd: it.uhd, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
+                        prev.variants.push(Variant { id: it.id, uhd: it.uhd, hdr: it.hdr, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
                         if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
                         prev.added = prev.added.max(it.added);
                         continue;
@@ -252,7 +309,7 @@ impl Catalog {
                             if c.series[ix].tmdb.is_none() {
                                 let prev = &mut c.series[ix];
                                 prev.tmdb = Some(t.clone());
-                                prev.variants.push(Variant { id: it.id, uhd: it.uhd, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
+                                prev.variants.push(Variant { id: it.id, uhd: it.uhd, hdr: it.hdr, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
                                 if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
                                 prev.added = prev.added.max(it.added);
                                 c.series_by_tmdb.insert(t, ix);
@@ -266,7 +323,7 @@ impl Catalog {
                 } else if !norm_t.is_empty() {
                     if let Some(&ix) = en_series_by_title.get(&norm_t) {
                         let prev = &mut c.series[ix];
-                        prev.variants.push(Variant { id: it.id, uhd: it.uhd, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
+                        prev.variants.push(Variant { id: it.id, uhd: it.uhd, hdr: it.hdr, cam: it.cam, dv: it.dv, bluray: it.bluray, dolby_audio: it.dolby_audio, sub_market: false });
                         if (prev.cam && !it.cam) || (!it.cam && prev.uhd && !it.uhd) { swap_primary(prev, &it); }
                         prev.added = prev.added.max(it.added);
                         continue;
@@ -276,7 +333,7 @@ impl Catalog {
             }
             c.series.push(it);
         }
-        // Pass 2: attach clean subtitle-only 4K / Dolby Audio upgrade variants onto existing English shows by TMDB ID
+        // Pass 2 (series): attach clean subtitle-only 4K / Dolby Audio upgrade variants onto existing English shows by TMDB ID
         let mut attached_sub_4k = 0usize;
         for (tmdb, v, added) in sub_market_candidates {
             if let Some(&ix) = c.series_by_tmdb.get(&tmdb) {
@@ -304,7 +361,7 @@ impl Catalog {
             c.live.push(it);
         }
         c.loaded_at = crate::util::now_ms();
-        println!("[catalog] {} movies, {} series (+{} cross-market 4K/Dolby upgrades), {} channels in {}ms", c.movies.len(), c.series.len(), attached_sub_4k, c.live.len(), t0.elapsed().as_millis());
+        println!("[catalog] {} movies (+{} cross-market 4K/HDR/Dolby), {} series (+{} cross-market 4K/Dolby), {} channels in {}ms", c.movies.len(), attached_movie_4k, c.series.len(), attached_sub_4k, c.live.len(), t0.elapsed().as_millis());
         c
     }
 
@@ -382,9 +439,9 @@ impl Catalog {
 fn rating(v: &Value) -> f64 { let mut n = num(v); if n > 10.0 { n /= 10.0; } (n * 10.0).round() / 10.0 }
 
 fn swap_primary(prev: &mut Item, it: &Item) {
-    let keep = Variant { id: prev.id, uhd: prev.uhd, cam: prev.cam, dv: prev.dv, bluray: prev.bluray, dolby_audio: prev.dolby_audio, sub_market: false };
+    let keep = Variant { id: prev.id, uhd: prev.uhd, hdr: prev.hdr, cam: prev.cam, dv: prev.dv, bluray: prev.bluray, dolby_audio: prev.dolby_audio, sub_market: false };
     prev.id = it.id; prev.cat = it.cat.clone(); prev.ext = it.ext.clone();
-    prev.uhd = it.uhd; prev.cam = it.cam; prev.dv = it.dv; prev.bluray = it.bluray; prev.dolby_audio = it.dolby_audio;
+    prev.uhd = it.uhd; prev.hdr = it.hdr; prev.cam = it.cam; prev.dv = it.dv; prev.bluray = it.bluray; prev.dolby_audio = it.dolby_audio;
     if !it.poster.is_empty() { prev.poster = it.poster.clone(); }
     if !it.trailer.is_empty() { prev.trailer = it.trailer.clone(); }
     if !it.backdrop.is_empty() { prev.backdrop = it.backdrop.clone(); }
