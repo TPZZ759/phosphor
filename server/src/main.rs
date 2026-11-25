@@ -896,13 +896,17 @@ async fn movie_detail(State(app): A, Path(id): Path<i64>) -> Response {
     let card = app.card(&it, d.as_ref());
     let imdb = d.as_ref().map(|d| s(&d["imdb_id"])).filter(|x| !x.is_empty()).or_else(|| tm.as_ref().and_then(|t| app.meta_get("movie", t)).map(|m| m.im)).unwrap_or_default();
     let similar = match &tm { Some(t) => { let r = app.tmdb.get(format!("/movie/{t}/recommendations"), crate::tmdb::NO, TTL_D).await; rec::match_results(&app, r.as_ref().and_then(|r| r["results"].as_array()).map(|a| a.as_slice()).unwrap_or(&[]), Some("movie"), 18) } None => vec![] };
-    let mut variants = vec![(it.id, it.uhd, it.cam, it.dv, it.bluray, cat.cat_name("movie", &it.cat))];
-    for v in &it.variants { variants.push((v.id, v.uhd, v.cam, v.dv, v.bluray, cat.movie_raw.get(&v.id).map(|x| cat.cat_name("movie", &x.cat)).unwrap_or_default())); }
+    let mut variants = vec![(it.id, it.uhd, it.cam, it.dv, it.bluray, it.dolby_audio, it.cat.clone(), cat.cat_name("movie", &it.cat))];
+    for v in &it.variants {
+        let cid = cat.movie_raw.get(&v.id).map(|x| x.cat.clone()).unwrap_or_default();
+        let cname = cat.cat_name("movie", &cid);
+        variants.push((v.id, v.uhd, v.cam, v.dv, v.bluray, v.dolby_audio, cid, cname));
+    }
     let mut n: HashMap<&str, usize> = HashMap::new();
-    let mut variants: Vec<Value> = variants.into_iter().map(|(id, uhd, cam, dv, bluray, c)| {
-        let b = if cam { "CAM" } else if dv { "4K DV" } else if uhd { "4K" } else if bluray { "Blu-Ray" } else { "HD" };
+    let mut variants: Vec<Value> = variants.into_iter().map(|(id, uhd, cam, dv, bluray, dolby_audio, cid, c)| {
+        let b = if cam { "CAM" } else if dv { "4K DV" } else if uhd && dolby_audio { "4K · Dolby" } else if uhd { "4K" } else if bluray { "Blu-Ray" } else if dolby_audio { "HD · Dolby" } else { "HD" };
         let k = n.entry(b).or_insert(0); *k += 1;
-        json!({ "id": id, "cat": c, "uhd": uhd, "cam": cam, "dv": dv, "bluray": bluray, "label": if *k > 1 { format!("{b} {k}") } else { b.into() }, "health": source_health(&app, id), "q": app.stream.quality_of(id) })
+        json!({ "id": id, "cat": c, "catId": cid, "uhd": uhd, "cam": cam, "dv": dv, "bluray": bluray, "dolbyAudio": dolby_audio, "label": if *k > 1 { format!("{b} {k}") } else { b.into() }, "health": source_health(&app, id), "q": app.stream.quality_of(id) })
     }).collect();
     rank_sources(&app, &mut variants); apply_pick(&app, &format!("m:{}", it.id), &mut variants);
     let mut out = card;
@@ -956,12 +960,24 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
     let cat = app.catalog(); let Some(it) = cat.series_item(id).cloned() else { return err(404, "not found") };
     let tm = it.tmdb.clone().filter(|_| app.tmdb.enabled());
     let is_anime = anime::is_anime_item(&app, &it);
-    let (info, d, show_filler) = tokio::join!(
-        async { Ok::<Value, String>(app.xc_info("get_series_info", "series_id", it.id, 2 * 3_600_000).await) },
+    // Fetch primary + all non-CAM variants in parallel (2h cached in xinfo — also pre-warms ep_alts!)
+    // so newer seasons/episodes from any EN variant are merged in and per-episode 4K/DV badges are exact.
+    let mut var_specs: Vec<(i64, bool, bool, bool, bool, String)> = vec![(it.id, it.uhd, it.dv, it.dolby_audio, false, it.cat.clone())];
+    let mut extra_vars: Vec<(i64, bool, bool, bool, bool, String)> = it.variants.iter()
+        .filter(|v| !v.cam)
+        .map(|v| (v.id, v.uhd, v.dv, v.dolby_audio, v.sub_market, cat.series_raw.get(&v.id).map(|x| x.cat.clone()).unwrap_or_default()))
+        .collect();
+    // Native EN variants first (4K/DV prioritized), then subtitle-only 4K upgrades
+    extra_vars.sort_by_key(|x| (x.4, !x.2, !x.1, !x.3));
+    extra_vars.truncate(5);
+    var_specs.extend(extra_vars);
+
+    let (var_infos, d, show_filler) = tokio::join!(
+        futures_util::future::join_all(var_specs.iter().map(|(vsid, _, _, _, _, _)| app.xc_info("get_series_info", "series_id", *vsid, 2 * 3_600_000))),
         async { match &tm { Some(t) => app.tmdb.get(format!("/tv/{t}"), [sp("append_to_response", "credits,videos,content_ratings")], TTL_D).await, None => None } },
         async { if is_anime { filler::lookup_show(&app, &it.title).await } else { None } }
     );
-    let info = info.unwrap_or(Value::Null); let i = &info["info"]; let dd = d.as_deref().cloned().unwrap_or(Value::Null);
+    let info = var_infos.first().cloned().unwrap_or(Value::Null); let i = &info["info"]; let dd = d.as_deref().cloned().unwrap_or(Value::Null);
     let sid = it.id.to_string();
     let (new_ids, progress, dub_watches, skip_filler) = app.state.read(|st| (
         st["newEps"][&sid]["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_i64()).collect::<std::collections::HashSet<i64>>(),
@@ -970,26 +986,62 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
         st["prefs"]["skipFiller"].as_bool().unwrap_or(false),
     ));
     let cat_name = cat.cat_name("series", &it.cat);
+    // Merge seasons & episodes across all native EN variants (primary wins on duplicate (sn, ep_num) so
+    // existing e:{id} progress keys never change), while collecting per-episode 4K/DV/Dolby availability
+    // and alternate episode IDs across ALL variants (including sub_market 4K upgrades).
+    let mut merged_seasons: std::collections::BTreeMap<i64, std::collections::BTreeMap<i64, (Value, String)>> = std::collections::BTreeMap::new();
+    let mut ep_qual: HashMap<(i64, i64), (bool, bool, bool)> = HashMap::new();
+    let mut ep_var_ids: HashMap<(i64, i64), Vec<i64>> = HashMap::new();
+    for ((_, v_uhd, v_dv, v_da, v_sub, v_cat), vinfo) in var_specs.iter().zip(var_infos.iter()) {
+        let Some(eps_obj) = vinfo["episodes"].as_object() else { continue };
+        let v_cat_name = cat.cat_name("series", v_cat);
+        for (k, arr) in eps_obj {
+            let Ok(sn) = k.parse::<i64>() else { continue };
+            for e in arr.as_array().into_iter().flatten() {
+                let ep_num = util::i(&e["episode_num"]);
+                let eid = util::i(&e["id"]);
+                if eid <= 0 { continue; }
+                let q = ep_qual.entry((sn, ep_num)).or_insert((false, false, false));
+                if *v_uhd { q.0 = true; }
+                if *v_dv { q.1 = true; }
+                if *v_da { q.2 = true; }
+                let vids = ep_var_ids.entry((sn, ep_num)).or_default();
+                if !vids.contains(&eid) { vids.push(eid); }
+                if !*v_sub {
+                    merged_seasons.entry(sn).or_default().entry(ep_num).or_insert_with(|| (e.clone(), v_cat_name.clone()));
+                }
+            }
+        }
+    }
     let mut dubbed_count = 0usize; let mut sub_only_count = 0usize;
     let mut seasons: Vec<Value> = vec![];
-    let mut keys: Vec<(i64, String)> = info["episodes"].as_object().map(|m| m.keys().map(|k| (k.parse().unwrap_or(0), k.clone())).collect()).unwrap_or_default(); keys.sort();
     let mut max_abs = 0i64;
-    for (sn, key) in keys {
+    for (sn, ep_map) in merged_seasons {
         let tm_s = dd["seasons"].as_array().and_then(|a| a.iter().find(|x| x["season_number"].as_i64() == Some(sn)));
-        let mut raw_eps: Vec<&Value> = info["episodes"][&key].as_array().into_iter().flatten().collect();
-        raw_eps.sort_by_key(|e| util::i(&e["episode_num"]));
-        let first_num = raw_eps.first().map(|e| util::i(&e["episode_num"])).unwrap_or(0);
+        let raw_eps: Vec<(Value, String)> = ep_map.into_values().collect();
+        let first_num = raw_eps.first().map(|(e, _)| util::i(&e["episode_num"])).unwrap_or(0);
         let season_offset = if sn > 0 && max_abs > 0 && first_num > 0 && first_num <= max_abs { max_abs } else { 0 };
         let mut season_max = max_abs;
-        let eps: Vec<Value> = raw_eps.into_iter().map(|e| {
-            let eid = util::i(&e["id"]); let ekey = format!("e:{eid}"); let p = &progress[&ekey];
+        let eps: Vec<Value> = raw_eps.into_iter().map(|(e, ep_cat_name)| {
+            let eid = util::i(&e["id"]); let ekey = format!("e:{eid}");
+            let ep_num = util::i(&e["episode_num"]);
+            // Check canonical progress key first, then any variant episode ID for this (season, ep_num)
+            let p = if !progress[&ekey].is_null() {
+                &progress[&ekey]
+            } else {
+                ep_var_ids.get(&(sn, ep_num))
+                    .and_then(|ids| ids.iter().find_map(|&vid| {
+                        let k = format!("e:{vid}");
+                        (!progress[&k].is_null()).then_some(&progress[&k])
+                    }))
+                    .unwrap_or(&Value::Null)
+            };
             let title = crate::re!(r"(?i)^.*?S\d+E\d+\s*-?\s*").replace(&s(&e["title"]), "").to_string();
             let dur = p["dur"].as_f64().unwrap_or(0.0);
             let ext = { let x = s(&e["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
             let aired = { let a = s(&e["info"]["releasedate"]); if a.is_empty() { s(&e["info"]["air_date"]) } else { a } };
-            let ep_num = util::i(&e["episode_num"]);
             let title = if title.is_empty() { format!("Episode {}", s(&e["episode_num"])) } else { title };
-            let dub = if is_anime { anime::ep_dub_status(&app, eid, Some(e), &cat_name) } else { "yes" };
+            let dub = if is_anime { anime::ep_dub_status(&app, eid, Some(&e), if ep_cat_name.is_empty() { &cat_name } else { &ep_cat_name }) } else { "yes" };
             if is_anime { if dub == "yes" { dubbed_count += 1; } else if dub == "no" { sub_only_count += 1; } }
             let abs_ep = if sn > 0 {
                 let a = if ep_num > 0 { season_offset + ep_num } else { season_max + 1 };
@@ -999,9 +1051,11 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
             let ftag = if abs_ep > 0 {
                 show_filler.as_ref().map(|sf| filler::episode_tag(sf, abs_ep)).unwrap_or("")
             } else { "" };
+            let (ep_uhd, ep_dv, ep_da) = ep_qual.get(&(sn, ep_num)).copied().unwrap_or((false, false, false));
             json!({ "id": eid, "n": ep_num, "abs": abs_ep, "title": title,
                 "plot": s(&e["info"]["plot"]), "still": s(&e["info"]["movie_image"]), "duration": duration_of(&e["info"]), "ext": ext,
                 "aired": aired, "dub": dub, "filler": ftag, "dubWatching": dub_watches.contains(&ekey),
+                "uhd": ep_uhd, "dv": ep_dv, "dolbyAudio": ep_da,
                 "extSub": extsubs::cached_vtt(&app, &ekey),
                 "progress": if dur > 0.0 { p["pos"].as_f64().unwrap_or(0.0) / dur } else { 0.0 }, "resume": p["pos"].as_f64().unwrap_or(0.0), "isNew": new_ids.contains(&eid) })
         }).collect();
@@ -1457,42 +1511,96 @@ async fn intro_worker(app: &Arc<App>) {
 // ---------------------------------------------------------------- source health (best version)
 /// Penalty for a stream id from what actually happened when it played here: failures to start,
 /// stalls per hour watched and slow starts. 0 = untested or flawless.
-pub(crate) fn source_health(app: &App, id: i64) -> f64 {
-    app.state.read(|st| { let h = &st["health"][id.to_string()]; if h.is_null() { return 0.0; }
-        let f = h["f"].as_f64().unwrap_or(0.0); let ok = h["s"].as_f64().unwrap_or(0.0); let stalls = h["st"].as_f64().unwrap_or(0.0); let hrs = (h["w"].as_f64().unwrap_or(0.0) / 3600.0).max(0.25);
-        let ms = h["ms"].as_f64().unwrap_or(0.0);
-        (f / (f + ok).max(1.0)) * 10.0 + (stalls / hrs).min(10.0) + (ms / 10_000.0).min(2.0) })
+fn source_health_inner(h: &Value, now: i64) -> f64 {
+    if h.is_null() { return 0.0; }
+    let f = h["f"].as_f64().unwrap_or(0.0);
+    let ok = h["s"].as_f64().unwrap_or(0.0);
+    let stalls = h["st"].as_f64().unwrap_or(0.0);
+    let hrs = (h["w"].as_f64().unwrap_or(0.0) / 3600.0).max(0.25);
+    let ms = h["ms"].as_f64().unwrap_or(0.0);
+    // Time decay: full weight for 48h, linear decay to 0 over 7 days (legacy entries without `t` decay by 50%).
+    let age_ms = match h["t"].as_i64() {
+        Some(ts) if ts > 0 => now.saturating_sub(ts),
+        _ => 72 * 3_600_000,
+    };
+    let decay = if age_ms <= 48 * 3_600_000 {
+        1.0
+    } else if age_ms >= 168 * 3_600_000 {
+        0.0
+    } else {
+        1.0 - (age_ms - 48 * 3_600_000) as f64 / (120 * 3_600_000) as f64
+    };
+    if decay <= 0.0 { return 0.0; }
+    // A single isolated transient failure (e.g. VPN hiccup / 460 slot busy) shouldn't permanently
+    // downgrade a 4K DV copy below 1080p: cap single-blip fail score at 2.5 (penalty -7.5 vs +10+ 4K lead).
+    let fail_score = if f <= 1.0 && ok == 0.0 && stalls == 0.0 {
+        f * 2.5
+    } else {
+        (f / (f + ok).max(1.0)) * 10.0
+    };
+    let raw = fail_score + (stalls / hrs).min(10.0) + (ms / 10_000.0).min(2.0);
+    raw * decay
 }
-/// Picture score from what a stream really is (probed), or its category quality tier when not probed yet:
-/// resolution first, then HDR/Dolby Vision, Blu-Ray/Dolby/HEVC, then bitrate. Dolby Vision profile 5 only counts as HDR in the pro player.
+pub(crate) fn source_health(app: &App, id: i64) -> f64 {
+    let now = now_ms();
+    app.state.read(|st| source_health_inner(&st["health"][id.to_string()], now))
+}
+/// Picture score from what a stream really is (probed), or its category/tag quality tier when not probed yet:
+/// resolution first, then HDR/Dolby Vision, Blu-Ray/Dolby Audio/Platform HD, then bitrate & 5.1 audio.
 fn quality_score(v: &Value, pro: bool, hdr_pref: bool) -> f64 {
     let q = &v["q"];
     let cat = v["cat"].as_str().unwrap_or("").to_uppercase();
-    let h = q["h"].as_f64().map(|h| h.max(q["w"].as_f64().unwrap_or(0.0) * 9.0 / 16.0)).unwrap_or(if v["uhd"].as_bool().unwrap_or(false) { 2160.0 } else { 1080.0 });
+    let is_uhd = v["uhd"].as_bool().unwrap_or(false);
+    let is_dv = v["dv"].as_bool().unwrap_or(false) || (cat.contains("DOLBY") && cat.contains("VISION"));
+    let is_da = v["dolbyAudio"].as_bool().unwrap_or(false) || (cat.contains("DOLBY") && !cat.contains("VISION"));
+    let is_br = v["bluray"].as_bool().unwrap_or(false) || cat.contains("BLURAY") || cat.contains("BLU-RAY") || cat.contains("REMUX");
+    let is_sub_mkt = v["subMarket"].as_bool().unwrap_or(false);
+    let h = q["h"].as_f64().map(|h| h.max(q["w"].as_f64().unwrap_or(0.0) * 9.0 / 16.0)).unwrap_or(if is_uhd { 2160.0 } else { 1080.0 });
     let tier = if h >= 2000.0 { 3.0 } else if h >= 1000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 };
     // HDR in the browser can look greyer than a good SDR copy on an OLED: only prefer HDR where it's shown
     // properly (pro player installed, or the viewer asked for it); otherwise an SDR copy of the same size wins.
-    let hdr = match q["hdr"].as_str().unwrap_or("") { "" => 0.0, "DV" if !pro => -4.0, _ if pro || hdr_pref => 1.0, _ => -0.5 };
-    // Unprobed category hints: Blu-Ray, Dolby Vision (with pro), Dolby Audio, HEVC
-    let cat_boost = if q["h"].is_null() {
+    let hdr = match q["hdr"].as_str().unwrap_or("") {
+        "" => 0.0,
+        "DV" if !pro => -4.0,
+        "DV" => 1.35, // Dolby Vision > HDR10 > SDR when pro player (mpv) is installed
+        _ if pro || hdr_pref => 1.0,
+        _ => -0.5,
+    };
+    let probed = !q["h"].is_null();
+    let cat_boost = if !probed {
         let mut b = 0.0;
-        if cat.contains("BLURAY") || cat.contains("BLU-RAY") || cat.contains("REMUX") { b += 1.5; }
-        if cat.contains("DOLBY") && cat.contains("VISION") { b += if pro { 2.0 } else { -1.5 }; }
-        else if cat.contains("DOLBY") { b += 0.8; }
+        if is_br { b += 1.8; }
+        if is_dv { b += if pro { 2.5 } else { -1.5 }; }
+        else if is_da { b += 1.5; }
         if cat.contains("HEVC") { b += 0.4; }
+        // Platform WEB-DL categories (Netflix, Apple+, Disney+, HBO, Amazon, etc.) are reliably 1080p 5.1
+        // compared to generic `ENGLISH SERIES` which frequently carries lower-bitrate 720p/1080p stereo rips.
+        let is_platform = ["NETFLIX", "APPLE+", "DISNEY+", "HBO", "AMAZON", "PARAMOUNT+", "SHOWTIME", "PEACOCK", "SKY", "MARVEL", "OSN+"]
+            .iter().any(|p| cat.contains(p));
+        if is_platform { b += 1.0; }
         b
-    } else { 0.0 };
-    tier * 10.0 + hdr * 3.0 + cat_boost + (q["kbps"].as_f64().unwrap_or(0.0) / 10_000.0).min(4.0) + if q["ch"].as_i64().unwrap_or(0) >= 6 { 0.5 } else { 0.0 }
+    } else {
+        0.0
+    };
+    // Native EN slightly outranks cross-market subtitle-only 4K when both are in the exact same tier
+    let native_bonus = if !is_sub_mkt { 0.6 } else { 0.0 };
+    let codec_bonus = if probed && h >= 1000.0 && matches!(q["codec"].as_str().unwrap_or(""), "hevc" | "av1") { 0.4 } else { 0.0 };
+    let audio_bonus = if q["ch"].as_i64().unwrap_or(0) >= 6 { 1.2 } else { 0.0 };
+    tier * 10.0 + hdr * 3.0 + cat_boost + native_bonus + codec_bonus + audio_bonus + (q["kbps"].as_f64().unwrap_or(0.0) / 8_000.0).min(5.0)
 }
 /// Best first: healthiest, then best picture (default; gigabit) or HD first if the viewer turned 4K off.
 fn rank_sources(app: &App, v: &mut Vec<Value>) {
     let pref4k = app.state.read(|st| st["prefs"]["prefer4k"].as_bool().unwrap_or(true));
     let pro = mpv::find(app).is_some(); let hdr_pref = app.state.read(|st| st["prefs"]["preferHdr"].as_bool().unwrap_or(false));
+    rank_sources_with(v, pref4k, pro, hdr_pref);
+}
+fn rank_sources_with(v: &mut Vec<Value>, pref4k: bool, pro: bool, hdr_pref: bool) {
     for x in v.iter_mut() { let qs = quality_score(x, pro, hdr_pref); x["qs"] = json!(qs); let q = x["q"].clone(); if let Some(lab) = quality_label(&q) { x["label"] = json!(lab); } }
     // one score: picture quality minus a penalty for real trouble (failures, frequent stalls, slow
-    // starts). CAM rips ALWAYS drop to the very bottom when any clean copy exists.
+    // starts). CAM rips & confirmed non-English cross-market copies drop to the bottom when clean copies exist.
     let score = |x: &Value| {
         if x["cam"].as_bool().unwrap_or(false) { return -5000.0; }
+        if x["nonEn"].as_bool().unwrap_or(false) { return -4000.0; }
         let q = x["qs"].as_f64().unwrap_or(0.0);
         let h = x["health"].as_f64().unwrap_or(0.0);
         (if pref4k { q } else { -q }) - 3.0 * h
@@ -1564,15 +1672,36 @@ async fn quality_worker(app: &Arc<App>) {
             push_todo(&mut todo, "movie", vid, e);
         }
     }
-    // Priority 2: Watched/listed/followed series (probe episode 1 across variants so 4K DV vs HD is known!)
+    // Priority 2: Watched/listed/followed series (probe current/next episode across variants so 4K DV vs HD is known!)
+    let prog_se: HashMap<i64, (i64, i64)> = app.state.read(|st| {
+        let mut m: HashMap<i64, (i64, i64, i64)> = HashMap::new();
+        for x in st["progress"].as_object().into_iter().flatten().map(|(_, v)| v) {
+            let sid = util::i(&x["item"]["sid"]);
+            if sid <= 0 { continue; }
+            let sub = x["item"]["sub"].as_str().unwrap_or("");
+            if let Some(c) = crate::re!(r"(?i)S(\d+):E(\d+)").captures(sub) {
+                let (sn, en) = (c[1].parse::<i64>().unwrap_or(1), c[2].parse::<i64>().unwrap_or(1));
+                let ts = x["t"].as_i64().unwrap_or(0);
+                if m.get(&sid).map_or(true, |prev| ts > prev.2) { m.insert(sid, (sn, en, ts)); }
+            }
+        }
+        m.into_iter().map(|(k, (sn, en, _))| (k, (sn, en))).collect()
+    });
     for sid in s_ids.into_iter().take(4) {
         if todo.len() >= 6 { break; }
         let Some(it) = cat.series_item(sid).cloned() else { continue };
-        for vsid in std::iter::once(it.id).chain(it.variants.iter().map(|v| v.id)) {
+        let target_se = prog_se.get(&it.id).copied();
+        for vsid in std::iter::once(it.id).chain(it.variants.iter().filter(|v| !v.cam).map(|v| v.id)).take(4) {
             let info = app.xc_info("get_series_info", "series_id", vsid, 6 * 3_600_000).await;
-            if let Some(first_ep) = info["episodes"].as_object().and_then(|m| m.values().next()).and_then(|a| a.as_array()).and_then(|a| a.first()) {
-                let eid = util::i(&first_ep["id"]);
-                let ext = { let x = s(&first_ep["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
+            let picked = target_se.and_then(|(sn, en)| {
+                info["episodes"][sn.to_string()].as_array()
+                    .and_then(|a| a.iter().find(|e| util::i(&e["episode_num"]) == en))
+            }).or_else(|| {
+                info["episodes"].as_object().and_then(|m| m.values().next()).and_then(|a| a.as_array()).and_then(|a| a.first())
+            });
+            if let Some(ep) = picked {
+                let eid = util::i(&ep["id"]);
+                let ext = { let x = s(&ep["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
                 push_todo(&mut todo, "series", eid, ext);
             }
         }
@@ -1625,6 +1754,22 @@ async fn quality_worker(app: &Arc<App>) {
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     }
 }
+pub(crate) fn record_mpv_health(app: &App, id: i64, watched_secs: f64, count_start: bool) {
+    if id <= 0 { return; }
+    app.state.with(|st| {
+        if st["health"].is_null() { st["health"] = json!({}); }
+        let h = &mut st["health"][id.to_string()];
+        if h.is_null() { *h = json!({ "s": 0, "f": 0, "st": 0, "w": 0, "ms": 0 }); }
+        if count_start {
+            h["s"] = json!(h["s"].as_f64().unwrap_or(0.0) + 1.0);
+        }
+        if watched_secs > 0.0 {
+            h["w"] = json!(h["w"].as_f64().unwrap_or(0.0) + watched_secs.clamp(0.0, 4.0 * 3600.0));
+        }
+        h["t"] = json!(now_ms());
+    });
+    app.state.save();
+}
 async fn health(State(app): A, Json(b): Json<Value>) -> Response {
     let id = b["id"].as_i64().unwrap_or(0); if id == 0 { return err(400, "id"); }
     let ev = b["ev"].as_str().unwrap_or("");
@@ -1641,33 +1786,80 @@ async fn health(State(app): A, Json(b): Json<Value>) -> Response {
                 add(h, "hc", b["hitches"].as_f64().unwrap_or(0.0).clamp(0.0, 10_000.0)); add(h, "df", b["dropped"].as_f64().unwrap_or(0.0).max(0.0)); add(h, "fr", b["frames"].as_f64().unwrap_or(0.0).max(0.0)); }
             _ => {}
         }
+        h["t"] = json!(now_ms());
     });
     app.state.save(); j(json!({ "ok": true }))
 }
-/// The viewer chose a version by hand: remember it for the title (movie: stream id; show: its category).
+/// The viewer chose a version by hand: remember it for the title (movie: stream id; show: its category id & name).
 async fn pick(State(app): A, Json(b): Json<Value>) -> Response {
     let key = s(&b["key"]); if key.is_empty() { return err(400, "key"); }
-    app.state.with(|st| { if st["picks"].is_null() { st["picks"] = json!({}); } st["picks"][&key] = json!({ "id": b["id"], "cat": b["cat"], "t": now_ms() }); });
+    let pid = b["id"].as_i64().unwrap_or(0);
+    let cat_id = s(&b["catId"]);
+    let cat_name = s(&b["cat"]);
+    if pid <= 0 && cat_id.is_empty() && cat_name.is_empty() {
+        return j(json!({ "ok": true, "ignored": "empty pick" }));
+    }
+    app.state.with(|st| {
+        if st["picks"].is_null() { st["picks"] = json!({}); }
+        st["picks"][&key] = json!({
+            "id": if pid > 0 { json!(pid) } else { Value::Null },
+            "catId": if !cat_id.is_empty() { json!(cat_id) } else { Value::Null },
+            "cat": if !cat_name.is_empty() { json!(cat_name) } else { Value::Null },
+            "t": now_ms(),
+        });
+    });
     app.state.save(); j(json!({ "ok": true }))
 }
-/// Put the viewer's own pick first (unless it keeps failing).
-fn apply_pick(app: &App, key: &str, v: &mut Vec<Value>) {
-    let p = app.state.read(|st| st["picks"][key].clone()); if p.is_null() { return; }
-    let Some(i) = v.iter().position(|x| (p["id"].is_i64() && x["id"] == p["id"]) || (p["cat"].is_string() && x["cat"] == p["cat"])) else { return };
-    if v[i]["health"].as_f64().unwrap_or(0.0) >= 5.0 { return; }
+/// Put the viewer's own pick first (unless it keeps failing or is a bad/non-EN copy).
+fn apply_pick_val(p: &Value, v: &mut Vec<Value>) {
+    if p.is_null() { return; }
+    let pid = p["id"].as_i64().filter(|&x| x > 0);
+    let p_cid = p["catId"].as_str().filter(|s| !s.is_empty());
+    let p_cat = p["cat"].as_str().filter(|s| !s.is_empty());
+    let idx = p_cid.and_then(|cid| v.iter().position(|x| x["catId"].as_str() == Some(cid)))
+        .or_else(|| pid.and_then(|id| v.iter().position(|x| x["id"].as_i64() == Some(id))))
+        .or_else(|| p_cat.and_then(|c| v.iter().position(|x| x["cat"].as_str().map_or(false, |xc| xc == c || xc.starts_with(&format!("{c} 4K"))))))
+        .or_else(|| p_cat.and_then(|c| v.iter().position(|x| x["cat"].as_str() == Some(c))));
+    let Some(i) = idx else { return };
+    if v[i]["health"].as_f64().unwrap_or(0.0) >= 5.0 || v[i]["nonEn"].as_bool().unwrap_or(false) { return; }
     let x = v.remove(i); v.insert(0, x);
 }
-/// The same episode in the show's other versions (other categories / 4K copies), best first.
+fn apply_pick(app: &App, key: &str, v: &mut Vec<Value>) {
+    let p = app.state.read(|st| st["picks"][key].clone());
+    apply_pick_val(&p, v);
+}
+/// The same episode in the show's other versions (other categories / 4K DV / Dolby Audio / clean sub-market 4K), best first.
 async fn ep_alts(State(app): A, Path((sid, season, n)): Path<(i64, i64, i64)>) -> Response {
     let cat = app.catalog(); let Some(it) = cat.series_item(sid).cloned() else { return j(json!([])) };
-    let mut ids = vec![(it.id, it.uhd, it.cat.clone())]; for v in &it.variants { ids.push((v.id, v.uhd, cat.series_raw.get(&v.id).map(|x| x.cat.clone()).unwrap_or_default())); }
-    let infos = futures_util::future::join_all(ids.iter().map(|(id, _, _)| app.xc_info("get_series_info", "series_id", *id, 2 * 3_600_000))).await;
-    let mut cnt: HashMap<&str, usize> = HashMap::new(); let mut out = vec![];
-    for ((_, uhd, c), info) in ids.iter().zip(infos) {
+    let mut specs = vec![(it.id, it.uhd, it.dv, it.bluray, it.dolby_audio, it.cam, false, it.cat.clone())];
+    for v in &it.variants {
+        let cid = cat.series_raw.get(&v.id).map(|x| x.cat.clone()).unwrap_or_default();
+        specs.push((v.id, v.uhd, v.dv, v.bluray, v.dolby_audio, v.cam, v.sub_market, cid));
+    }
+    let infos = futures_util::future::join_all(specs.iter().map(|(id, ..)| app.xc_info("get_series_info", "series_id", *id, 2 * 3_600_000))).await;
+    let mut cnt: HashMap<String, usize> = HashMap::new(); let mut out = vec![];
+    for ((_, uhd, dv, bluray, da, cam, sub_mkt, cid), info) in specs.iter().zip(infos) {
         let Some(e) = info["episodes"][season.to_string()].as_array().and_then(|a| a.iter().find(|e| util::i(&e["episode_num"]) == n)) else { continue };
-        let b = if *uhd { "4K" } else { "HD" }; let k = cnt.entry(b).or_insert(0); *k += 1;
-        let eid = util::i(&e["id"]); let ext = { let x = s(&e["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
-        out.push(json!({ "id": eid, "ext": ext, "uhd": uhd, "label": if *k > 1 { format!("{b} {k}") } else { b.to_string() }, "cat": cat.cat_name("series", c), "health": source_health(&app, eid), "q": app.stream.quality_of(eid) }));
+        let eid = util::i(&e["id"]);
+        if eid <= 0 || out.iter().any(|x: &Value| x["id"].as_i64() == Some(eid)) { continue; }
+        let ext = { let x = s(&e["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
+        let cname = cat.cat_name("series", cid);
+        let base = if *cam { "CAM" }
+            else if *dv { "4K DV" }
+            else if *uhd && *da { "4K · Dolby Audio" }
+            else if *uhd { "4K" }
+            else if *bluray { "Blu-Ray" }
+            else if *da { "HD · Dolby Audio" }
+            else { "HD" };
+        let base_s = if *sub_mkt { format!("{base} · Nordic") } else { base.to_string() };
+        let k = cnt.entry(base_s.clone()).or_insert(0); *k += 1;
+        let label = if *k > 1 { format!("{base_s} {k}") } else { base_s };
+        let non_en = *sub_mkt && app.dubs.get(&format!("e:{eid}")).map_or(false, |d| !d.has_en);
+        out.push(json!({
+            "id": eid, "ext": ext, "uhd": uhd, "dv": dv, "bluray": bluray, "dolbyAudio": da, "cam": cam,
+            "subMarket": sub_mkt, "nonEn": non_en, "catId": cid, "cat": cname,
+            "label": label, "health": source_health(&app, eid), "q": app.stream.quality_of(eid),
+        }));
     }
     rank_sources(&app, &mut out); apply_pick(&app, &format!("s:{sid}"), &mut out); j(json!(out))
 }
@@ -1684,4 +1876,56 @@ async fn extra_guide(app: Arc<App>) {
         *app.cat.write().unwrap() = Arc::new(c);
     }
     if changed || fresh { let a = app.clone(); let _ = tokio::task::spawn_blocking(move || sports::load_epg(&a)).await; app.memo.clear(); }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn clean_cat_folds_superscripts_without_collisions() {
+        assert_eq!(catalog::clean_cat("NETFLIX SERIES ⁴ᴷ ³⁸⁴⁰ᴾ ᴰᵒˡᵇʸ ⱽᶦˢᶦᵒⁿ"), "NETFLIX SERIES 4K 3840P Dolby Vision");
+        assert_eq!(catalog::clean_cat("ENGLISH SERIES ᴰᴼᴸᴮʸ ᴬᵁᴰᴵᴼ"), "ENGLISH SERIES DOLBY AUDIO");
+        assert_ne!(catalog::clean_cat("HBO MAX SERIES ⁴ᴷ ³⁸⁴⁰ᴾ"), catalog::clean_cat("HBO MAX SERIES"));
+        assert_eq!(catalog::clean_cat("4K| ᵁᴴᴰ ³⁸⁴⁰ᴾ"), "4K| UHD 3840P");
+        assert_eq!(catalog::clean_cat("AU| PRIME ᴿᴬᵂ ⁶⁰ᶠᵖˢ"), "AU| PRIME RAW 60fps");
+    }
+
+    #[test]
+    fn rank_sources_prefers_4k_dv_dolby_platform_and_tolerates_single_blip() {
+        let now = now_ms();
+        let single_blip = source_health_inner(&json!({ "f": 1, "s": 0, "st": 0, "w": 0, "ms": 0, "t": now }), now);
+        assert!((single_blip - 2.5).abs() < 0.01, "single blip capped at 2.5, got {single_blip}");
+        let old_fail = source_health_inner(&json!({ "f": 5, "s": 0, "st": 0, "w": 0, "ms": 0, "t": now - 8 * 86_400_000 }), now);
+        assert_eq!(old_fail, 0.0, "8-day-old failure decays to 0");
+
+        // Even with 1 transient failure, 4K DV still beats plain 1080p HD
+        let mut v = vec![
+            json!({ "id": 1, "uhd": false, "dv": false, "dolbyAudio": false, "cam": false, "subMarket": false, "catId": "156", "cat": "ENGLISH SERIES", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 2, "uhd": false, "dv": false, "dolbyAudio": false, "cam": false, "subMarket": false, "catId": "138", "cat": "NETFLIX SERIES", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 3, "uhd": false, "dv": false, "dolbyAudio": true,  "cam": false, "subMarket": false, "catId": "1898", "cat": "ENGLISH SERIES DOLBY AUDIO", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 4, "uhd": true,  "dv": false, "dolbyAudio": true,  "cam": false, "subMarket": true,  "catId": "1264", "cat": "NORDIC SERIES 4K 3840P DOLBY AUDIO", "health": 0.0, "q": Value::Null }),
+            json!({ "id": 5, "uhd": true,  "dv": true,  "dolbyAudio": false, "cam": false, "subMarket": false, "catId": "427", "cat": "NETFLIX SERIES 4K 3840P Dolby Vision", "health": single_blip, "q": Value::Null }),
+            json!({ "id": 6, "uhd": true,  "dv": false, "dolbyAudio": false, "cam": false, "subMarket": true,  "nonEn": true, "catId": "999", "cat": "FOREIGN 4K", "health": 0.0, "q": Value::Null }),
+        ];
+        rank_sources_with(&mut v, true, true, false);
+        let ids: Vec<i64> = v.iter().map(|x| x["id"].as_i64().unwrap()).collect();
+        // Nordic 4K Dolby Audio (31.5) > 4K DV with single blip (34.1 - 7.5 = 26.6) > HD Dolby Audio (22.1) > Platform HD (21.6) > Generic HD (20.6) > nonEn (-4000)
+        assert_eq!(ids, vec![4, 5, 3, 2, 1, 6]);
+        // Without a blip, Native EN 4K DV beats Nordic 4K Dolby Audio
+        v.iter_mut().find(|x| x["id"] == 5).unwrap()["health"] = json!(0.0);
+        rank_sources_with(&mut v, true, true, false);
+        assert_eq!(v[0]["id"].as_i64(), Some(5));
+        assert_eq!(v[1]["id"].as_i64(), Some(4));
+    }
+
+    #[test]
+    fn apply_pick_matches_exact_cat_id_and_ignores_non_en() {
+        let mut v = vec![
+            json!({ "id": 10, "catId": "1851", "cat": "HBO MAX SERIES 4K 3840P", "health": 0.0, "nonEn": false }),
+            json!({ "id": 20, "catId": "1852", "cat": "HBO MAX SERIES", "health": 0.0, "nonEn": false }),
+        ];
+        apply_pick_val(&json!({ "catId": "1852", "cat": "HBO MAX SERIES" }), &mut v);
+        assert_eq!(v[0]["id"].as_i64(), Some(20));
+    }
 }

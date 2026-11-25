@@ -155,9 +155,16 @@ pub fn events(app: &App, raw: bool) -> Arc<Vec<Event>> {
         let list = by_title.entry(key).or_default();
         if let Some(&pi) = list.iter().find(|&&i| kept[i].start.is_none() || e.start.is_none() || (kept[i].start.unwrap() - e.start.unwrap()).abs() < 4 * 3_600_000) {
             let p = &mut kept[pi];
-            if !p.en && e.en {
+            let qrank = |ch: &str, cat: &str| -> i32 {
+                let qt = live_qtag(ch, cat);
+                if qt.starts_with("4K") { 0 } else if qt.starts_with("RAW") && qt.contains("fps") { 1 }
+                else if qt.starts_with("RAW") { 2 } else if qt.contains("fps") { 3 }
+                else if qt == "FHD" { 4 } else { 5 }
+            };
+            let better = (!p.en && e.en) || (p.en == e.en && qrank(&e.channel, &e.cat) < qrank(&p.channel, &p.cat));
+            if better {
                 p.alts.push(json!({ "id": p.id, "channel": p.channel }));
-                p.id = e.id; p.channel = e.channel.clone(); p.en = true;
+                p.id = e.id; p.channel = e.channel.clone(); p.cat = e.cat.clone(); p.en = e.en;
             } else {
                 p.alts.push(json!({ "id": e.id, "channel": e.channel }));
             }

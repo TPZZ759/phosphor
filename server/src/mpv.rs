@@ -14,11 +14,13 @@ const PIPE: &str = r"\\.\pipe\tv-mpv";
 
 pub struct Session {
     pub gen: u64,
+    pub stream_id: i64,
     pub child: std::process::Child,
     pub key: String,
     pub url: String,
     pub used_spool: bool,
     pub body: Value,
+    pub start_pos: f64,
     pub pos: f64,
     pub dur: f64,
     pub title: String,
@@ -29,6 +31,7 @@ pub struct Session {
     pub skipped: Vec<usize>,
     pub next_triggered: bool,
     pub has_osd: bool,
+    pub health_reported: bool,
 }
 
 pub struct Mpv {
@@ -497,15 +500,18 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         Err(e) => return crate::err(500, &format!("mpv failed to start: {e}")),
     };
 
+    let stream_id = id.parse::<i64>().unwrap_or(0);
     let gen = app.mpv.gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     *app.mpv.last_done.lock().unwrap() = None;
     *app.mpv.s.lock().unwrap() = Some(Session {
         gen,
+        stream_id,
         child,
         key,
         url,
         used_spool,
         body: b["progress"].clone(),
+        start_pos: t,
         pos: t,
         dur: b["dur"].as_f64().unwrap_or(0.0),
         title: title.clone(),
@@ -516,6 +522,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         skipped: vec![],
         next_triggered: false,
         has_osd,
+        health_reported: false,
     });
     println!("[mpv] playing {kind}:{id} from {t:.0}s (hdr={hdr} hdr_now={hdr_now} spool={used_spool} shader={shader_preset} osd={has_osd} vsr={use_vsr} oled={gdi})");
     let a2 = app.clone();
@@ -542,11 +549,16 @@ async fn watch(app: Arc<App>, gen: u64) {
             )
         }).await.unwrap_or((None, None, None));
         let mut skip_cmd: Option<(f64, bool)> = None;
+        let mut report_start_id: i64 = 0;
         {
             let mut g = app.mpv.s.lock().unwrap();
             let Some(s) = g.as_mut() else { return };
             if let Some(p) = p.and_then(|x| x.as_f64()) { s.pos = p; }
             if let Some(d) = d.and_then(|x| x.as_f64()) { s.dur = d; }
+            if !s.health_reported && s.stream_id > 0 && ((s.pos - s.start_pos).abs() >= 10.0 || (n >= 6 && s.pos > 2.0)) {
+                s.health_reported = true;
+                report_start_id = s.stream_id;
+            }
             if nx.as_ref().and_then(|x| x.as_str()) == Some("1") || nx.as_ref().and_then(|x| x.as_i64()) == Some(1) {
                 s.next_triggered = true;
             }
@@ -561,6 +573,9 @@ async fn watch(app: Arc<App>, gen: u64) {
                     }
                 }
             }
+        }
+        if report_start_id > 0 {
+            crate::record_mpv_health(&app, report_start_id, 0.0, true);
         }
         if let Some((en, do_auto)) = skip_cmd {
             let _ = tokio::task::spawn_blocking(move || {
@@ -578,6 +593,10 @@ async fn watch(app: Arc<App>, gen: u64) {
     save(&app, &mut history).await;
     let s = app.mpv.s.lock().unwrap().take();
     if let Some(s) = s {
+        let watched = (s.pos - s.start_pos).max(0.0).min(4.0 * 3600.0);
+        if s.stream_id > 0 && watched >= 10.0 {
+            crate::record_mpv_health(&app, s.stream_id, watched, !s.health_reported);
+        }
         let finished = s.next_triggered || (!s.live && s.dur > 60.0 && (
             s.pos / s.dur >= 0.90
             || s.credits.map_or(false, |c| c > s.dur * 0.55 && s.pos >= c - 5.0)

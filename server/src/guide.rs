@@ -13,9 +13,9 @@ use std::sync::Arc;
 type A = State<Arc<App>>;
 type Q = Query<HashMap<String, String>>;
 
-/// (merge key, quality label) for a channel name: country prefix and quality/feed tags removed.
+/// (merge key, quality label) for a channel name: country/network prefix and quality/feed tags removed.
 pub fn base_name(title: &str) -> (String, String) {
-    let t = crate::re!(r"^\s*[A-Z0-9]{2,4}\s*[|:]\s*").replace(title, "").to_string();
+    let t = crate::re!(r"^\s*(?:AT&T|PRIME|CA\s+EN|CA\s+FR|AR\s+4K|[A-Z0-9]{2,4})\s*[|:]\s*").replace(title, "").to_string();
     let up = t.to_uppercase();
     let is_4k = crate::re!(r"\b(4K|UHD|3840P?|2160P?)\b|ᵁᴴᴰ|⁴ᴷ").is_match(&up);
     let is_raw = crate::re!(r"\bRAW\b|ᴿᴬᵂ").is_match(&up);
@@ -54,9 +54,9 @@ pub fn merge<'a>(list: &[&'a Item]) -> Vec<Row<'a>> {
         idx.insert(key.clone(), rows.len());
         rows.push(Row { key, title: if title.is_empty() { ch.title.clone() } else { title }, feeds: vec![(ch, label)] });
     }
-    // primary feed: best picture first (4K > RAW 50/60fps > RAW > FHD > HD > SD), preferring EPG & catch-up
+    // primary feed: best picture first (4K > RAW 50/60fps > RAW > FHD > HD > SD); EPG is shared across all feeds in the row
     for r in rows.iter_mut() {
-        r.feeds.sort_by_key(|(c, l)| (c.epg.is_empty() as i32, live_label_rank(l, &c.title), (c.archive == 0) as i32));
+        r.feeds.sort_by_key(|(c, l)| (live_label_rank(l, &c.title), c.epg.is_empty() as i32, (c.archive == 0) as i32));
         let mut n = 0; for f in r.feeds.iter_mut() { if f.1.is_empty() { n += 1; f.1 = if n == 1 { "Main".into() } else { format!("Feed {n}") }; } }
     }
     rows

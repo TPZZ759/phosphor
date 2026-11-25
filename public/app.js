@@ -2930,9 +2930,9 @@ const Player = (() => {
     loadDirect();
   }
   function buildAttempts() {
-    const list = [{ id: o.id, label: o.label, ext: o.ext, cat: o.cat }, { id: o.id, tx: true, label: o.label, ext: o.ext }];
-    for (const v of o.alternates || []) if (v.id !== o.id) list.push({ id: v.id, label: v.label || v.channel, ext: v.ext, cat: v.cat });
-    list.push({ id: o.id, alt: true, label: o.label, ext: o.ext });
+    const list = [{ id: o.id, label: o.label, ext: o.ext, cat: o.cat, catId: o.catId, subMarket: !!o.subMarket }, { id: o.id, tx: true, label: o.label, ext: o.ext, subMarket: !!o.subMarket }];
+    for (const v of o.alternates || []) if (v.id !== o.id) list.push({ id: v.id, label: v.label || v.channel, ext: v.ext, cat: v.cat, catId: v.catId, subMarket: !!v.subMarket });
+    list.push({ id: o.id, alt: true, label: o.label, ext: o.ext, subMarket: !!o.subMarket });
     return list;
   }
   function report(ev, extra = {}, beacon = false) {
@@ -2994,11 +2994,11 @@ const Player = (() => {
   }
   function renderSources() {
     const sel = $('#pSrc'); if (!sel || !o) return;
-    const list = [{ id: o.id, label: o.label || (o.live ? 'Main feed' : 'Original'), cat: o.cat }, ...(o.alternates || [])];
+    const list = [{ id: o.id, label: o.label || (o.live ? 'Main feed' : 'Original'), cat: o.cat, catId: o.catId }, ...(o.alternates || [])];
     if (list.length < 2) { sel.hidden = true; return; }
     sel.hidden = false;
     sel.title = o.live ? 'Backup feeds' : 'Version';
-    sel.innerHTML = list.map((v) => `<option value="${v.id}">${esc(v.label || v.channel || (o.live ? 'Feed' : 'Version'))}${v.cat ? ` · ${esc(v.cat.slice(0, 22))}` : ''}</option>`).join('');
+    sel.innerHTML = list.map((v) => `<option value="${v.id}">${esc(v.label || v.channel || (o.live ? 'Feed' : 'Version'))}${v.cat ? ` · ${esc(v.cat.slice(0, 28))}` : ''}</option>`).join('');
     sel.value = cur().id;
     sel.onchange = () => {
       const id = +sel.value;
@@ -3006,7 +3006,11 @@ const Player = (() => {
       if (i >= 0) useAttempt(i);
       if (!o.live && !o.catchup) {
         const v = list.find((x) => x.id === id);
-        post('/api/pick', o.kind === 'series' && o.sid ? { key: 's:' + o.sid, cat: v?.cat } : { key: o.progressKey, id }).catch(() => {});
+        if (o.kind === 'series' && o.sid) {
+          if (v?.catId || v?.cat) post('/api/pick', { key: 's:' + o.sid, catId: v?.catId || '', cat: v?.cat || '' }).catch(() => {});
+        } else if (id) {
+          post('/api/pick', { key: o.progressKey, id }).catch(() => {});
+        }
       }
     };
   }
@@ -3482,7 +3486,7 @@ const Player = (() => {
         if (!o || o !== opts) return;
         if (Array.isArray(list) && list.length) {
           const best = list[0];
-          o.id = best.id; o.ext = best.ext || o.ext; o.label = best.label; o.cat = best.cat;
+          o.id = best.id; o.ext = best.ext || o.ext; o.label = best.label; o.cat = best.cat; o.catId = best.catId || ''; o.subMarket = !!best.subMarket;
           o.alternates = list.slice(1);
           attempts = buildAttempts(); ai = 0;
         }
@@ -3498,6 +3502,15 @@ const Player = (() => {
       const p0 = await api(`/api/probe/${o.kind}/${o.id}?${pq}`).catch(() => null);
       if (!o || o !== opts) return;
       probe = p0;
+      // English-audio safety gate: if a cross-market 4K copy ever lacks English audio, fall back automatically to native EN
+      if (!o.isAnime && cur().subMarket && probe?.audio?.length > 0 && probe?.hasEnAudio === false) {
+        const nx = attempts.findIndex((a, idx) => idx > ai && !a.tx && !a.alt && !a.subMarket);
+        if (nx >= 0) {
+          toast('No English audio on international 4K copy — switching to English version');
+          renderSources(); setMediaSession();
+          return useAttempt(nx);
+        }
+      }
       if (o.isAnime && probe?.hasEnAudio === false && !o.allowSubOnly) {
         spin(false);
         const langs = [...new Set((probe.audio || []).map((a) => langName(a.lang) || a.lang || 'Unknown'))].join(', ');

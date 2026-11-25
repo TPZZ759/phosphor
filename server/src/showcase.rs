@@ -24,7 +24,7 @@ const TRENDING_ALERT_CAP: usize = 5;
 /// Fold Unicode superscript & modifier letters/digits (used heavily in provider
 /// category names like `⁴ᴷ ³⁸⁴⁰ᴾ ᴰᵒˡᵇʸ ⱽᶦˢᶦᵒⁿ`, `ᴰᴼᴸᴮʸ ᴬᵁᴰᴵᴼ`, `²¹⁶⁰ᵖ ᴴᴰᴿ¹⁰`)
 /// into plain ASCII while leaving normal ASCII strings untouched without allocation.
-fn fold_superscripts(input: &str) -> Cow<'_, str> {
+pub(crate) fn fold_superscripts(input: &str) -> Cow<'_, str> {
     if input.is_ascii() {
         return Cow::Borrowed(input);
     }
@@ -41,6 +41,8 @@ fn fold_superscripts(input: &str) -> Cow<'_, str> {
             '⁷' => Some('7'),
             '⁸' => Some('8'),
             '⁹' => Some('9'),
+            '⁽' => Some('('),
+            '⁾' => Some(')'),
             'ᴬ' => Some('A'),
             'ᴮ' => Some('B'),
             'ᴰ' => Some('D'),
@@ -65,7 +67,7 @@ fn fold_superscripts(input: &str) -> Cow<'_, str> {
             'ᶜ' => Some('c'),
             'ᵈ' => Some('d'),
             'ᵉ' => Some('e'),
-            'ᶠ' => Some('f'),
+            'ᶠ' | 'ᶲ' => Some('f'),
             'ᵍ' => Some('g'),
             'ʰ' => Some('h'),
             'ⁱ' | 'ᶦ' => Some('i'),

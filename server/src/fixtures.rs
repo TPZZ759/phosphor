@@ -104,8 +104,21 @@ fn network(app: &App, name: &str) -> Vec<(i64, String)> {
     let cat = app.catalog();
     let ids = { app.net_idx.lock().unwrap().get(&n).cloned() };
     let ids = ids.unwrap_or_else(|| {
-        let re = regex::Regex::new(&format!(r"(?i)^(us|uk|ca|au)?\s*{}\s*(hd|fhd|east)?$", regex::escape(&n).replace(' ', r"\s*"))).unwrap();
-        let hits: Vec<i64> = cat.live.iter().filter(|ch| ch.en && re.is_match(&norm(&crate::re!(r"^[A-Z]{2}\s*[:|]\s*").replace(&ch.title, "")))).take(2).map(|c| c.id).collect();
+        let re = regex::Regex::new(&format!(r"(?i)^(us|uk|ca|au|at&t|prime|vip|now)?\s*{}\s*(4k|uhd|raw|hd|fhd|hevc|east|60fps|50fps|\s)*$", regex::escape(&n).replace(' ', r"\s*"))).unwrap();
+        let mut cands: Vec<(i32, i64)> = cat.live.iter()
+            .filter(|ch| ch.en && re.is_match(&norm(&crate::re!(r"^(?:AT&T|PRIME|CA\s+EN|[A-Z]{2,4})\s*[:|]\s*").replace(&ch.title, ""))))
+            .map(|c| {
+                let up = format!("{} {}", c.title, cat.cat_name("live", &c.cat)).to_uppercase();
+                let r = if up.contains("4K") || up.contains("UHD") || up.contains("3840") { 0 }
+                    else if up.contains("RAW") && (up.contains("60FPS") || up.contains("50FPS")) { 1 }
+                    else if up.contains("RAW") { 2 }
+                    else if up.contains("FHD") { 3 }
+                    else { 4 };
+                (r, c.id)
+            })
+            .collect();
+        cands.sort_by_key(|x| x.0);
+        let hits: Vec<i64> = cands.into_iter().take(3).map(|x| x.1).collect();
         app.net_idx.lock().unwrap().insert(n.clone(), hits.clone()); hits
     });
     ids.into_iter().filter_map(|id| cat.live_item(id).map(|c| (id, c.title.clone()))).collect()
