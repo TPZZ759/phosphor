@@ -1,5 +1,5 @@
 // Phosphor — pure-black OLED streaming front-end for Xtream Codes IPTV (Rust server).
-mod subsync; mod fmp4; mod intro; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
+mod subsync; mod fmp4; mod intro; mod skipdb; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
 pub use extras::notify;
 
 pub fn notify_all(app: &App, kind: &str, title: &str, body: &str, link: &str, action: Value) {
@@ -62,7 +62,7 @@ async fn main() {
         meta_running: Default::default(), meta_progress: Default::default(), memo: Default::default(), epg: Default::default(),
         syncing: Default::default(), sync_error: Default::default(), stream: stream::Streamer::new(&data), fixtures: Default::default(),
         omdb: extras::Omdb::new(data.join("omdb.json")), kw_cache: Default::default(), acct: Default::default(), events_raw: Default::default(),
-        net_idx: Default::default(), xinfo: Default::default(), tri: Default::default(), skips: intro::Skips::new(&data), remote: remote::Remote::new(), jobs: Default::default(), cast: Default::default(), display: display::DisplayCtl::load(&data), stream_gen: Default::default(), mpv: mpv::Mpv::new(), dubs: anime::DubCache::load(&data), http, cfg, data,
+        net_idx: Default::default(), xinfo: Default::default(), tri: Default::default(), skips: intro::Skips::new(&data), skipdb: skipdb::SkipDb::new(&data), remote: remote::Remote::new(), jobs: Default::default(), cast: Default::default(), display: display::DisplayCtl::load(&data), stream_gen: Default::default(), mpv: mpv::Mpv::new(), dubs: anime::DubCache::load(&data), http, cfg, data,
     });
 
     tokio::spawn(startup(app.clone()));
@@ -95,7 +95,7 @@ async fn main() {
         .route("/api/continue", get(continue_get)).route("/api/continue/remove", post(continue_remove)).route("/api/continue/restore", post(continue_restore)).route("/api/continue/pin", post(continue_pin)).route("/api/continue/done", post(continue_done))
         .route("/api/list", post(list)).route("/api/fav", post(fav))
         .route("/api/reminders", get(reminders_get).post(reminders_post))
-        .route("/api/probe/{kind}/{id}", get(probe)).route("/api/health", post(health)).route("/api/health/reset", post(health_reset)).route("/api/syshealth", get(sys_health)).route("/api/pick", post(pick)).route("/api/guide", get(guide::guide)).route("/api/tonight", get(guide::tonight)).route("/api/import/letterboxd", post(sync::letterboxd)).route("/api/import/status", get(sync::import_status)).route("/api/trakt", get(sync::trakt_info)).route("/api/trakt/connect", post(sync::trakt_connect)).route("/api/trakt/disconnect", post(sync::trakt_disconnect)).route("/api/trakt/sync", post(sync::trakt_sync)).route("/api/cast/devices", get(cast::devices)).route("/api/cast/start", post(cast::start)).route("/api/cast/control", post(cast::control)).route("/api/cast/status", get(cast::status)).route("/api/remote", get(remote::info).post(remote::set)).route("/api/remote/events", get(remote::events)).route("/api/remote/state", post(remote::tv_state)).route("/api/remote/send", post(remote::send_local)).route("/api/ep-alts/{sid}/{season}/{n}", get(ep_alts)).route("/api/display", get(display::info)).route("/api/display/match", post(display::matcher)).route("/api/display/restore", post(display::restore_route)).route("/api/mpv", get(mpv::info)).route("/api/mpv/play", post(mpv::play)).route("/api/mpv/stop", post(mpv::stop)).route("/api/mpv/control", post(mpv::control_route)).route("/api/mpv/install", post(mpv::install)).route("/stream/{kind}/{id}", get(stream_route)).route("/spool/{gen}", get(spool::serve)).route("/livebuf/{gen}", get(livebuf::serve)).route("/api/stop", post(stop)).route("/api/streamstats", get(stream_stats))
+        .route("/api/probe/{kind}/{id}", get(probe)).route("/api/skips/stats", get(skips_stats)).route("/api/skips/resolve", get(skips_resolve)).route("/api/health", post(health)).route("/api/health/reset", post(health_reset)).route("/api/syshealth", get(sys_health)).route("/api/pick", post(pick)).route("/api/guide", get(guide::guide)).route("/api/tonight", get(guide::tonight)).route("/api/import/letterboxd", post(sync::letterboxd)).route("/api/import/status", get(sync::import_status)).route("/api/trakt", get(sync::trakt_info)).route("/api/trakt/connect", post(sync::trakt_connect)).route("/api/trakt/disconnect", post(sync::trakt_disconnect)).route("/api/trakt/sync", post(sync::trakt_sync)).route("/api/cast/devices", get(cast::devices)).route("/api/cast/start", post(cast::start)).route("/api/cast/control", post(cast::control)).route("/api/cast/status", get(cast::status)).route("/api/remote", get(remote::info).post(remote::set)).route("/api/remote/events", get(remote::events)).route("/api/remote/state", post(remote::tv_state)).route("/api/remote/send", post(remote::send_local)).route("/api/ep-alts/{sid}/{season}/{n}", get(ep_alts)).route("/api/display", get(display::info)).route("/api/display/match", post(display::matcher)).route("/api/display/restore", post(display::restore_route)).route("/api/mpv", get(mpv::info)).route("/api/mpv/play", post(mpv::play)).route("/api/mpv/stop", post(mpv::stop)).route("/api/mpv/control", post(mpv::control_route)).route("/api/mpv/install", post(mpv::install)).route("/stream/{kind}/{id}", get(stream_route)).route("/spool/{gen}", get(spool::serve)).route("/livebuf/{gen}", get(livebuf::serve)).route("/api/stop", post(stop)).route("/api/streamstats", get(stream_stats))
         .with_state(app.clone());
     let static_files = tower_http::services::ServeDir::new(&app.public).fallback(tower_http::services::ServeFile::new(app.public.join("index.html")));
     // no-cache: the browser revalidates (cheap 304s), so front-end updates always load.
@@ -167,7 +167,7 @@ async fn prewarm(app: Arc<App>) {
 }
 fn spawn_loops(app: Arc<App>) {
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(1)).await; let b = a.clone(); let _ = tokio::task::spawn_blocking(move || b.state.flush()).await; } });
-    let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(10)).await; let b = a.clone(); let _ = tokio::task::spawn_blocking(move || b.tmdb.flush()).await; } });
+    let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(10)).await; let b = a.clone(); let _ = tokio::task::spawn_blocking(move || { b.tmdb.flush(); b.skipdb.save_if_dirty(false); }).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(600)).await; if !a.stream.is_active() && !mpv::running(&a) && !livebuf::is_active() { prewarm(a.clone()).await; } } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(60)).await; if a.ready() { fixtures::alerts(&a).await; } } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; reminders_tick(&a); } });
@@ -180,6 +180,7 @@ fn spawn_loops(app: Arc<App>) {
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(12 * 3600)).await; meta::build(a.clone()).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; expiry_reminder(&a).await; } });
     let a = app.clone(); tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_secs(300)).await; loop { if a.ready() { sync::pull(a.clone()).await; } tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await; } });
+    let a = app.clone(); tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_secs(25)).await; loop { if a.ready() { skipdb::prefetch_worker(a.clone()).await; } tokio::time::sleep(std::time::Duration::from_secs(1800)).await; } });
     let a = app; tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_secs(180)).await; loop { if a.ready() { intro_worker(&a).await; } tokio::time::sleep(std::time::Duration::from_secs(900)).await; } });
 }
 async fn expiry_reminder(app: &App) {
@@ -571,7 +572,7 @@ async fn episodes_watched(State(app): A, Json(b): Json<Value>) -> Response {
 async fn prefs_get(State(app): A) -> Response { j(app.state.read(|st| st["prefs"].clone())) }
 async fn prefs_post(State(app): A, Json(b): Json<Value>) -> Response {
     if let Some(h) = b["hide"].as_array() { let h: Vec<Value> = h.iter().filter(|x| x.is_string()).cloned().collect(); app.state.with(|st| st["prefs"]["hide"] = json!(h)); }
-    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "hideCams", "ufcSpoilerFree"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
+    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "hideCams", "ufcSpoilerFree", "autoplay", "autoskip", "autoSkipCredits"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     for k in ["display", "pro", "oledPeak", "mpvShaders"] { if let Some(v) = b[k].as_str() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     app.state.save(); app.memo.clear(); tokio::spawn(prewarm(app.clone()));
     j(json!({ "ok": true, "prefs": app.state.read(|st| st["prefs"].clone()) }))
@@ -1175,23 +1176,114 @@ pub(crate) fn upstream(app: &App, kind: &str, id: &str, ext: Option<&String>, al
         _ => app.xc.stream_url("series", id, ext.map(|x| x.as_str()).filter(|x| !x.is_empty()).unwrap_or("mkv"), alt),
     }
 }
+fn resolve_series_ids(app: &App, sid: i64, q_tmdb: Option<&str>, q_imdb: Option<&str>, q_anime: bool) -> (String, String, bool) {
+    let mut tmdb = q_tmdb.unwrap_or("").trim().to_string();
+    let mut imdb = q_imdb.unwrap_or("").trim().to_string();
+    let mut is_anime = q_anime;
+    if (tmdb.is_empty() || tmdb == "0") && sid > 0 {
+        if let Some(it) = app.catalog().series_item(sid) {
+            if let Some(ref tm) = it.tmdb { tmdb = tm.clone(); }
+        }
+    }
+    if !tmdb.is_empty() && tmdb != "0" {
+        if let Some(m) = app.meta_get("tv", &tmdb) {
+            if imdb.is_empty() && m.im.starts_with("tt") { imdb = m.im.clone(); }
+            if !is_anime && m.g.contains(&16) && m.l == "ja" { is_anime = true; }
+        }
+    }
+    (tmdb, imdb, is_anime)
+}
+
+async fn skips_stats(State(app): A) -> Response {
+    let mut s = app.skipdb.stats();
+    let audio_eps = app.skips.count_matched();
+    s["audioMatched"] = json!(audio_eps);
+    j(s)
+}
+
+async fn skips_resolve(State(app): A, Query(q): Q) -> Response {
+    let num = |k: &str| q.get(k).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+    let sid = num("sid");
+    let sn = num("s");
+    let en = num("n");
+    let ep = num("ep");
+    let dur = q.get("dur").and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+    let q_anime = q.get("anime").map_or(false, |v| v == "1" || v == "true");
+    let (tmdb, imdb, is_anime) = resolve_series_ids(&app, sid, q.get("tmdb").map(|s| s.as_str()), q.get("imdb").map(|s| s.as_str()), q_anime);
+    let remote = if sn >= 0 && en > 0 {
+        skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, dur, is_anime).await
+    } else { None };
+    let e = if ep > 0 { app.skips.entry(ep) } else { Value::Null };
+    let a_intro = e["intro"].as_array().and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
+    let a_credits = e["credits"].as_f64();
+    let m = skipdb::merge_all(&[], None, a_intro, a_credits, remote.as_ref(), dur);
+    j(json!({
+        "tmdb": tmdb,
+        "imdb": imdb,
+        "isAnime": is_anime,
+        "skips": m.skips,
+        "intro": m.intro.map(|(s, e)| json!([s, e])),
+        "recap": m.recap.map(|(s, e)| json!([s, e])),
+        "credits": m.credits,
+        "postCredits": m.post_credits.map(|(s, e)| json!([s, e])),
+        "source": m.source,
+    }))
+}
+
 async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q): Q) -> Response {
     let url = upstream(&app, &kind, &id, q.get("ext"), false);
     yield_background(&app).await;
-    if kind == "movie" || kind == "series" {
-        if !spool::attached(&url) && !app.stream.is_active() { let since = now_ms() - app.stream.last_stop(); if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; } }
-        if !app.stream.is_active() || spool::attached(&url) { spool::attach(&url, &app.cfg.str("userAgent")).await; }
-    }
-    let mut p = match app.stream.probe(&url, &app.cfg.str("userAgent")).await { Some(mut p) => { p["subs"] = stream::pick_subs(&p["subs"]); p } None => json!({}) };
+    let num = |k: &str| q.get(k).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+    let (sid, sn, en) = (num("sid"), num("s"), num("n"));
+    let q_anime = q.get("anime").map_or(false, |v| v == "1" || v == "true");
+    let (tmdb, imdb, is_anime) = if kind == "series" {
+        resolve_series_ids(&app, sid, q.get("tmdb").map(|s| s.as_str()), q.get("imdb").map(|s| s.as_str()), q_anime)
+    } else {
+        (String::new(), String::new(), false)
+    };
+
+    // Run public skipdb lookup (IntroDB + TheIntroDB v2 + AniSkip) IN PARALLEL with stream probe
+    // so resolving crowd-sourced intro/recap/credits adds 0ms to playback startup!
+    let probe_fut = async {
+        if kind == "movie" || kind == "series" {
+            if !spool::attached(&url) && !app.stream.is_active() { let since = now_ms() - app.stream.last_stop(); if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; } }
+            if !app.stream.is_active() || spool::attached(&url) { spool::attach(&url, &app.cfg.str("userAgent")).await; }
+        }
+        match app.stream.probe(&url, &app.cfg.str("userAgent")).await { Some(mut p) => { p["subs"] = stream::pick_subs(&p["subs"]); p } None => json!({}) }
+    };
+    let skip_fut = async {
+        if kind == "series" && sn >= 0 && en > 0 {
+            skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, 0.0, is_anime).await
+        } else {
+            None
+        }
+    };
+    let (mut p, remote_skips) = tokio::join!(probe_fut, skip_fut);
+
     if let (Ok(nid), Some(aud)) = (id.parse::<i64>(), p["audio"].as_array()) {
         let has_en = anime::record_probe(&app, &kind, nid, aud);
         p["hasEnAudio"] = json!(has_en);
     }
-    if kind == "series" { if let Ok(ep) = id.parse::<i64>() {
-        let num = |k: &str| q.get(k).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
-        if num("sid") > 0 { app.skips.register(ep, num("sid"), num("s"), num("n"), p["duration"].as_f64().unwrap_or(0.0)); }
-        let e = app.skips.entry(ep); p["intro"] = e["intro"].clone(); p["credits"] = e["credits"].clone();
-    } }
+    if kind == "series" {
+        let dur = p["duration"].as_f64().unwrap_or(0.0);
+        let ep_id = id.parse::<i64>().unwrap_or(0);
+        if ep_id > 0 && sid > 0 { app.skips.register(ep_id, sid, sn, en, dur); }
+        let e = if ep_id > 0 { app.skips.entry(ep_id) } else { Value::Null };
+        let ch_skips = p["skips"].as_array().cloned().unwrap_or_default();
+        let ch_credits = p["chapterCredits"].as_f64();
+        let a_intro = e["intro"].as_array().and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
+        let a_credits = e["credits"].as_f64();
+        let merged = skipdb::merge_all(&ch_skips, ch_credits, a_intro, a_credits, remote_skips.as_ref(), dur);
+        p["skips"] = Value::Array(merged.skips);
+        p["intro"] = merged.intro.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
+        p["recap"] = merged.recap.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
+        p["credits"] = merged.credits.map(|c| json!(c)).unwrap_or(Value::Null);
+        p["postCredits"] = merged.post_credits.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
+        if !merged.source.is_empty() { p["skipSource"] = json!(merged.source); }
+        if sn >= 0 && en > 0 {
+            skipdb::spawn_prefetch_ahead(app.clone(), tmdb, imdb, sn, en, is_anime);
+        }
+    }
     j(p)
 }
 struct Guard { app: Arc<App>, seq: u64 }
@@ -1332,10 +1424,17 @@ async fn intro_worker(app: &Arc<App>) {
         let Some(ix) = flat.iter().position(|x| x.2 == last_ep) else { continue };
         // the episode being watched, the next two, and one before (a reference for matching)
         let targets: Vec<_> = flat.iter().enumerate().filter(|(i, _)| *i + 1 >= ix && *i <= ix + 2).map(|(_, x)| x.clone()).collect();
+        let (tmdb, imdb, is_anime) = resolve_series_ids(app, sid, None, None, false);
         let mut changed = false;
         for (sn, n, ep, ext, dur) in targets {
             app.skips.register(ep, sid, sn, n, dur);
+            // First check free crowd-sourced skip DBs (IntroDB / TheIntroDB / AniSkip — zero provider load!).
+            // Only audio-fingerprint segments still missing after crowd-sourced lookup!
+            let remote = skipdb::resolve_episode(app, &tmdb, &imdb, sn, n, dur, is_anime).await;
+            let have_remote_intro = remote.as_ref().map_or(false, |r| r.intro.is_some());
+            let have_remote_credits = remote.as_ref().map_or(false, |r| r.credits.is_some());
             for which in ["h", "t"] {
+                if (which == "h" && have_remote_intro) || (which == "t" && have_remote_credits) { continue; }
                 if app.skips.has(ep, which) || (which == "t" && dur < 600.0) || grabs >= 6 { continue; }
                 if !idle(app) { return; }
                 match app.account(true).await { Ok(a) if a.active == 0 => {} _ => return }

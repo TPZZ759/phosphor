@@ -109,10 +109,23 @@ impl Streamer {
         let audio: Vec<Value> = streams.iter().filter(|s| s["codec_type"] == "audio").enumerate().map(|(i, s)| json!({ "i": i, "codec": s["codec_name"], "ch": s["channels"], "lang": s["tags"]["language"].as_str().unwrap_or(""), "title": s["tags"]["title"].as_str().unwrap_or("") })).collect();
         let subs: Vec<Value> = streams.iter().filter(|s| s["codec_type"] == "subtitle").enumerate().map(|(i, s)| json!({ "i": i, "codec": s["codec_name"], "lang": s["tags"]["language"].as_str().unwrap_or(""), "title": s["tags"]["title"].as_str().unwrap_or(""), "forced": s["disposition"]["forced"].as_i64().unwrap_or(0) == 1 }))
             .filter(|s| TEXT_SUBS.contains(&s["codec"].as_str().unwrap_or(""))).collect();
-        let skips: Vec<Value> = j["chapters"].as_array().into_iter().flatten().map(|c| (c["start_time"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), c["end_time"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), c["tags"]["title"].as_str().unwrap_or("").to_string()))
-            .filter(|(s, e, t)| crate::re!(r"(?i)intro|opening|recap|previously|title sequence").is_match(t) && e - s < 300.0).map(|(s, e, t)| json!({ "s": s, "e": e, "title": t })).collect();
+        let dur = j["format"]["duration"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+        let raw_chapters: Vec<(f64, f64, String)> = j["chapters"].as_array().into_iter().flatten()
+            .map(|c| (
+                c["start_time"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0),
+                c["end_time"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0),
+                c["tags"]["title"].as_str().unwrap_or("").to_string(),
+            ))
+            .collect();
+        let skips: Vec<Value> = raw_chapters.iter()
+            .filter(|(s, e, t)| crate::re!(r"(?i)\b(intro|opening|op|recap|previously|title sequence|main title)\b").is_match(t) && *e > *s + 4.0 && *e - *s < 300.0)
+            .map(|(s, e, t)| json!({ "s": s, "e": e, "title": t })).collect();
+        let chapter_credits: Option<f64> = raw_chapters.iter()
+            .filter(|(s, _, t)| crate::re!(r"(?i)\b(end credits|credits|outro|ending|ed|end titles|closing)\b").is_match(t) && *s > 60.0 && (dur <= 120.0 || (*s >= dur * 0.55 && *s < dur - 5.0)))
+            .map(|(s, _, _)| *s)
+            .reduce(f64::min);
         let pic = streams.iter().find(|s| s["codec_type"] == "video").map(picture).unwrap_or(json!({}));
-        let mut r = json!({ "v": 2, "duration": j["format"]["duration"].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), "video": video, "audio": audio, "subs": pick_subs(&Value::Array(subs)), "skips": skips, "pic": pic });
+        let mut r = json!({ "v": 2, "duration": dur, "video": video, "audio": audio, "subs": pick_subs(&Value::Array(subs)), "skips": skips, "chapterCredits": chapter_credits, "pic": pic });
         r["pic"]["kbps"] = json!(j["format"]["bit_rate"].as_str().and_then(|x| x.parse::<f64>().ok()).map(|b| (b / 1000.0).round()).unwrap_or(0.0));
         { let mut p = self.probes.lock().unwrap(); p.insert(k, r.clone()); let _ = std::fs::write(&self.probe_file, serde_json::to_vec(&*p).unwrap()); }
         Some(r)

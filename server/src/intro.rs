@@ -121,6 +121,11 @@ impl Skips {
         e["sid"] = json!(sid); e["season"] = json!(season); e["n"] = json!(n); if dur > 0.0 { e["dur"] = json!(dur); }
     }
     pub fn entry(&self, ep: i64) -> Value { self.db.lock().unwrap()["eps"][ep.to_string()].clone() }
+    pub fn count_matched(&self) -> usize {
+        self.db.lock().unwrap()["eps"].as_object().map_or(0, |m| {
+            m.values().filter(|v| v["intro"].is_array() || v["credits"].is_number()).count()
+        })
+    }
     pub fn has(&self, ep: i64, which: &str) -> bool { self.dir.join(format!("{ep}_{which}.fp")).exists() }
     /// Store a fingerprint ("h" = head starting at 0, "t" = tail starting at `start` seconds).
     pub fn put(&self, ep: i64, which: &str, fp: &[u32], start: f64) {

@@ -51,7 +51,14 @@ impl Mpv {
 pub fn running(app: &App) -> bool {
     let mut g = app.mpv.s.lock().unwrap();
     match g.as_mut() {
-        Some(s) => matches!(s.child.try_wait(), Ok(None)),
+        Some(s) => match s.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(st)) => {
+                if st.code() == Some(42) { s.next_triggered = true; }
+                false
+            }
+            Err(_) => false,
+        },
         None => false,
     }
 }
@@ -361,7 +368,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         } else {
             a.push("--deband=no".into());
         }
-        // GPU upscaling & live deinterlace
+        // GPU neural upscaling & live deinterlace
         if use_vsr {
             if deint {
                 a.push("--vf-append=d3d11vpp=deint=yes:mode=bob:scale=2:scaling-mode=nvidia".into());
@@ -380,7 +387,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         }
     }
 
-    // Parse intro/credits skips BEFORE spawning mpv so we can pass them into tv_osd.lua!
+    // Parse intro/recap/credits skips BEFORE spawning mpv so we can pass them into tv_osd.lua!
     let skips: Vec<(f64, f64, String)> = b["skips"].as_array().map(|arr| {
         arr.iter().filter_map(|x| {
             let st = x["s"].as_f64()?;
@@ -389,7 +396,8 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         }).collect()
     }).unwrap_or_default();
     let credits = b["credits"].as_f64().filter(|x| *x > 30.0);
-    let autoskip = b["autoskip"].as_bool().unwrap_or(false);
+    let autoskip = b["autoskip"].as_bool().unwrap_or(true);
+    let autoskip_credits = b["autoskipCredits"].as_bool().unwrap_or(true);
 
     // Custom pure-black OLED Lua OSD + neural GPU shader chain
     let root = app.data.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -416,8 +424,14 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         };
         add_opt("title", title.clone());
         add_opt("sub", sub_label.clone());
+        if let Some((rst, ren, _)) = skips.iter().find(|(_, _, l)| {
+            let ll = l.to_lowercase(); ll.contains("recap") || ll.contains("previously")
+        }) {
+            add_opt("recap_s", format!("{rst:.2}"));
+            add_opt("recap_e", format!("{ren:.2}"));
+        }
         if let Some((ist, ien, _)) = skips.iter().find(|(_, _, l)| {
-            let ll = l.to_lowercase(); ll.contains("intro") || ll.contains("opening") || ll.contains("recap")
+            let ll = l.to_lowercase(); ll.contains("intro") || ll.contains("opening") || ll == "op"
         }) {
             add_opt("intro_s", format!("{ist:.2}"));
             add_opt("intro_e", format!("{ien:.2}"));
@@ -427,6 +441,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         add_opt("next_label", next_label.clone());
         add_opt("autoplay", if autoplay { "yes" } else { "no" }.into());
         add_opt("autoskip", if autoskip { "yes" } else { "no" }.into());
+        add_opt("autoskip_credits", if autoskip_credits { "yes" } else { "no" }.into());
         add_opt("shader_dir", shader_dir.to_string_lossy().to_string());
         add_opt("shader_preset", shader_preset.into());
         add_opt("night", if night { "yes" } else { "no" }.into());
@@ -538,9 +553,10 @@ async fn watch(app: Arc<App>, gen: u64) {
             if !s.has_osd && !s.live && !s.skips.is_empty() {
                 for (i, (st, en, label)) in s.skips.iter().enumerate() {
                     if !s.skipped.contains(&i) && s.pos >= *st && s.pos < *en - 2.0 {
-                        let is_intro = label.to_lowercase().contains("intro") || label.to_lowercase().contains("opening");
+                        let ll = label.to_lowercase();
+                        let is_skip = ll.contains("intro") || ll.contains("opening") || ll.contains("recap") || ll.contains("previously");
                         s.skipped.push(i);
-                        skip_cmd = Some((*en, s.autoskip && is_intro));
+                        skip_cmd = Some((*en, s.autoskip && is_skip));
                         break;
                     }
                 }
@@ -564,7 +580,7 @@ async fn watch(app: Arc<App>, gen: u64) {
     if let Some(s) = s {
         let finished = s.next_triggered || (!s.live && s.dur > 60.0 && (
             s.pos / s.dur >= 0.90
-            || s.credits.map_or(false, |c| c > s.dur * 0.6 && s.pos >= c - 5.0)
+            || s.credits.map_or(false, |c| c > s.dur * 0.55 && s.pos >= c - 5.0)
         ));
         let mut err_msg: Option<String> = None;
         if s.pos < 1.0 && !s.next_triggered && n <= 8 {

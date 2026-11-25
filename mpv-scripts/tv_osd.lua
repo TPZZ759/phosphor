@@ -1,5 +1,5 @@
 -- tv_osd.lua — Pure-Black QD-OLED Netflix-Style OSD for Personal Windows 11 TV App
--- Loaded via: --osc=no --script=<app-dir>\mpv-scripts\tv_osd.lua
+-- Loaded via: --osc=no --script=mpv-scripts/tv_osd.lua
 --
 -- Supported --script-opts (prefix: tv_osd-):
 --   tv_osd-title          (string)   Display title (falls back to media-title / filename)
@@ -35,6 +35,7 @@ local HIDE_DELAY = 2.5
 local REPLAY_SEEK_SECS = 8
 local REPLAY_RESTORE_SECS = 10
 local UP_NEXT_COUNTDOWN_SECS = 10
+local UP_NEXT_CREDITS_SKIP_SECS = 3
 
 local C = {
     black        = "&H000000&", -- #000000 Pure OLED pixel-off black
@@ -105,37 +106,43 @@ local SHADER_PRESETS = {
 -- Options (parsed as strings first so yes/no, true/false, 1/0, empty all work cleanly)
 --------------------------------------------------------------------------------
 local raw_opts = {
-    title         = "",
-    sub           = "",
-    intro_s       = "-1",
-    intro_e       = "-1",
-    credits       = "-1",
-    has_next      = "no",
-    next_label    = "",
-    autoplay      = "no",
-    autoskip      = "no",
-    shader_dir    = "",
-    shader_preset = "off",
-    night         = "no",
-    is_live       = "no",
-    api_base      = "http://127.0.0.1:7878",
+    title            = "",
+    sub              = "",
+    recap_s          = "-1",
+    recap_e          = "-1",
+    intro_s          = "-1",
+    intro_e          = "-1",
+    credits          = "-1",
+    has_next         = "no",
+    next_label       = "",
+    autoplay         = "no",
+    autoskip         = "no",
+    autoskip_credits = "yes",
+    shader_dir       = "",
+    shader_preset    = "off",
+    night            = "no",
+    is_live          = "no",
+    api_base         = "http://127.0.0.1:7878",
 }
 
 local opts = {
-    title         = "",
-    sub           = "",
-    intro_s       = -1,
-    intro_e       = -1,
-    credits       = -1,
-    has_next      = false,
-    next_label    = "",
-    autoplay      = false,
-    autoskip      = false,
-    shader_dir    = "",
-    shader_preset = "off",
-    night         = false,
-    is_live       = false,
-    api_base      = "http://127.0.0.1:7878",
+    title            = "",
+    sub              = "",
+    recap_s          = -1,
+    recap_e          = -1,
+    intro_s          = -1,
+    intro_e          = -1,
+    credits          = -1,
+    has_next         = false,
+    next_label       = "",
+    autoplay         = false,
+    autoskip         = false,
+    autoskip_credits = true,
+    shader_dir       = "",
+    shader_preset    = "off",
+    night            = false,
+    is_live          = false,
+    api_base         = "http://127.0.0.1:7878",
 }
 
 local function parse_bool(val, default_val)
@@ -176,20 +183,23 @@ local function resolve_shader_dir()
 end
 
 local function sync_parsed_opts()
-    opts.title         = tostring(raw_opts.title or "")
-    opts.sub           = tostring(raw_opts.sub or "")
-    opts.intro_s       = parse_num(raw_opts.intro_s, -1)
-    opts.intro_e       = parse_num(raw_opts.intro_e, -1)
-    opts.credits       = parse_num(raw_opts.credits, -1)
-    opts.has_next      = parse_bool(raw_opts.has_next, false)
-    opts.next_label    = tostring(raw_opts.next_label or "")
-    opts.autoplay      = parse_bool(raw_opts.autoplay, false)
-    opts.autoskip      = parse_bool(raw_opts.autoskip, false)
-    opts.shader_dir    = tostring(raw_opts.shader_dir or "")
-    opts.shader_preset = normalize_preset(raw_opts.shader_preset)
-    opts.night         = parse_bool(raw_opts.night, false)
-    opts.is_live       = parse_bool(raw_opts.is_live, false)
-    opts.api_base      = tostring(raw_opts.api_base or "http://127.0.0.1:7878")
+    opts.title            = tostring(raw_opts.title or "")
+    opts.sub              = tostring(raw_opts.sub or "")
+    opts.recap_s          = parse_num(raw_opts.recap_s, -1)
+    opts.recap_e          = parse_num(raw_opts.recap_e, -1)
+    opts.intro_s          = parse_num(raw_opts.intro_s, -1)
+    opts.intro_e          = parse_num(raw_opts.intro_e, -1)
+    opts.credits          = parse_num(raw_opts.credits, -1)
+    opts.has_next         = parse_bool(raw_opts.has_next, false)
+    opts.next_label       = tostring(raw_opts.next_label or "")
+    opts.autoplay         = parse_bool(raw_opts.autoplay, false)
+    opts.autoskip         = parse_bool(raw_opts.autoskip, false)
+    opts.autoskip_credits = parse_bool(raw_opts.autoskip_credits, true)
+    opts.shader_dir       = tostring(raw_opts.shader_dir or "")
+    opts.shader_preset    = normalize_preset(raw_opts.shader_preset)
+    opts.night            = parse_bool(raw_opts.night, false)
+    opts.is_live          = parse_bool(raw_opts.is_live, false)
+    opts.api_base         = tostring(raw_opts.api_base or "http://127.0.0.1:7878")
 end
 
 --------------------------------------------------------------------------------
@@ -243,8 +253,11 @@ local state = {
     replay_prev_sid = "no",
     replay_prev_vis = true,
 
-    -- Intro Skip
+    -- Intro & Recap Skip
     intro_visible = false,
+    intro_kind = "intro", -- "recap" | "intro"
+    recap_autoskipped = false,
+    recap_dismissed = false,
     intro_autoskipped = false,
     intro_dismissed = false,
     skip_key_bound = false,
@@ -253,6 +266,8 @@ local state = {
     up_next_visible = false,
     up_next_dismissed = false,
     up_next_remaining = UP_NEXT_COUNTDOWN_SECS,
+    up_next_total = UP_NEXT_COUNTDOWN_SECS,
+    up_next_credits_skip = false,
     up_next_last_tick = nil,
     quitting_for_next = false,
 
@@ -835,13 +850,60 @@ local function set_skip_key_bound(active)
 end
 
 do_skip_intro = function(auto)
-    if opts.intro_e > 0 then
+    if state.intro_kind == "recap" and opts.recap_e > 0 then
+        mp.set_property_number("time-pos", opts.recap_e)
+        state.intro_visible = false
+        state.recap_dismissed = true
+        set_skip_key_bound(false)
+        show_toast(auto and "Auto-Skipped Recap" or "Skipped Recap")
+        render()
+    elseif opts.intro_e > 0 then
         mp.set_property_number("time-pos", opts.intro_e)
         state.intro_visible = false
         state.intro_dismissed = true
         set_skip_key_bound(false)
         show_toast(auto and "Auto-Skipped Intro" or "Skipped Intro")
         render()
+    end
+end
+
+local function adopt_chapters(chapters)
+    if opts.is_live or type(chapters) ~= "table" or #chapters == 0 then return end
+    local dur = state.duration or mp.get_property_number("duration", 0) or 0
+    for i, ch in ipairs(chapters) do
+        local title = tostring(ch.title or ""):lower()
+        local st = tonumber(ch.time)
+        local nxt = chapters[i + 1]
+        local en = nxt and tonumber(nxt.time) or (dur > 0 and dur or nil)
+        if st and title ~= "" then
+            local is_recap = title:find("recap", 1, true) or title:find("previously", 1, true)
+            local is_intro = (not is_recap) and (
+                title:find("intro", 1, true)
+                or title:find("opening", 1, true)
+                or title:find("title sequence", 1, true)
+                or title:find("main title", 1, true)
+                or title:match("^op%s*$")
+                or title:match("^op%W")
+            )
+            local is_credits = (
+                title:find("end credits", 1, true)
+                or title:find("credits", 1, true)
+                or title:find("outro", 1, true)
+                or title:find("ending", 1, true)
+                or title:find("end titles", 1, true)
+                or title:match("^ed%s*$")
+                or title:match("^ed%W")
+            )
+            if is_recap and opts.recap_s < 0 and en and (en - st) >= 4 and (en - st) <= 240 and (dur <= 120 or en <= dur * 0.42) then
+                opts.recap_s = st
+                opts.recap_e = en
+            elseif is_intro and opts.intro_s < 0 and en and (en - st) >= 5 and (en - st) <= 210 and (dur <= 120 or en <= dur * 0.50) then
+                opts.intro_s = st
+                opts.intro_e = en
+            elseif is_credits and opts.credits < 0 and st > 60 and (dur <= 120 or (st >= dur * 0.55 and st < dur - 5)) then
+                opts.credits = st
+            end
+        end
     end
 end
 
@@ -852,7 +914,8 @@ local function trigger_play_next()
     show_toast("Starting Next Episode...", 1.0)
     mp.set_property("user-data/tv-next", "1")
     mp.add_timeout(0.12, function()
-        mp.command("quit")
+        -- Exit code 42 signals instant zero-race auto-next to tv-server's mpv watcher
+        mp.commandv("quit", "42")
     end)
 end
 
@@ -874,9 +937,21 @@ local function update_intro_and_up_next()
     local pos = state.time_pos or 0
     local dur = state.duration or 0
 
-    -- Intro window: [intro_s, intro_e - 2]
+    -- Recap window: [recap_s, recap_e - 2], then Intro window: [intro_s, intro_e - 2]
+    local has_recap = (opts.recap_s >= 0 and opts.recap_e > opts.recap_s and (opts.recap_e - 2) >= opts.recap_s)
     local has_intro = (opts.intro_s >= 0 and opts.intro_e > opts.intro_s and (opts.intro_e - 2) >= opts.intro_s)
-    if has_intro and pos >= opts.intro_s and pos <= (opts.intro_e - 2) then
+    if has_recap and pos >= opts.recap_s and pos <= (opts.recap_e - 2) then
+        state.intro_kind = "recap"
+        if opts.autoskip and not state.recap_autoskipped then
+            state.recap_autoskipped = true
+            do_skip_intro(true)
+            return
+        elseif not state.recap_dismissed then
+            state.intro_visible = true
+            set_skip_key_bound(true)
+        end
+    elseif has_intro and pos >= opts.intro_s and pos <= (opts.intro_e - 2) then
+        state.intro_kind = "intro"
         if opts.autoskip and not state.intro_autoskipped then
             state.intro_autoskipped = true
             do_skip_intro(true)
@@ -887,16 +962,20 @@ local function update_intro_and_up_next()
         end
     else
         state.intro_visible = false
-        if pos < opts.intro_s then
+        if has_recap and pos < opts.recap_s then
+            state.recap_dismissed = false
+        end
+        if has_intro and pos < opts.intro_s then
             state.intro_dismissed = false
         end
         set_skip_key_bound(false)
     end
 
-    -- Up Next window: credits >= 0 -> time_pos >= credits; else duration - 40
+    -- Up Next / Auto-Skip Credits window: credits >= 0 -> time_pos >= credits; else duration - 40
     if opts.has_next and not state.quitting_for_next then
+        local has_known_credits = (opts.credits >= 0 and (dur <= 120 or opts.credits >= dur * 0.55))
         local trigger = nil
-        if opts.credits >= 0 then
+        if has_known_credits then
             trigger = opts.credits
         elseif dur > 0 then
             trigger = math.max(0, dur - 40)
@@ -905,8 +984,12 @@ local function update_intro_and_up_next()
         if trigger ~= nil and pos >= trigger and dur > 0 then
             if not state.up_next_dismissed then
                 if not state.up_next_visible then
+                    local fast_credits = has_known_credits and opts.autoplay and opts.autoskip_credits
+                    local cd = fast_credits and UP_NEXT_CREDITS_SKIP_SECS or UP_NEXT_COUNTDOWN_SECS
                     state.up_next_visible = true
-                    state.up_next_remaining = UP_NEXT_COUNTDOWN_SECS
+                    state.up_next_credits_skip = fast_credits
+                    state.up_next_total = cd
+                    state.up_next_remaining = cd
                     state.up_next_last_tick = mp.get_time()
                 elseif opts.autoplay then
                     local now = mp.get_time()
@@ -930,6 +1013,8 @@ local function update_intro_and_up_next()
             if state.up_next_visible or state.up_next_dismissed then
                 state.up_next_visible = false
                 state.up_next_dismissed = false
+                state.up_next_credits_skip = false
+                state.up_next_total = UP_NEXT_COUNTDOWN_SECS
                 state.up_next_remaining = UP_NEXT_COUNTDOWN_SECS
                 state.up_next_last_tick = nil
             end
@@ -1442,8 +1527,9 @@ render = function()
 
         local bg = hov and C.red or C.black
         local bc = hov and C.red_hover or C.white
+        local skip_lbl = (state.intro_kind == "recap") and "Skip Recap  >" or "Skip Intro  >"
         push(ass_rect(sx0, sy0, sx1, sy1, bg, "&H08&", 10, 2.0, bc))
-        push(ass_text(sx0 + 24, (sy0 + sy1) * 0.5, 4, 22, C.white, "Skip Intro  >", true))
+        push(ass_text(sx0 + 24, (sy0 + sy1) * 0.5, 4, 22, C.white, skip_lbl, true))
         push(ass_text(sx1 - 18, (sy0 + sy1) * 0.5, 6, 16, hov and C.white or C.muted, "[S]", false))
         register_hit("skip_intro", sx0, sy0, sx1, sy1, function()
             do_skip_intro(false)
@@ -1470,14 +1556,16 @@ render = function()
         register_hit("up_next_card", cx0, cy0, cx1, cy1, function() end)
 
         -- Top red accent / countdown bar
-        local bar_frac = opts.autoplay and clamp((state.up_next_remaining or 0) / UP_NEXT_COUNTDOWN_SECS, 0, 1) or 1
+        local cd_total = math.max(1, state.up_next_total or UP_NEXT_COUNTDOWN_SECS)
+        local bar_frac = opts.autoplay and clamp((state.up_next_remaining or 0) / cd_total, 0, 1) or 1
         push(ass_rect(cx0 + 12, cy0 + 2, cx1 - 12, cy0 + 5, C.track_bg, "&H00&", 1.5))
         if bar_frac > 0 then
             push(ass_rect(cx0 + 12, cy0 + 2, cx0 + 12 + (cw - 24) * bar_frac, cy0 + 5, C.red, "&H00&", 1.5))
         end
 
         -- Header row: UP NEXT + countdown
-        push(ass_text(cx0 + 22, cy0 + 20, 7, 16, C.red, "UP NEXT", true))
+        local hdr_txt = state.up_next_credits_skip and "SKIPPING CREDITS · UP NEXT" or "UP NEXT"
+        push(ass_text(cx0 + 22, cy0 + 20, 7, 16, C.red, hdr_txt, true))
         if opts.autoplay then
             local cd_str = string.format("Starting in %ds", math.max(0, state.up_next_remaining or 0))
             push(ass_text(cx1 - 22, cy0 + 20, 9, 16, C.muted, cd_str, false))
@@ -1731,7 +1819,14 @@ end)
 
 mp.observe_property("duration", "number", function(_, val)
     state.duration = val or 0
+    if state.duration > 0 then
+        adopt_chapters(mp.get_property_native("chapter-list"))
+    end
     render()
+end)
+
+mp.observe_property("chapter-list", "native", function(_, val)
+    adopt_chapters(val)
 end)
 
 mp.observe_property("demuxer-cache-time", "number", function(_, val)
@@ -1789,16 +1884,24 @@ end)
 mp.register_event("file-loaded", function()
     -- Reset per-file playback state
     state.intro_visible = false
+    state.intro_kind = "intro"
     state.intro_autoskipped = false
     state.intro_dismissed = false
+    state.recap_autoskipped = false
+    state.recap_dismissed = false
     state.up_next_visible = false
     state.up_next_dismissed = false
+    state.up_next_credits_skip = false
+    state.up_next_total = UP_NEXT_COUNTDOWN_SECS
     state.up_next_remaining = UP_NEXT_COUNTDOWN_SECS
     state.up_next_last_tick = nil
     state.quitting_for_next = false
     cancel_replay_timer(false)
     stop_cropdetect()
     state.crop_mode = "off"
+
+    -- Adopt native MKV chapter markers for Recap / Intro / Credits when not already provided
+    adopt_chapters(mp.get_property_native("chapter-list"))
 
     -- Apply initial Night Mode if requested and not already present
     local night_present = has_night_filter()

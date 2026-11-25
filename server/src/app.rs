@@ -41,6 +41,7 @@ pub struct App {
     pub xinfo: Mutex<HashMap<String, (i64, Arc<Value>)>>,
     pub tri: RwLock<Option<Arc<Vec<(String, bool, usize, HashSet<[u8; 3]>)>>>>,
     pub skips: crate::intro::Skips,
+    pub skipdb: crate::skipdb::SkipDb,
     pub remote: crate::remote::Remote,
     pub jobs: crate::sync::Jobs,
     pub cast: crate::cast::Cast,

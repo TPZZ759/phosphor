@@ -3323,7 +3323,8 @@ const Player = (() => {
       night: localGet('night', '0') === '1', deint: !!(o.live && localGet('di.' + o.id, '0') === '1'),
       isAnime: !!o.isAnime, skips: SKIPS, credits,
       hasNext: !!o.next, nextLabel: o.next?.label || '', autoplay: localGet('autoplay', '1') === '1',
-      autoskip: localGet('autoskip', '0') === '1',
+      autoskip: localGet('autoskip', '1') === '1',
+      autoskipCredits: localGet('autoSkipCredits', '1') === '1',
       audioDelay: +localGet('ad.' + sk(), 0) || 0, subDelay: +localGet('subshift.' + sk(), 0) || 0,
       progress: o.live ? {} : { key: o.progressKey, item: o.item, tmdb: o.tmdb, historyKind: o.historyKind, historyTitle: o.historyTitle },
     };
@@ -3360,7 +3361,7 @@ const Player = (() => {
           toast(`Playing next: ${o.next.label}`);
           return o.next.go();
         }
-        if (done?.finished && o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 3) {
+        if (done?.finished && o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 10) {
           AUTOPLAY.chain++;
           toast(`Up next: ${o.next.label}`);
           return o.next.go();
@@ -3486,7 +3487,14 @@ const Player = (() => {
           attempts = buildAttempts(); ai = 0;
         }
       }
-      const pq = new URLSearchParams(); if (o.ext) pq.set('ext', o.ext); if (o.kind === 'series' && o.sid) { pq.set('sid', o.sid); pq.set('s', o.season); pq.set('n', o.epn); }
+      const pq = new URLSearchParams();
+      if (o.ext) pq.set('ext', o.ext);
+      if (o.kind === 'series' && o.sid) {
+        pq.set('sid', o.sid); pq.set('s', o.season); pq.set('n', o.epn);
+        if (o.tmdb) pq.set('tmdb', o.tmdb);
+        if (o.imdb) pq.set('imdb', o.imdb);
+        if (o.isAnime) pq.set('anime', '1');
+      }
       const p0 = await api(`/api/probe/${o.kind}/${o.id}?${pq}`).catch(() => null);
       if (!o || o !== opts) return;
       probe = p0;
@@ -3521,7 +3529,12 @@ const Player = (() => {
       applyTracks(null, null);
       if (offset > 5) toast(`Resuming from ${fmtTime(offset)}`);
       SKIPS = (probe?.skips || []).slice();
-      if (Array.isArray(probe?.intro)) SKIPS.push({ s: Math.max(0, probe.intro[0] - 1), e: probe.intro[1], title: 'Intro' });
+      if (Array.isArray(probe?.intro) && !SKIPS.some((x) => /intro|opening/i.test(x.title || ''))) {
+        SKIPS.push({ s: Math.max(0, probe.intro[0] - 1), e: probe.intro[1], title: 'Intro' });
+      }
+      if (Array.isArray(probe?.recap) && !SKIPS.some((x) => /recap|previously/i.test(x.title || ''))) {
+        SKIPS.unshift({ s: Math.max(0, probe.recap[0] - 1), e: probe.recap[1], title: 'Recap' });
+      }
       credits = typeof probe?.credits === 'number' ? probe.credits : null;
       const ql = qLabel(probe?.pic, probe?.audio); if (ql) $('#pSub').insertAdjacentHTML('beforeend', ` <span class="qbadge">${esc(ql)}</span>`);
       if (proRule(probe?.pic) && (await proInfo()).available) { renderSources(); setMediaSession(); if (await toPro()) return; }
@@ -3688,30 +3701,48 @@ const Player = (() => {
     let btn = $('#pSkip', el);
     if (sk && !btn) { btn = document.createElement('button'); btn.id = 'pSkip'; btn.className = 'btn btn-primary skip-btn'; el.appendChild(btn); }
     if (btn) { if (!sk) btn.remove(); else { btn.textContent = /recap|previously/i.test(sk.title) ? 'Skip recap' : 'Skip intro'; btn.onclick = () => { skipped.add(sk); seekTo(sk.e); }; } }
-    if (sk && started && !skipped.has(sk) && localGet('autoskip', '0') === '1' && /intro|opening/i.test(sk.title)) { skipped.add(sk); toast('Skipped the intro'); seekTo(sk.e); return; }
+    if (sk && started && !skipped.has(sk) && localGet('autoskip', '1') === '1' && /intro|opening|recap|previously/i.test(sk.title)) {
+      skipped.add(sk);
+      toast(/recap|previously/i.test(sk.title) ? 'Skipped the recap' : 'Skipped the intro');
+      seekTo(sk.e);
+      return;
+    }
     if (duration) {
       const pct = Math.min(100, (p / duration) * 100);
       const f = $('#pSeek .fill'); if (f) { f.style.width = pct + '%'; $('#pSeek .knob').style.left = pct + '%'; }
       $('#pTime').textContent = `${fmtTime(p)} / ${fmtTime(duration)}`;
-      const nextAt = credits && credits > duration * 0.6 ? credits : duration - 40;
+      const nextAt = credits && credits > duration * 0.55 ? credits : duration - 40;
       if (o.next && !nextShown && p >= nextAt && p > 60) showNextUp();
     } else $('#pTime').textContent = fmtTime(p);
   }
 
-  // Up next at the end credits: counts down and plays the next episode (unless switched off, or
-  // three episodes have auto-played with nobody touching anything: then it asks first).
+  // Up next at the end credits: counts down and plays the next episode (fast 3s auto-skip when
+  // end credits are detected and autoSkipCredits is on; pauses to ask after 10 episodes unattended).
   function showNextUp() {
     nextShown = true;
-    const auto = localGet('autoplay', '1') === '1'; const ask = AUTOPLAY.chain >= 3;
+    const auto = localGet('autoplay', '1') === '1'; const ask = AUTOPLAY.chain >= 10;
+    const hasKnownCredits = !!(credits && duration && credits > duration * 0.55);
+    const fastCredits = auto && !ask && hasKnownCredits && localGet('autoSkipCredits', '1') === '1';
     const n = document.createElement('div'); n.className = 'next-up';
-    n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : 'Up next'}</small><b>${esc(o.next.label)}</b></div>
+    n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : fastCredits ? 'Skipping credits · Up next' : 'Up next'}</small><b>${esc(o.next.label)}</b></div>
       <div class="nu-btns"><button class="btn btn-primary btn-sm" id="nuPlay">${I.play}<span>${ask ? 'Keep watching' : 'Play now'}</span></button><button class="btn btn-ghost btn-sm" id="nuStay">${credits ? 'Watch credits' : 'Dismiss'}</button></div>`;
     el.appendChild(n);
-    let left = 10; let t = null;
+    let left = fastCredits ? 3 : 10; let t = null;
     const go = (byUser) => { clearInterval(t); if (byUser) AUTOPLAY.chain = 0; else AUTOPLAY.chain++; o.next.go(); };
     $('#nuPlay', n).onclick = () => go(true);
     $('#nuStay', n).onclick = () => { clearInterval(t); n.remove(); };
-    if (auto && !ask) { const lab = $('#nuPlay span', n); lab.textContent = `Next episode in ${left}`; t = setInterval(() => { if (!o || !n.isConnected) return clearInterval(t); if (video.paused) return; left--; lab.textContent = `Next episode in ${left}`; if (left <= 0) go(false); }, 1000); }
+    if (auto && !ask) {
+      const lab = $('#nuPlay span', n);
+      const labelFor = (s) => (fastCredits ? `Skipping credits in ${s}s` : `Next episode in ${s}`);
+      lab.textContent = labelFor(left);
+      t = setInterval(() => {
+        if (!o || !n.isConnected) return clearInterval(t);
+        if (video.paused) return;
+        left--;
+        lab.textContent = labelFor(left);
+        if (left <= 0) go(false);
+      }, 1000);
+    }
   }
 
   function wire() {
@@ -3750,9 +3781,9 @@ const Player = (() => {
       if (!o) return;
       if (o.live) return load();
       // the stream stopped well before the end (connection dropped): that's not the end of the film
-      const realEnd = credits && credits > duration * 0.6 ? credits - 30 : duration - 90;
+      const realEnd = credits && credits > duration * 0.55 ? credits - 30 : duration - 90;
       if (duration && pos() < realEnd && resumeHere()) return;
-      save(); if (o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 3) { AUTOPLAY.chain++; o.next.go(); } else close();
+      save(); if (o.next && localGet('autoplay', '1') === '1' && AUTOPLAY.chain < 10) { AUTOPLAY.chain++; o.next.go(); } else close();
     });
     video.addEventListener('pause', () => { $('#pPlay').innerHTML = I.play; pausedSaver(); });
     video.addEventListener('play', () => { $('#pPlay').innerHTML = I.pause; clearTimeout(saverTimer); });
@@ -4125,8 +4156,14 @@ const langName = (l) => LANGS[(l || '').toLowerCase()] || (l && l !== 'und' ? l.
 
 // ---------------------------------------------------------------- settings
 async function openSettings() {
-  const [s, st, acct, prefs] = await Promise.all([api('/api/settings'), api('/api/status'), api('/api/account?fresh=1').catch(() => null), api('/api/prefs')]);
+  const [s, st, acct, prefs, skipStats] = await Promise.all([api('/api/settings'), api('/api/status'), api('/api/account?fresh=1').catch(() => null), api('/api/prefs'), api('/api/skips/stats').catch(() => null)]);
   const ago = st.lastSync ? Math.round((Date.now() - st.lastSync) / 3600e3) : null;
+  const autoplayOn = localGet('autoplay', prefs.autoplay === false ? '0' : '1') === '1';
+  const autoskipOn = localGet('autoskip', prefs.autoskip === false ? '0' : '1') === '1';
+  const autoskipCredOn = localGet('autoSkipCredits', prefs.autoSkipCredits === false ? '0' : '1') === '1';
+  const skipCov = skipStats && (skipStats.matched || skipStats.audioMatched)
+    ? ` Cached so far: <b>${(skipStats.matched || 0).toLocaleString()}</b> episodes across <b>${(skipStats.shows || 0).toLocaleString()}</b> shows${skipStats.audioMatched ? ` + <b>${skipStats.audioMatched.toLocaleString()}</b> audio-matched` : ''}.`
+    : '';
   openModal(`<div class="sheet settings"><button class="close" aria-label="Close">${I.close}</button>
     <h2>Settings</h2><p>Everything runs on this PC. Your viewing history stays local.</p>
     <h4>Trending data (TMDB) ${s.tmdbKeySet ? '<span class="ok">· connected</span>' : ''}</h4>
@@ -4154,11 +4191,12 @@ async function openSettings() {
       <span>Last refresh</span><b>${ago === null ? '—' : ago < 1 ? 'under an hour ago' : `${ago}h ago`}${st.syncing ? ' · refreshing now' : ''}</b><span>Server</span><b>${esc(s.active)}</b></div>
     <div class="btns" style="margin-top:14px"><button class="btn btn-ghost btn-sm" id="syncNow">Refresh catalogue now</button></div>
     <h4>Playback</h4>
-    <div class="hide-grid"><label class="tog"><input type="checkbox" id="optAutoplay" ${localGet('autoplay', '1') === '1' ? 'checked' : ''}> Play the next episode automatically</label>
-      <label class="tog"><input type="checkbox" id="optAutoskip" ${localGet('autoskip', '0') === '1' ? 'checked' : ''}> Skip intros automatically</label>
+    <div class="hide-grid"><label class="tog"><input type="checkbox" id="optAutoplay" ${autoplayOn ? 'checked' : ''}> Play the next episode automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoskip" ${autoskipOn ? 'checked' : ''}> Skip intros &amp; recaps automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoskipCredits" ${autoskipCredOn ? 'checked' : ''}> Skip end credits automatically</label>
       <label class="tog"><input type="checkbox" id="optSkipFillerSet" ${prefs.skipFiller ? 'checked' : ''}> Skip anime filler episodes automatically</label>
       <label class="tog"><input type="checkbox" id="optTv" ${document.body.classList.contains('tv') ? 'checked' : ''}> TV mode (big screen, arrows / gamepad)</label></div>
-    <p class="muted">Intros and end credits are detected from the audio, using episodes you watch and short clips fetched only while nothing is playing and your account is free. When a version stutters, playback moves to another copy of the same title, and the smoothest copy is picked first next time.</p>
+    <p class="muted">Intros, recaps and end credits combine MKV chapters, crowd-sourced TV &amp; anime skip databases (IntroDB, TheIntroDB, AniSkip — zero provider connections) and local audio fingerprinting.${skipCov} When a version stutters, playback moves to another copy of the same title, and the smoothest copy is picked first next time.</p>
     <h4>Picture & display</h4><div id="dispBox"><p>…</p></div>
     <h4>System & network health</h4><div id="sysHealthBox"><p>…</p></div>
     <h4>Phone remote</h4><div id="remoteBox"><p>…</p></div>
@@ -4185,8 +4223,9 @@ async function openSettings() {
     try { await post('/api/settings', { omdbKey: v }); toast('OMDb connected. Scores now show on detail pages'); closeModal(); }
     catch (e) { toast(e.message); $('#saveOmdb').textContent = 'Save'; }
   };
-  $('#optAutoplay').onchange = (e) => localSet('autoplay', e.target.checked ? '1' : '0');
-  $('#optAutoskip').onchange = (e) => localSet('autoskip', e.target.checked ? '1' : '0');
+  $('#optAutoplay').onchange = (e) => { localSet('autoplay', e.target.checked ? '1' : '0'); post('/api/prefs', { autoplay: e.target.checked }).catch(() => {}); };
+  $('#optAutoskip').onchange = (e) => { localSet('autoskip', e.target.checked ? '1' : '0'); post('/api/prefs', { autoskip: e.target.checked }).catch(() => {}); };
+  $('#optAutoskipCredits').onchange = (e) => { localSet('autoSkipCredits', e.target.checked ? '1' : '0'); post('/api/prefs', { autoSkipCredits: e.target.checked }).catch(() => {}); };
   $('#optSkipFillerSet').onchange = (e) => post('/api/prefs', { skipFiller: e.target.checked }).then(() => toast(e.target.checked ? 'Anime filler skipping on' : 'Anime filler skipping off')).catch(() => {});
   $('#optTv').onchange = (e) => setTvMode(e.target.checked);
   renderRemote(); renderTrakt(); renderDisplay(prefs); renderSysHealth();
