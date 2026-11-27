@@ -3763,19 +3763,6 @@ const Player = (() => {
     } else { if (ss) ss.hidden = true; if (subSel >= 0 || subSel === -3) setSubs(-1); }
   }
 
-  // ---- connection guard: never silently kick another device off the single connection.
-  async function guardOk() {
-    const pf = await api(`/api/preflight?pg=${PAGE_ID}`).catch(() => ({}));
-    if (!pf.busy) return true;
-    spin(false);
-    return new Promise((resolve) => {
-      showMsg(pf.otherWindow ? `<h4>Playing in another window</h4><p>This app is already playing something in another window. Your account allows one stream, so playing here will stop that one.</p>` : `<h4>Your account is in use</h4><p>Another device is streaming on this account right now. It only allows one stream, so playing here will stop it.</p>
-        <div class="btns" style="justify-content:center"><button class="btn btn-primary btn-sm" id="pTake">Play here anyway</button><button class="btn btn-ghost btn-sm" id="pCancel">Cancel</button></div>`);
-      $('#pTake').onclick = () => { showMsg(null); resolve(true); };
-      $('#pCancel').onclick = () => { resolve(false); close(); };
-    });
-  }
-
   async function open(opts) {
     const my = ++openGen;
     try { document.activeElement?.blur?.(); } catch {}
@@ -3851,7 +3838,6 @@ const Player = (() => {
     wire(); startOledCare(); focusPlayer();
     proInfo().then((p) => { if (p.available && $('#pPro')) $('#pPro').hidden = false; });
     spin(true, 'Loading…');
-    if (!(await guardOk())) return;
     if (!o || o !== opts) return;
     if (!o.live && !o.catchup) {
       // Series: resolve ranked/picked version BEFORE probing so we open directly on the best copy
