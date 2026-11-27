@@ -93,17 +93,14 @@ pub fn best_match(a: &[u32], b: &[u32], min_secs: f64) -> Option<(f64, f64, f64,
     Some((s as f64 / FPS, e as f64 / FPS, (s as i64 + off) as f64 / FPS, (e as i64 + off) as f64 / FPS))
 }
 
-#[cfg(test)]
-mod tests {}
-
 // ---------------------------------------------------------------- per-episode store + analysis
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-pub const HEAD_SECS: f64 = 330.0; // intros almost always finish within the first ~5 minutes
-pub const TAIL_SECS: f64 = 300.0;
+pub const HEAD_SECS: f64 = 420.0; // 7 min: catches late anime cold-open OPs (e.g. JJK, 7DS)
+pub const TAIL_SECS: f64 = 360.0; // 6 min: catches anime EDs followed by 2-3.5 min C-part epilogues
 
 pub struct Skips { dir: PathBuf, file: PathBuf, db: Mutex<Value>, pub cancel: AtomicBool, pub busy: AtomicBool }
 
@@ -127,49 +124,89 @@ impl Skips {
         })
     }
     pub fn has(&self, ep: i64, which: &str) -> bool { self.dir.join(format!("{ep}_{which}.fp")).exists() }
-    /// Store a fingerprint ("h" = head starting at 0, "t" = tail starting at `start` seconds).
+    pub fn fp_secs(&self, ep: i64, which: &str) -> f64 {
+        std::fs::metadata(self.dir.join(format!("{ep}_{which}.fp")))
+            .map(|m| (m.len() / 4) as f64 / FPS)
+            .unwrap_or(0.0)
+    }
+    /// Store a fingerprint ("h" = head starting at `start`, "t" = tail starting at `start` seconds).
     pub fn put(&self, ep: i64, which: &str, fp: &[u32], start: f64) {
         if fp.len() < (30.0 * FPS) as usize { return; }
         let _ = std::fs::write(self.dir.join(format!("{ep}_{which}.fp")), to_bytes(fp));
-        if which == "t" { self.db.lock().unwrap()["eps"][ep.to_string()]["tailStart"] = json!(start); }
+        let mut g = self.db.lock().unwrap();
+        let e = &mut g["eps"][ep.to_string()];
+        if e.is_null() { *e = json!({}); }
+        if which == "h" { e["headStart"] = json!(start); }
+        if which == "t" { e["tailStart"] = json!(start); }
+        drop(g);
         self.save();
     }
     fn load(&self, ep: i64, which: &str) -> Option<Vec<u32>> { std::fs::read(self.dir.join(format!("{ep}_{which}.fp"))).ok().map(|b| from_bytes(&b)) }
 
     /// Re-run detection for every episode of a series that has fingerprints.
+    /// Supports both arbitrary `headStart` offsets AND mid-tail anime EDs with C-part epilogues,
+    /// storing exact `[intro_s, intro_e]`, `credits`, and `creditsEnd`!
     pub fn analyze(&self, sid: i64) {
-        let eps: Vec<(i64, i64, i64, f64)> = {
+        let eps: Vec<(i64, i64, i64, f64, f64, f64)> = {
             let g = self.db.lock().unwrap();
             g["eps"].as_object().map(|m| m.iter().filter(|(_, v)| v["sid"].as_i64() == Some(sid))
-                .filter_map(|(k, v)| Some((k.parse().ok()?, v["season"].as_i64().unwrap_or(0), v["n"].as_i64().unwrap_or(0), v["tailStart"].as_f64().unwrap_or(0.0)))).collect()).unwrap_or_default()
+                .filter_map(|(k, v)| Some((
+                    k.parse().ok()?,
+                    v["season"].as_i64().unwrap_or(0),
+                    v["n"].as_i64().unwrap_or(0),
+                    v["headStart"].as_f64().unwrap_or(0.0),
+                    v["tailStart"].as_f64().unwrap_or(0.0),
+                    v["dur"].as_f64().unwrap_or(0.0),
+                ))).collect()).unwrap_or_default()
         };
         let mut found = 0;
-        for &(ep, season, n, tail_start) in &eps {
+        for &(ep, season, n, head_start, tail_start, dur) in &eps {
             // compare with the nearest episodes (same season first)
-            let mut others: Vec<&(i64, i64, i64, f64)> = eps.iter().filter(|o| o.0 != ep).collect();
+            let mut others: Vec<&(i64, i64, i64, f64, f64, f64)> = eps.iter().filter(|o| o.0 != ep).collect();
             others.sort_by_key(|o| ((o.1 != season) as i64, (o.2 - n).abs()));
-            let mut intro: Option<(f64, f64)> = None; let mut credits: Option<f64> = None;
+            let mut intro: Option<(f64, f64)> = None;
+            let mut credits: Option<(f64, f64)> = None;
             if let Some(h) = self.load(ep, "h") {
                 let mut votes: Vec<(f64, f64)> = vec![];
-                for o in others.iter().take(4) { if let Some(oh) = self.load(o.0, "h") {
-                    if let Some(m) = best_match(&h, &oh, 12.0) { if m.1 - m.0 <= 150.0 { votes.push((m.0, m.1)); } }
-                } }
-                // the longest stretch seen at a consistent position
-                votes.sort_by(|a, b| (b.1 - b.0).partial_cmp(&(a.1 - a.0)).unwrap());
+                for o in others.iter().take(5) {
+                    if let Some(oh) = self.load(o.0, "h") {
+                        if let Some(m) = best_match(&h, &oh, 12.0) {
+                            let len = m.1 - m.0;
+                            if len <= 150.0 {
+                                votes.push((head_start + m.0, head_start + m.1));
+                            }
+                        }
+                    }
+                }
+                votes.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
                 intro = votes.first().copied();
             }
             if let Some(t) = self.load(ep, "t") {
                 let tail_len = t.len() as f64 / FPS;
-                let mut best: Option<f64> = None;
-                for o in others.iter().take(4) { if let Some(ot) = self.load(o.0, "t") {
-                    // shared end-credits music running to (near) the end of what we captured
-                    if let Some(m) = best_match(&t, &ot, 10.0) { if m.1 > tail_len - 25.0 { let st = tail_start + m.0; best = Some(best.map_or(st, |b: f64| b.min(st))); } }
-                } }
-                credits = best;
+                let mut tail_votes: Vec<(f64, f64)> = vec![];
+                for o in others.iter().take(5) {
+                    if let Some(ot) = self.load(o.0, "t") {
+                        if let Some(m) = best_match(&t, &ot, 10.0) {
+                            let len = m.1 - m.0;
+                            if len > 165.0 { continue; }
+                            let st = tail_start + m.0;
+                            let en = tail_start + m.1;
+                            let near_end = m.1 > tail_len - 30.0 || (dur > 120.0 && dur - en < 30.0);
+                            // Accept EITHER a full theme song (>= 45s, e.g. 90s anime ED before a 2-3 min C-part!)
+                            // OR a shorter >= 10s end-credits sting running to near EOF.
+                            if len >= 45.0 || near_end {
+                                tail_votes.push((st, en));
+                            }
+                        }
+                    }
+                }
+                tail_votes.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
+                credits = tail_votes.first().copied();
             }
             let mut g = self.db.lock().unwrap(); let e = &mut g["eps"][ep.to_string()];
             e["intro"] = intro.map(|(s, x)| json!([(s * 10.0).round() / 10.0, (x * 10.0).round() / 10.0])).unwrap_or(Value::Null);
-            e["credits"] = credits.map(|c| json!((c * 10.0).round() / 10.0)).unwrap_or(Value::Null);
+            e["credits"] = credits.map(|(s, _)| json!((s * 10.0).round() / 10.0)).unwrap_or(Value::Null);
+            e["creditsEnd"] = credits.map(|(_, x)| json!((x * 10.0).round() / 10.0)).unwrap_or(Value::Null);
             if intro.is_some() { found += 1; }
         }
         self.save();
@@ -178,23 +215,43 @@ impl Skips {
 }
 
 /// Fingerprint the head/tail of a finished playback session's audio tap (no extra connection).
+/// Captures partial head/tail clips even when the viewer skipped an OP/ED or sought mid-episode,
+/// upgrading stored fingerprints whenever a longer span becomes available.
 pub fn from_session(sk: &Skips, pcm: &Path, ep: i64, sid: i64, start: f64, dur: f64) {
     let Ok(meta) = std::fs::metadata(pcm) else { return };
     let secs = meta.len() as f64 / (2.0 * RATE as f64);
     let read = |from: f64, len: f64| -> Vec<i16> {
         use std::io::{Read, Seek, SeekFrom};
         let Ok(mut f) = std::fs::File::open(pcm) else { return vec![] };
-        let off = ((from * RATE as f64) as u64) * 2; let n = ((len * RATE as f64) as usize) * 2;
+        let off = ((from.max(0.0) * RATE as f64) as u64) * 2;
+        let n = ((len.max(0.0) * RATE as f64) as usize) * 2;
+        if n == 0 { return vec![]; }
         let mut b = vec![0u8; n]; if f.seek(SeekFrom::Start(off)).is_err() { return vec![]; }
         let got = f.read(&mut b).unwrap_or(0); let mut total = got;
         while total < n { match f.read(&mut b[total..]) { Ok(0) | Err(_) => break, Ok(k) => total += k } }
         b.truncate(total); b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
     };
     let mut changed = false;
-    if start < 2.0 && secs >= HEAD_SECS - 5.0 && !sk.has(ep, "h") { sk.put(ep, "h", &fingerprint(&read(0.0, HEAD_SECS)), 0.0); changed = true; }
-    if dur > 600.0 && start + secs >= dur - 20.0 && !sk.has(ep, "t") {
-        let from = (secs - TAIL_SECS).max(0.0);
-        sk.put(ep, "t", &fingerprint(&read(from, TAIL_SECS)), start + from); changed = true;
+    // Head window: capture any span overlapping [0, HEAD_SECS] that is >= 95s (and longer than any existing clip)
+    if start < HEAD_SECS - 95.0 {
+        let head_end = (start + secs).min(HEAD_SECS);
+        let head_len = head_end - start;
+        if head_len >= 95.0 && head_len > sk.fp_secs(ep, "h") + 15.0 {
+            sk.put(ep, "h", &fingerprint(&read(0.0, head_len)), start);
+            changed = true;
+        }
+    }
+    // Tail window: capture any span overlapping [dur - TAIL_SECS, dur] that is >= 95s and reaches within 240s of EOF
+    if dur > 600.0 {
+        let tail_win_s = (dur - TAIL_SECS).max(0.0);
+        let span_s = start.max(tail_win_s);
+        let span_e = (start + secs).min(dur);
+        let span_len = span_e - span_s;
+        if span_len >= 95.0 && span_e >= dur - 240.0 && span_len > sk.fp_secs(ep, "t") + 15.0 {
+            let from_pcm = (span_s - start).max(0.0);
+            sk.put(ep, "t", &fingerprint(&read(from_pcm, span_len)), span_s);
+            changed = true;
+        }
     }
     let _ = std::fs::remove_file(pcm);
     if changed { sk.analyze(sid); }
@@ -216,4 +273,71 @@ pub async fn grab(sk: &Skips, url: &str, ua: &str, from: f64, len: f64) -> Optio
     let _ = child.wait().await;
     if bytes.len() < (20.0 * RATE as f64) as usize * 2 { return None; }
     Some(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synth_theme(secs: f64, seed: u32) -> Vec<i16> {
+        let n = (secs * RATE as f64) as usize;
+        let mut out = Vec::with_capacity(n);
+        let mut s = seed.wrapping_add(1);
+        for i in 0..n {
+            let t = i as f64 / RATE as f64;
+            // Changing melodic chord progression with rich harmonic content across 300-3000 Hz
+            let beat = (t * 2.5).floor();
+            let f1 = 330.0 + ((beat * 73.0) % 440.0);
+            let f2 = f1 * 1.498;
+            let f3 = 880.0 + ((beat * 131.0) % 1200.0);
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let nse = (((s >> 16) as i16) as f64 / 32768.0) * 0.12;
+            let v = 0.35 * (2.0 * std::f64::consts::PI * f1 * t).sin()
+                + 0.28 * (2.0 * std::f64::consts::PI * f2 * t).sin()
+                + 0.22 * (2.0 * std::f64::consts::PI * f3 * t).sin()
+                + nse;
+            out.push((v.clamp(-0.95, 0.95) * 28000.0) as i16);
+        }
+        out
+    }
+
+    fn synth_noise(secs: f64, seed: u32) -> Vec<i16> {
+        let n = (secs * RATE as f64) as usize;
+        let mut out = Vec::with_capacity(n);
+        let mut s = seed.wrapping_add(7);
+        for _ in 0..n {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            out.push((((s >> 16) as i16) / 3) as i16);
+        }
+        out
+    }
+
+    #[test]
+    fn detects_cpart_anime_ed_and_credits_end_with_head_offset() {
+        let tmp = std::env::temp_dir().join(format!("tv_intro_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sk = Skips::new(&tmp);
+        let ed = synth_theme(52.0, 42);
+        // Ep 1 tail [1110..1470]: 100s dialogue + 52s ED [1210..1262] + 108s C-part story!
+        let mut t1 = synth_noise(100.0, 1);
+        t1.extend_from_slice(&ed);
+        t1.extend_from_slice(&synth_noise(108.0, 2));
+        // Ep 2 tail [1110..1470]: 70s dialogue + 52s ED [1180..1232] + 138s C-part story!
+        let mut t2 = synth_noise(70.0, 3);
+        t2.extend_from_slice(&ed);
+        t2.extend_from_slice(&synth_noise(138.0, 4));
+
+        sk.register(101, 999, 1, 1, 1470.0);
+        sk.register(102, 999, 1, 2, 1470.0);
+        sk.put(101, "t", &fingerprint(&t1), 1110.0);
+        sk.put(102, "t", &fingerprint(&t2), 1110.0);
+        sk.analyze(999);
+
+        let e1 = sk.entry(101);
+        let c1 = e1["credits"].as_f64().expect("ep1 credits");
+        let ce1 = e1["creditsEnd"].as_f64().expect("ep1 creditsEnd");
+        assert!((c1 - 1210.0).abs() < 3.0, "expected ep1 ED start ~1210, got {c1}");
+        assert!((ce1 - 1262.0).abs() < 3.0, "expected ep1 ED end ~1262, got {ce1}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

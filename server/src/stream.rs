@@ -44,6 +44,12 @@ impl Streamer {
         Streamer { active: Mutex::new(None), seq: Default::default(), last_stop: Default::default(), sub_dir, probe_file, probes: Mutex::new(probes), markers: Mutex::new((false, false, false, 0.0)), on_stop: Mutex::new(None), bytes: Default::default(), cut: Mutex::new(vec![]), owner: Mutex::new(String::new()), began: Mutex::new((0, String::new(), 0)) }
     }
     pub fn probe_count(&self) -> usize { self.probes.lock().unwrap().len() }
+    pub fn cached_duration(&self, url: &str) -> f64 {
+        self.probes.lock().unwrap().get(&pkey(url))
+            .and_then(|v| v["duration"].as_f64())
+            .filter(|&d| d.is_finite() && d > 0.0)
+            .unwrap_or(0.0)
+    }
     pub fn evict_probe(&self, url: &str) {
         self.probes.lock().unwrap().remove(&pkey(url));
     }
@@ -120,12 +126,14 @@ impl Streamer {
         let skips: Vec<Value> = raw_chapters.iter()
             .filter(|(s, e, t)| crate::re!(r"(?i)\b(intro|opening|op|recap|previously|title sequence|main title)\b").is_match(t) && *e > *s + 4.0 && *e - *s < 300.0)
             .map(|(s, e, t)| json!({ "s": s, "e": e, "title": t })).collect();
-        let chapter_credits: Option<f64> = raw_chapters.iter()
+        let cred_ch: Option<(f64, f64)> = raw_chapters.iter()
             .filter(|(s, _, t)| crate::re!(r"(?i)\b(end credits|credits|outro|ending|ed|end titles|closing)\b").is_match(t) && *s > 60.0 && (dur <= 120.0 || (*s >= dur * 0.55 && *s < dur - 5.0)))
-            .map(|(s, _, _)| *s)
-            .reduce(f64::min);
+            .map(|(s, e, _)| (*s, *e))
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let chapter_credits = cred_ch.map(|x| x.0);
+        let chapter_credits_end = cred_ch.and_then(|(s, e)| (e > s + 5.0).then_some(e));
         let pic = streams.iter().find(|s| s["codec_type"] == "video").map(picture).unwrap_or(json!({}));
-        let mut r = json!({ "v": 2, "duration": dur, "video": video, "audio": audio, "subs": pick_subs(&Value::Array(subs)), "skips": skips, "chapterCredits": chapter_credits, "pic": pic });
+        let mut r = json!({ "v": 2, "duration": dur, "video": video, "audio": audio, "subs": pick_subs(&Value::Array(subs)), "skips": skips, "chapterCredits": chapter_credits, "chapterCreditsEnd": chapter_credits_end, "pic": pic });
         r["pic"]["kbps"] = json!(j["format"]["bit_rate"].as_str().and_then(|x| x.parse::<f64>().ok()).map(|b| (b / 1000.0).round()).unwrap_or(0.0));
         { let mut p = self.probes.lock().unwrap(); p.insert(k, r.clone()); let _ = std::fs::write(&self.probe_file, serde_json::to_vec(&*p).unwrap()); }
         Some(r)

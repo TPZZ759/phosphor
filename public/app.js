@@ -2585,7 +2585,7 @@ const Player = (() => {
   // Fallback chain: each attempt = {id, tx, alt}. On failure we move to the next one.
   let attempts = []; let ai = 0;
   // source health: startup time, stalls, watched time per stream id (feeds best-version ranking)
-  let loadT = 0; let reportedStart = false; let stallAt = 0; let stalls = []; let stallTimer2; let watchedAt = 0; let watchedSecs = 0; let credits = null; let creditsEnd = null; let hasPostCredits = false; let skipped = new Set();
+  let loadT = 0; let reportedStart = false; let stallAt = 0; let stalls = []; let stallTimer2; let watchedAt = 0; let watchedSecs = 0; let credits = null; let creditsEnd = null; let creditsMixed = false; let hasPostCredits = false; let skipped = new Set(); let userDismissed = new Set(); let creditsDismissed = false; let lastAutoSkip = null;
   let subSel = -1; let subTrack = null; let subSeen = 0;
   // resume-in-place budget (network drops), one failure report per version per title, load generation
   let retries = 0; let retryAt = 0; let lastFreeze = 0; let failed = new Set(); let loadGen = 0; let openGen = 0;
@@ -2750,15 +2750,34 @@ const Player = (() => {
     if (old && force !== true) { old.remove(); focusPlayer(); wakeControls(); return; }
     if (old) return;
     closePopovers();
+    const isSeries = !o?.live && o?.kind === 'series';
+    const asIntro = localGet('autoskip', '1') === '1';
+    const asRecap = localGet('autoSkipRecap', '1') === '1';
+    const asEnd = localGet('autoSkipCredits', '1') === '1';
     const m = document.createElement('div'); m.className = 'cast-menu p-menu';
     m.innerHTML = `${!o?.live ? `<div class="pm-sec"><div class="pm-lbl">Playback speed <span>&lt; / &gt;</span></div><div class="pm-pills">${SPEEDS.map((s) => `<button type="button" data-spd="${s}" class="${s === playRate ? 'on' : ''}">${s}×</button>`).join('')}</div></div>` : ''}
       <div class="pm-sec"><div class="pm-lbl">Picture fit <span>Z</span></div><div class="pm-pills">${ZOOMS.map(([k, l]) => `<button type="button" data-zm="${k}" class="${k === zoomMode ? 'on' : ''}">${l}</button>`).join('')}</div></div>
       ${!o?.live ? `<div class="pm-sec"><div class="pm-lbl">Subtitle size</div><div class="pm-pills">${SUB_SIZES.map(([k, l]) => `<button type="button" data-ssz="${k}" class="${k === subSize ? 'on' : ''}">${l}</button>`).join('')}</div></div>` : ''}
+      ${isSeries ? `<div class="pm-sec"><div class="pm-lbl">Auto-skip <span>S / U undo</span></div><div class="pm-pills">
+        <button type="button" data-as="autoskip" class="${asIntro ? 'on' : ''}">${o?.isAnime ? 'Opening' : 'Intro'}</button>
+        <button type="button" data-as="autoSkipRecap" class="${asRecap ? 'on' : ''}">Recap</button>
+        <button type="button" data-as="autoSkipCredits" class="${asEnd ? 'on' : ''}">${o?.isAnime ? 'Ending' : 'Credits'}</button>
+      </div></div>` : ''}
       <button type="button" class="pm-link" id="pmHelp"><span>Keyboard shortcuts</span><kbd>?</kbd></button>`;
     el.appendChild(m);
     $$('[data-spd]', m).forEach((b) => (b.onclick = () => { setSpeed(+b.dataset.spd, true); focusPlayer(); }));
     $$('[data-zm]', m).forEach((b) => (b.onclick = () => { setZoom(b.dataset.zm, true); focusPlayer(); }));
     $$('[data-ssz]', m).forEach((b) => (b.onclick = () => { setSubSize(b.dataset.ssz, true); focusPlayer(); }));
+    $$('[data-as]', m).forEach((b) => (b.onclick = () => {
+      const key = b.dataset.as;
+      const next = localGet(key, '1') !== '1';
+      localSet(key, next ? '1' : '0');
+      b.classList.toggle('on', next);
+      post('/api/prefs', { [key]: next }).catch(() => {});
+      const lbl = key === 'autoskip' ? (o?.isAnime ? 'Opening' : 'Intro') : key === 'autoSkipRecap' ? 'Recap' : (o?.isAnime ? 'Ending' : 'Credits');
+      showOsd(`Auto-skip ${lbl}: ${next ? 'On' : 'Off'}`);
+      focusPlayer();
+    }));
     $('#pmHelp', m).onclick = () => { m.remove(); toggleShortcutsHelp(true); };
     wakeControls();
     setTimeout(() => document.addEventListener('click', function off(e) {
@@ -2783,7 +2802,8 @@ const Player = (() => {
           <div><kbd>0</kbd>–<kbd>9</kbd><span>Jump to 0%–90%</span></div>
           <div><kbd>,</kbd> <kbd>.</kbd><span>Frame step when paused</span></div>
           <div><kbd>&lt;</kbd> <kbd>&gt;</kbd><span>Playback speed</span></div>
-          <div><kbd>S</kbd> <kbd>N</kbd> <kbd>B</kbd><span>Skip intro · Next · Prev ep</span></div>
+          <div><kbd>S</kbd> <kbd>U</kbd><span>Skip segment · Undo auto-skip</span></div>
+          <div><kbd>N</kbd> <kbd>B</kbd><span>Next / Previous episode</span></div>
         </div>
         <div class="ph-col">
           <div class="ph-sec">Sound, Subtitles &amp; View</div>
@@ -2823,7 +2843,8 @@ const Player = (() => {
     for (const sk of SKIPS) {
       const a = Math.max(0, Math.min(100, (sk.s / duration) * 100));
       const b = Math.max(a, Math.min(100, (sk.e / duration) * 100));
-      if (b - a > 0.2) parts.push(`<i class="seg intro" style="left:${a.toFixed(2)}%;width:${(b - a).toFixed(2)}%"></i>`);
+      const cls = sk.kind === 'ending' ? 'ending' : sk.kind === 'recap' ? 'recap' : 'intro';
+      if (b - a > 0.2) parts.push(`<i class="seg ${cls}${sk.auto === false ? ' manual' : ''}" style="left:${a.toFixed(2)}%;width:${(b - a).toFixed(2)}%"></i>`);
     }
     if (credits && credits > duration * 0.55 && credits < duration) {
       const a = Math.max(0, Math.min(100, (credits / duration) * 100));
@@ -2836,15 +2857,19 @@ const Player = (() => {
   function segmentLabelAt(sec) {
     const sk = SKIPS.find((c) => sec >= c.s && sec <= c.e);
     if (sk) {
+      if (sk.kind === 'ending') return sk.mixed ? 'Ending (Mixed)' : 'Ending';
       const t = sk.title || '';
       if (/recap/i.test(t) && /intro|opening/i.test(t)) return o?.isAnime ? 'Recap + Opening' : 'Recap + Intro';
-      if (/recap|previously/i.test(t)) return 'Recap';
-      return o?.isAnime ? 'Opening' : 'Intro';
+      if (sk.kind === 'recap' || /recap|previously/i.test(t)) return 'Recap';
+      const base = o?.isAnime ? 'Opening' : 'Intro';
+      return sk.mixed ? `${base} (Mixed)` : base;
     }
     if (credits && duration && credits > duration * 0.55 && sec >= credits) {
       if (hasPostCredits && creditsEnd && sec >= creditsEnd) return 'Post-Credits / Preview';
-      return o?.isAnime ? 'Ending' : 'Credits';
+      return o?.isAnime ? (SKIPS.some((c) => c.kind === 'ending') ? 'Final Credits' : 'Ending') : 'Credits';
     }
+    const edSeg = SKIPS.find((c) => c.kind === 'ending');
+    if (edSeg && sec > edSeg.e) return 'Post-Credits / Epilogue';
     return '';
   }
   function updateBufferedBar() {
@@ -3081,6 +3106,12 @@ const Player = (() => {
       const myCtrl = new AbortController(); ctrl = myCtrl;
       let ftyp = null; let moov = null; let pendingMoof = null;
       let startSec = targetSec; let firstMoofDone = false; let initDone = false;
+      // Frame-accurate seek landing: ffmpeg -noaccurate_seek starts at the keyframe BEFORE targetSec
+      // (often 4-8s early in h264 anime!). Hold start until chunks buffer past targetSec (~40ms from spool)
+      // so auto-skip & seeks land on the exact frame instead of playing 5s of leftover OP music.
+      let exactSeekGoal = (!splice && targetSec > 0.5) ? targetSec : null;
+      let playbackStarted = false;
+      const exactStartMs = performance.now();
       let buf = new Uint8Array(0); let bufLen = 0;
 
       const appendBytes = (chunk) => {
@@ -3118,6 +3149,17 @@ const Player = (() => {
           if (fg !== fetchGen || o !== me) break;
           const { value, done } = await reader.read();
           if (done) {
+            if (!playbackStarted && video && fg === fetchGen && o === me) {
+              playbackStarted = true; exactSeekGoal = null;
+              try {
+                if (video.buffered.length) {
+                  const bs = video.buffered.start(video.buffered.length - 1);
+                  const be = video.buffered.end(video.buffered.length - 1);
+                  video.currentTime = Math.max(bs, Math.min(be - 0.05, Math.max(startSec, targetSec)));
+                }
+              } catch {}
+              if (!keepPaused) video.play().catch(() => {}); else video.pause();
+            }
             // Stream ended: if well before film end, reconnect seamlessly from buffered end
             const end = video?.buffered?.length ? video.buffered.end(video.buffered.length - 1) : pos();
             const realEnd = credits && credits > duration * 0.6 ? credits - 30 : duration - 90;
@@ -3197,21 +3239,38 @@ const Player = (() => {
               await enqueue(async () => {
                 if (fg !== fetchGen || !initDone) return;
                 await appendSeg(seg, fg, tsOff, false, spAt);
-                if (isFirst && video && fg === fetchGen && o === me) {
-                  if (!splice) {
-                    const seekGoal = Math.max(startSec, targetSec);
+                if (!playbackStarted && video && fg === fetchGen && o === me) {
+                  if (splice) {
+                    playbackStarted = true;
+                    if (!keepPaused) video.play().catch(() => {});
+                    else video.pause();
+                  } else {
+                    const seekGoal = exactSeekGoal ?? Math.max(startSec, targetSec);
+                    let bs = startSec; let be = startSec;
                     try {
                       if (video.buffered.length) {
-                        const bs = video.buffered.start(video.buffered.length - 1);
-                        const be = video.buffered.end(video.buffered.length - 1);
-                        video.currentTime = Math.max(bs, Math.min(be - 0.1, seekGoal));
-                      } else {
-                        video.currentTime = seekGoal;
+                        for (let bi = video.buffered.length - 1; bi >= 0; bi--) {
+                          if (video.buffered.start(bi) <= Math.max(startSec, seekGoal) + 2) {
+                            bs = video.buffered.start(bi); be = video.buffered.end(bi); break;
+                          }
+                        }
+                        if (be <= bs) {
+                          bs = video.buffered.start(video.buffered.length - 1);
+                          be = video.buffered.end(video.buffered.length - 1);
+                        }
                       }
                     } catch {}
+                    const reachedExact = exactSeekGoal === null || be >= exactSeekGoal + 0.15 || (performance.now() - exactStartMs > 1400);
+                    if (reachedExact) {
+                      playbackStarted = true;
+                      exactSeekGoal = null;
+                      try {
+                        video.currentTime = be > bs ? Math.max(bs, Math.min(be - 0.05, seekGoal)) : seekGoal;
+                      } catch {}
+                      if (!keepPaused) video.play().catch(() => {});
+                      else video.pause();
+                    }
                   }
-                  if (!keepPaused) video.play().catch(() => {});
-                  else video.pause();
                 }
                 // Evict old buffer behind playhead
                 if (sb && !sb.updating && video && video.buffered.length) {
@@ -3514,7 +3573,7 @@ const Player = (() => {
   function replayWithSubs() {
     if (!o || o.live) return;
     const target = Math.max(0, pos() - 8);
-    seekTo(target);
+    seekTo(target, { byUser: true });
     const hadOff = subSel < 0 && subSel !== -3;
     if (hadOff) {
       const enSub = probe?.subs?.find((s) => /^en/i.test(s.lang) && !s.forced) || probe?.subs?.find((s) => /^en/i.test(s.lang));
@@ -3631,6 +3690,7 @@ const Player = (() => {
         ['Dropped frames', q.totalVideoFrames ? `${q.droppedVideoFrames} of ${q.totalVideoFrames}` : '…'],
         ['Sound', a ? (ch >= 6 && SURROUND_OUT ? `5.1 surround (from ${(a.codec || '').toUpperCase()} ${ch >= 8 ? '7.1' : '5.1'})` : ch >= 6 ? `Stereo mix of ${(a.codec || '').toUpperCase()} ${ch >= 8 ? '7.1' : '5.1'} (your output is stereo)` : `Stereo (from ${(a.codec || '').toUpperCase()}${ch === 1 ? ' mono' : ''})`) : o.live ? 'Stereo' : '…'],
         ['Delivery', `${cur().tx ? 'Converted (compatibility mode)' : 'Original stream, untouched'}${mseActive ? ' · MSE' : ''}${cur().label || o.label ? ` · ${esc(cur().label || o.label)}` : ''}`],
+        ...(o.kind === 'series' ? [['Skip data', probe?.skipSource ? `${esc(probe.skipSource)}${SKIPS.some((x) => x.uncertain) ? ' (manual — cuts conflict)' : ''}${SKIPS.some((x) => x.kind === 'ending') ? ' · C-part preserved' : ''}` : 'None']] : []),
       ];
       box.innerHTML = `<b>Playback info</b><button class="stats-x" aria-label="Close">×</button>` + rows.map(([k, v]) => `<div><span>${k}</span><span>${v}</span></div>`).join('');
       $('.stats-x', box).onclick = () => toggleStats();
@@ -3670,9 +3730,10 @@ const Player = (() => {
       fps: pic.fps || o.fps || 0, hdr: !!pic.hdr, dv: pic.dv || 0, bits: pic.bits || (pic.hdr ? 10 : 8),
       h: pic.h || 0, w: pic.w || 0, ch: curAud?.ch || 2, sc: SURROUND_OUT,
       night: localGet('night', '0') === '1', deint: !!(o.live && localGet('di.' + o.id, '0') === '1'),
-      isAnime: !!o.isAnime, skips: SKIPS, credits, creditsEnd, hasPostCredits,
+      isAnime: !!o.isAnime, skips: SKIPS, credits, creditsEnd, creditsMixed, hasPostCredits,
       hasNext: !!o.next, nextLabel: o.next?.label || '', autoplay: localGet('autoplay', '1') === '1',
       autoskip: localGet('autoskip', '1') === '1',
+      autoskipRecap: localGet('autoSkipRecap', '1') === '1',
       autoskipCredits: localGet('autoSkipCredits', '1') === '1',
       audioDelay: +localGet('ad.' + sk(), 0) || 0, subDelay: +localGet('subshift.' + sk(), 0) || 0,
       progress: o.live ? {} : { key: o.progressKey, item: o.item, tmdb: o.tmdb, historyKind: o.historyKind, historyTitle: o.historyTitle },
@@ -3771,7 +3832,7 @@ const Player = (() => {
     document.body.classList.add('playing');
     if (o) await close(true);
     if (my !== openGen) return;
-    o = opts; credits = null; creditsEnd = null; hasPostCredits = false; skipped = new Set(); stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false;
+    o = opts; credits = null; creditsEnd = null; creditsMixed = false; hasPostCredits = false; skipped = new Set(); userDismissed = new Set(); creditsDismissed = false; clearUndoSkip(); stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false;
     subSel = -1; subTrack = null; clearInterval(subTimer);
     mseFailed = false; mseActive = false; mseTarget = offset; mseSessionStart = offset;
     playRate = 1; zoomMode = 'fit'; draggingSeek = false; hoveringCtrl = false;
@@ -3902,15 +3963,16 @@ const Player = (() => {
       if (probe?.duration) duration = probe.duration;
       applyTracks(null, null);
       if (offset > 5) toast(`Resuming from ${fmtTime(offset)}`);
-      SKIPS = (probe?.skips || []).slice();
-      if (Array.isArray(probe?.intro) && !SKIPS.some((x) => /intro|opening/i.test(x.title || ''))) {
-        SKIPS.push({ s: Math.max(0, probe.intro[0] - 1), e: probe.intro[1], title: 'Intro' });
+      SKIPS = (probe?.skips || []).map((x) => ({ ...x }));
+      if (!SKIPS.length && Array.isArray(probe?.intro)) {
+        SKIPS.push({ s: Math.max(0, probe.intro[0]), e: probe.intro[1], title: 'Intro', kind: 'intro', auto: true });
       }
-      if (Array.isArray(probe?.recap) && !SKIPS.some((x) => /recap|previously/i.test(x.title || ''))) {
-        SKIPS.unshift({ s: Math.max(0, probe.recap[0] - 1), e: probe.recap[1], title: 'Recap' });
+      if (!SKIPS.length && Array.isArray(probe?.recap)) {
+        SKIPS.unshift({ s: Math.max(0, probe.recap[0]), e: probe.recap[1], title: 'Recap', kind: 'recap', auto: !o.isAnime });
       }
       credits = typeof probe?.credits === 'number' ? probe.credits : null;
       creditsEnd = typeof probe?.creditsEnd === 'number' ? probe.creditsEnd : null;
+      creditsMixed = !!probe?.creditsMixed;
       hasPostCredits = !!probe?.hasPostCredits;
       renderSeekMarkers();
       const ql = qLabel(probe?.pic, probe?.audio); if (ql) $('#pSub').insertAdjacentHTML('beforeend', ` <span class="qbadge">${esc(ql)}</span>`);
@@ -4048,14 +4110,53 @@ const Player = (() => {
     if (k) k.style.left = pct + '%';
     renderTimeText(targetSec);
   }
-  function seekTo(t) {
+  function clearUndoSkip() {
+    if (lastAutoSkip?.timer) clearTimeout(lastAutoSkip.timer);
+    lastAutoSkip = null;
+    $('#pUndoSkip', el)?.remove();
+  }
+  function showUndoSkip(sk, fromPos, label) {
+    clearUndoSkip();
+    const msg = sk.kind === 'ending' ? `Skipped ${label} → Post-Credits` : `Skipped ${label}`;
+    const btn = document.createElement('div');
+    btn.id = 'pUndoSkip';
+    btn.className = 'skip-undo';
+    btn.innerHTML = `<span>${esc(msg)}</span><button type="button" class="btn btn-ghost btn-sm" id="pUndoBtn">Undo <kbd>U</kbd></button>`;
+    el.appendChild(btn);
+    $('#pUndoBtn', btn).onclick = (e) => { e.stopPropagation(); undoLastSkip(); };
+    const timer = setTimeout(clearUndoSkip, 7500);
+    lastAutoSkip = { sk, from: fromPos, label, timer };
+  }
+  function undoLastSkip() {
+    if (!lastAutoSkip || !o) return false;
+    const { sk, from, label } = lastAutoSkip;
+    userDismissed.add(sk);
+    clearUndoSkip();
+    showOsd(`Undo ${label} · ${fmtTime(from)}`);
+    seekTo(from, { byUser: true });
+    focusPlayer();
+    return true;
+  }
+  function seekTo(t, { byUser = false } = {}) {
     clearTimeout(pendingSeekTimer); pendingSeekTimer = null; pendingSeekTarget = null; pendingLiveBack = null;
     if (o.live) {
       if (liveBufSecs <= 5) return showOsd('Live buffer is still filling…');
       return seekLiveToBack(Math.max(0, liveBufSecs - t));
     }
     if (!duration) return;
+    const prev = pos();
     const clamped = Math.max(0, Math.min(duration - 3, t));
+    if (byUser) {
+      clearUndoSkip();
+      // Manual scrub-back / seek-into immunity: if the viewer explicitly seeks into or rewinds back
+      // before a skip segment, never auto-skip them forward over it again (manual button stays available).
+      for (const c of SKIPS) {
+        if ((clamped >= c.s - 2 && clamped < c.e) || (clamped < prev - 1 && prev >= c.s && clamped < c.e)) {
+          userDismissed.add(c);
+        }
+      }
+      if (!creditsDismissed && credits && clamped < credits - 15) nextShown = false;
+    }
     if (casting) { offset = clamped; tick(); return castCtl('seek', { t: offset }); }
     // MSE instant in-buffer seek (0ms, zero ffmpeg restart, zero subtitle reset!)
     if (mseActive && Mse.isBuffered(clamped)) {
@@ -4102,15 +4203,14 @@ const Player = (() => {
       clearTimeout(pendingSeekTimer);
       pendingSeekTimer = setTimeout(() => {
         const t = pendingSeekTarget; pendingSeekTarget = null; pendingSeekTimer = null;
-        if (o && t !== null) seekTo(t);
+        if (o && t !== null) seekTo(t, { byUser: true });
       }, 200);
       return;
     }
 
     // 0ms instant in-buffer MSE seek!
     if (mseActive && pendingSeekTimer === null && Mse.isBuffered(target)) {
-      video.currentTime = target;
-      tick();
+      seekTo(target, { byUser: true });
       return;
     }
 
@@ -4119,8 +4219,25 @@ const Player = (() => {
     clearTimeout(pendingSeekTimer);
     pendingSeekTimer = setTimeout(() => {
       const t = pendingSeekTarget; pendingSeekTarget = null; pendingSeekTimer = null;
-      if (o && t !== null) seekTo(t);
+      if (o && t !== null) seekTo(t, { byUser: true });
     }, 220);
+  }
+
+  function skipLabelFor(s) {
+    if (!s) return o?.isAnime ? 'Opening' : 'Intro';
+    if (s.kind === 'ending') return s.mixed ? 'Ending (Mixed)' : 'Ending';
+    const t = s.title || '';
+    if (/recap/i.test(t) && /intro|opening/i.test(t)) return o?.isAnime ? 'Recap + Opening' : 'Recap + Intro';
+    if (s.kind === 'recap' || /recap|previously/i.test(t)) return 'Recap';
+    const base = o?.isAnime ? 'Opening' : 'Intro';
+    return s.mixed ? `${base} (Mixed)` : base;
+  }
+  function shouldAutoSkipSeg(sk) {
+    if (!sk || sk.auto === false || skipped.has(sk) || userDismissed.has(sk)) return false;
+    if (sk.kind === 'ending') return localGet('autoSkipCredits', '1') === '1';
+    if (sk.kind === 'recap') return localGet('autoSkipRecap', '1') === '1';
+    if (/intro|opening|recap|previously/i.test(sk.title || '')) return localGet('autoskip', '1') === '1';
+    return false;
   }
 
   function tick() {
@@ -4129,19 +4246,22 @@ const Player = (() => {
     const p = pos();
     updateBufferedBar();
     const sk = SKIPS.find((c) => p >= c.s && p < c.e - 2);
-    const skipLabelFor = (s) => {
-      const t = s?.title || '';
-      if (/recap/i.test(t) && /intro|opening/i.test(t)) return o.isAnime ? 'Recap + Opening' : 'Recap + Intro';
-      if (/recap|previously/i.test(t)) return 'Recap';
-      return o.isAnime ? 'Opening' : 'Intro';
-    };
     let btn = $('#pSkip', el);
     if (sk && !btn) { btn = document.createElement('button'); btn.id = 'pSkip'; btn.className = 'btn btn-primary skip-btn'; el.appendChild(btn); }
-    if (btn) { if (!sk) btn.remove(); else { btn.textContent = `Skip ${skipLabelFor(sk)}`; btn.onclick = () => { skipped.add(sk); seekTo(sk.e); focusPlayer(); }; } }
-    if (sk && started && !skipped.has(sk) && localGet('autoskip', '1') === '1' && /intro|opening|recap|previously/i.test(sk.title)) {
+    if (btn) {
+      if (!sk) btn.remove();
+      else {
+        const lbl = skipLabelFor(sk);
+        btn.textContent = sk.kind === 'ending' ? `Skip ${lbl} → Post-Credits` : `Skip ${lbl}`;
+        btn.onclick = () => { skipped.add(sk); clearUndoSkip(); seekTo(sk.e); showOsd(`Skipped ${lbl}`); focusPlayer(); };
+      }
+    }
+    if (sk && started && p >= sk.s + 0.12 && shouldAutoSkipSeg(sk)) {
+      const fromPos = p;
+      const lbl = skipLabelFor(sk);
       skipped.add(sk);
-      showOsd(`Skipped ${skipLabelFor(sk)}`);
       seekTo(sk.e);
+      showUndoSkip(sk, fromPos, lbl);
       return;
     }
     if (!draggingSeek && pendingSeekTarget === null) {
@@ -4152,8 +4272,17 @@ const Player = (() => {
       renderTimeText(p);
     }
     if (duration) {
-      const nextAt = credits && credits > duration * 0.55 ? credits : duration - 40;
-      if (o.next && !nextShown && p >= nextAt && p > 60) showNextUp();
+      const edSeg = SKIPS.find((c) => c.kind === 'ending');
+      let nextAt;
+      if (credits && credits > duration * 0.55) {
+        nextAt = credits;
+      } else if (edSeg) {
+        // Episode has an in-episode ED followed by a C-part epilogue: NEVER cut off the C-part!
+        nextAt = Math.max(duration - 15, edSeg.e + 10);
+      } else {
+        nextAt = o.isAnime ? duration - 22 : duration - 40;
+      }
+      if (o.next && !nextShown && !creditsDismissed && p >= nextAt && p > 60) showNextUp();
       const now = Date.now();
       if (now - lastPosStateAt > 4000 && navigator.mediaSession?.setPositionState) {
         lastPosStateAt = now;
@@ -4163,14 +4292,14 @@ const Player = (() => {
   }
 
   // Up next at the end credits: counts down and plays the next episode (fast 3s auto-skip when
-  // end credits are detected and autoSkipCredits is on; pauses to ask after 10 episodes unattended).
+  // true end credits are detected and autoSkipCredits is on; gentle 10s on mixed-ed or unknown credits).
   function showNextUp() {
     nextShown = true;
     const auto = localGet('autoplay', '1') === '1'; const ask = AUTOPLAY.chain >= 10;
     const hasKnownCredits = !!(credits && duration && credits > duration * 0.55);
-    const fastCredits = auto && !ask && hasKnownCredits && localGet('autoSkipCredits', '1') === '1';
+    const fastCredits = auto && !ask && hasKnownCredits && !creditsMixed && localGet('autoSkipCredits', '1') === '1';
     const canSkipEd = !!(hasPostCredits && creditsEnd && duration && creditsEnd < duration - 12 && pos() < creditsEnd - 4);
-    const credNoun = o.isAnime ? 'ending' : 'credits';
+    const credNoun = o.isAnime ? (SKIPS.some((c) => c.kind === 'ending') ? 'credits' : 'ending') : 'credits';
     const n = document.createElement('div'); n.className = 'next-up';
     n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : fastCredits ? `Skipping ${credNoun} · Up next` : 'Up next'}</small><b>${esc(o.next.label)}</b></div>
       <div class="nu-btns"><button class="btn btn-primary btn-sm" id="nuPlay">${I.play}<span>${ask ? 'Keep watching' : 'Play now'}</span></button>${canSkipEd ? '<button class="btn btn-ghost btn-sm" id="nuPost">Post-credits →</button>' : ''}<button class="btn btn-ghost btn-sm" id="nuStay">${credits ? `Watch ${credNoun}` : 'Dismiss'}</button></div>`;
@@ -4178,8 +4307,8 @@ const Player = (() => {
     let left = fastCredits ? 3 : 10; let t = null;
     const go = (byUser) => { clearInterval(t); if (byUser) AUTOPLAY.chain = 0; else AUTOPLAY.chain++; o.next.go(); };
     $('#nuPlay', n).onclick = () => go(true);
-    if ($('#nuPost', n)) $('#nuPost', n).onclick = () => { clearInterval(t); n.remove(); showOsd('Skipped Ending → Post-Credits'); seekTo(creditsEnd); focusPlayer(); };
-    $('#nuStay', n).onclick = () => { clearInterval(t); n.remove(); };
+    if ($('#nuPost', n)) $('#nuPost', n).onclick = () => { clearInterval(t); creditsDismissed = true; n.remove(); showOsd('Skipped Ending → Post-Credits'); seekTo(creditsEnd); focusPlayer(); };
+    $('#nuStay', n).onclick = () => { clearInterval(t); creditsDismissed = true; n.remove(); };
     if (auto && !ask) {
       const lab = $('#nuPlay span', n);
       const labelFor = (s) => (fastCredits ? `Skipping ${credNoun} in ${s}s` : `Next episode in ${s}`);
@@ -4339,8 +4468,8 @@ const Player = (() => {
         try { sk.releasePointerCapture(e.pointerId); } catch {}
         if (commit) {
           const f = at(e);
-          if (o.live) seekTo(f * liveBufSecs);
-          else if (duration) seekTo(f * duration);
+          if (o.live) seekTo(f * liveBufSecs, { byUser: true });
+          else if (duration) seekTo(f * duration, { byUser: true });
         }
         sk.blur(); focusPlayer(); wake();
       };
@@ -4545,7 +4674,7 @@ const Player = (() => {
     clearInterval(statsTimer); clearInterval(shiftTimer); clearTimeout(saverTimer); clearTimeout(replaySubTimer); replayPrevSub = null; lastBytes = null; el.style.removeProperty('--shift');
     clearTimeout(pendingSeekTimer); pendingSeekTimer = null; pendingSeekTarget = null; pendingLiveBack = null;
     clearTimeout(hudSeekTimer); hudSeekDir = 0; hudSeekAccum = 0;
-    clearTimeout(osdTimer); clearTimeout(volOsdTimer); clearTimeout(clickTimer); clearTimeout(wheelResetTimer);
+    clearTimeout(osdTimer); clearTimeout(volOsdTimer); clearTimeout(clickTimer); clearTimeout(wheelResetTimer); clearUndoSkip();
     draggingSeek = false; hoveringCtrl = false;
     if (document.pictureInPictureElement && document.pictureInPictureElement === video) { document.exitPictureInPicture().catch(() => {}); }
     save(); flushWatched(); clearInterval(saveTimer); clearInterval(subTimer); clearInterval(syncTimer); clearTimeout(stallTimer); clearTimeout(stallTimer2); clearTimeout(idleTimer);
@@ -4691,11 +4820,11 @@ const Player = (() => {
     if (!e.shiftKey && !e.altKey && /^[0-9]$/.test(e.key) && !o.live && duration > 0) {
       stop();
       const target = (+e.key / 10) * duration;
-      seekTo(target);
+      seekTo(target, { byUser: true });
       showOsd(o.spoilerFree ? `${+e.key * 10}%` : `${fmtTime(target)} (${+e.key * 10}%)`);
       return;
     }
-    if (k === 'home' && !o.live && duration > 0) { stop(); seekTo(0); showOsd('0:00'); return; }
+    if (k === 'home' && !o.live && duration > 0) { stop(); seekTo(0, { byUser: true }); showOsd('0:00'); return; }
     if (k === 'end' && o.live) { stop(); seekLiveToBack(0); return; }
 
     // Speed (< / >) & Frame Step (, / .)
@@ -4716,6 +4845,7 @@ const Player = (() => {
       if (b) { stop(); b.click(); }
       return;
     }
+    if (k === 'u' && lastAutoSkip) { stop(); undoLastSkip(); return; }
     if (k === 'n' && o.next) { stop(); o.next.go(); return; }
     if (k === 'b' && o.prev) { stop(); o.prev.go(); return; }
     if (k === 'g') {
@@ -4783,7 +4913,7 @@ const Player = (() => {
     el.dispatchEvent(new Event('mousemove'));
     if (c === 'toggle') togglePlay(true);
     else if (c === 'seek') seekBy(+v || 0);
-    else if (c === 'seekto' && !o.live) seekTo(+v || 0);
+    else if (c === 'seekto' && !o.live) seekTo(+v || 0, { byUser: true });
     else if (c === 'next' && o.next) o.next.go();
     else if (c === 'last' && o.live) toggleLastChannel();
     else if (c === 'subs') cycleSubs();
@@ -4842,6 +4972,7 @@ async function openSettings() {
   const ago = st.lastSync ? Math.round((Date.now() - st.lastSync) / 3600e3) : null;
   const autoplayOn = localGet('autoplay', prefs.autoplay === false ? '0' : '1') === '1';
   const autoskipOn = localGet('autoskip', prefs.autoskip === false ? '0' : '1') === '1';
+  const autoskipRecapOn = localGet('autoSkipRecap', prefs.autoSkipRecap === false ? '0' : '1') === '1';
   const autoskipCredOn = localGet('autoSkipCredits', prefs.autoSkipCredits === false ? '0' : '1') === '1';
   const skipCov = skipStats && (skipStats.matched || skipStats.audioMatched)
     ? ` Cached so far: <b>${(skipStats.matched || 0).toLocaleString()}</b> episodes across <b>${(skipStats.shows || 0).toLocaleString()}</b> shows${skipStats.audioMatched ? ` + <b>${skipStats.audioMatched.toLocaleString()}</b> audio-matched` : ''}.`
@@ -4874,8 +5005,9 @@ async function openSettings() {
     <div class="btns" style="margin-top:14px"><button class="btn btn-ghost btn-sm" id="syncNow">Refresh catalogue now</button></div>
     <h4>Playback</h4>
     <div class="hide-grid"><label class="tog"><input type="checkbox" id="optAutoplay" ${autoplayOn ? 'checked' : ''}> Play the next episode automatically</label>
-      <label class="tog"><input type="checkbox" id="optAutoskip" ${autoskipOn ? 'checked' : ''}> Skip intros &amp; recaps automatically</label>
-      <label class="tog"><input type="checkbox" id="optAutoskipCredits" ${autoskipCredOn ? 'checked' : ''}> Skip end credits automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoskip" ${autoskipOn ? 'checked' : ''}> Skip intros &amp; openings automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoskipRecap" ${autoskipRecapOn ? 'checked' : ''}> Skip verified recaps automatically</label>
+      <label class="tog"><input type="checkbox" id="optAutoskipCredits" ${autoskipCredOn ? 'checked' : ''}> Skip endings &amp; credits automatically (preserves anime post-credits scenes)</label>
       <label class="tog"><input type="checkbox" id="optSkipFillerSet" ${prefs.skipFiller ? 'checked' : ''}> Skip anime filler episodes automatically</label>
       <label class="tog"><input type="checkbox" id="optTv" ${document.body.classList.contains('tv') ? 'checked' : ''}> TV mode (big screen, arrows / gamepad)</label></div>
     <p class="muted">Intros, recaps and end credits combine MKV chapters, crowd-sourced TV &amp; anime skip databases (IntroDB, TheIntroDB, AniSkip — zero provider connections) and local audio fingerprinting.${skipCov} When a version stutters, playback moves to another copy of the same title, and the smoothest copy is picked first next time.</p>
@@ -4907,6 +5039,7 @@ async function openSettings() {
   };
   $('#optAutoplay').onchange = (e) => { localSet('autoplay', e.target.checked ? '1' : '0'); post('/api/prefs', { autoplay: e.target.checked }).catch(() => {}); };
   $('#optAutoskip').onchange = (e) => { localSet('autoskip', e.target.checked ? '1' : '0'); post('/api/prefs', { autoskip: e.target.checked }).catch(() => {}); };
+  $('#optAutoskipRecap').onchange = (e) => { localSet('autoSkipRecap', e.target.checked ? '1' : '0'); post('/api/prefs', { autoSkipRecap: e.target.checked }).catch(() => {}); };
   $('#optAutoskipCredits').onchange = (e) => { localSet('autoSkipCredits', e.target.checked ? '1' : '0'); post('/api/prefs', { autoSkipCredits: e.target.checked }).catch(() => {}); };
   $('#optSkipFillerSet').onchange = (e) => post('/api/prefs', { skipFiller: e.target.checked }).then(() => toast(e.target.checked ? 'Anime filler skipping on' : 'Anime filler skipping off')).catch(() => {});
   $('#optTv').onchange = (e) => setTvMode(e.target.checked);

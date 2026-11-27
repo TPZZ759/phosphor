@@ -25,7 +25,7 @@ pub struct Session {
     pub dur: f64,
     pub title: String,
     pub live: bool,
-    pub skips: Vec<(f64, f64, String)>,
+    pub skips: Vec<(f64, f64, String, String, bool)>, // s, e, title, kind, auto
     pub credits: Option<f64>,
     pub autoskip: bool,
     pub skipped: Vec<usize>,
@@ -140,7 +140,7 @@ pub fn control_sync(app: &App, cmd: &str, v: Option<&Value>) -> bool {
         "full" => ipc(json!(["cycle", "fullscreen"])).is_some(),
         "skip" => {
             let target = app.mpv.s.lock().unwrap().as_ref().and_then(|s| {
-                s.skips.iter().find(|(st, en, _)| s.pos >= *st - 2.0 && s.pos < *en - 2.0).map(|(_, en, _)| *en)
+                s.skips.iter().find(|(st, en, _, _, _)| s.pos >= *st - 2.0 && s.pos < *en - 2.0).map(|(_, en, _, _, _)| *en)
             });
             if let Some(en) = target {
                 let _ = ipc(json!(["show-text", "Skipped intro", 2500]));
@@ -390,18 +390,23 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         }
     }
 
-    // Parse intro/recap/credits skips BEFORE spawning mpv so we can pass them into tv_osd.lua!
-    let skips: Vec<(f64, f64, String)> = b["skips"].as_array().map(|arr| {
+    // Parse intro/recap/ending skips BEFORE spawning mpv so we can pass them into tv_osd.lua!
+    let skips: Vec<(f64, f64, String, String, bool)> = b["skips"].as_array().map(|arr| {
         arr.iter().filter_map(|x| {
             let st = x["s"].as_f64()?;
             let en = x["e"].as_f64()?;
-            Some((st, en, x["title"].as_str().unwrap_or("Intro").to_string()))
+            let title = x["title"].as_str().unwrap_or("Intro").to_string();
+            let kind = x["kind"].as_str().unwrap_or("").to_string();
+            let auto = x["auto"].as_bool().unwrap_or(true);
+            Some((st, en, title, kind, auto))
         }).collect()
     }).unwrap_or_default();
     let credits = b["credits"].as_f64().filter(|x| *x > 30.0);
     let credits_end = b["creditsEnd"].as_f64().filter(|x| *x > 35.0);
+    let credits_mixed = b["creditsMixed"].as_bool().unwrap_or(false);
     let has_post_credits = b["hasPostCredits"].as_bool().unwrap_or(false);
     let autoskip = b["autoskip"].as_bool().unwrap_or(true);
+    let autoskip_recap = b["autoskipRecap"].as_bool().unwrap_or(true);
     let autoskip_credits = b["autoskipCredits"].as_bool().unwrap_or(true);
 
     // Custom pure-black OLED Lua OSD + neural GPU shader chain
@@ -430,26 +435,29 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         add_opt("title", title.clone());
         add_opt("sub", sub_label.clone());
         // Combined "Recap + Intro" segment goes to intro_s/intro_e with custom label so mpv performs one seamless skip.
-        let combined = skips.iter().find(|(_, _, l)| {
+        let combined = skips.iter().find(|(_, _, l, _, _)| {
             let ll = l.to_lowercase();
             ll.contains("recap") && (ll.contains("intro") || ll.contains("opening"))
         });
-        if let Some((cst, cen, clab)) = combined {
+        if let Some((cst, cen, clab, _, cauto)) = combined {
             add_opt("intro_s", format!("{cst:.2}"));
             add_opt("intro_e", format!("{cen:.2}"));
             add_opt("intro_label", clab.clone());
+            add_opt("intro_auto", if *cauto { "yes" } else { "no" }.into());
         } else {
-            if let Some((rst, ren, _)) = skips.iter().find(|(_, _, l)| {
-                let ll = l.to_lowercase(); ll.contains("recap") || ll.contains("previously")
+            if let Some((rst, ren, _, _, rauto)) = skips.iter().find(|(_, _, l, k, _)| {
+                let ll = l.to_lowercase(); k == "recap" || ll.contains("recap") || ll.contains("previously")
             }) {
                 add_opt("recap_s", format!("{rst:.2}"));
                 add_opt("recap_e", format!("{ren:.2}"));
+                add_opt("recap_auto", if *rauto { "yes" } else { "no" }.into());
             }
-            if let Some((ist, ien, ilab)) = skips.iter().find(|(_, _, l)| {
-                let ll = l.to_lowercase(); ll.contains("intro") || ll.contains("opening") || ll == "op"
+            if let Some((ist, ien, ilab, _, iauto)) = skips.iter().find(|(_, _, l, k, _)| {
+                let ll = l.to_lowercase(); k == "intro" || ll.contains("intro") || ll.contains("opening") || ll == "op"
             }) {
                 add_opt("intro_s", format!("{ist:.2}"));
                 add_opt("intro_e", format!("{ien:.2}"));
+                add_opt("intro_auto", if *iauto { "yes" } else { "no" }.into());
                 if is_anime && ilab.eq_ignore_ascii_case("intro") {
                     add_opt("intro_label", "Opening".into());
                 } else {
@@ -457,14 +465,22 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
                 }
             }
         }
+        // In-episode anime Ending (ED followed by substantial C-part story)
+        if let Some((est, een, _, _, eauto)) = skips.iter().find(|(_, _, _, k, _)| k == "ending") {
+            add_opt("ed_s", format!("{est:.2}"));
+            add_opt("ed_e", format!("{een:.2}"));
+            add_opt("ed_auto", if *eauto { "yes" } else { "no" }.into());
+        }
         if let Some(cr) = credits { add_opt("credits", format!("{cr:.2}")); }
         if let Some(ce) = credits_end { add_opt("credits_end", format!("{ce:.2}")); }
+        add_opt("credits_mixed", if credits_mixed { "yes" } else { "no" }.into());
         add_opt("has_post_credits", if has_post_credits { "yes" } else { "no" }.into());
         add_opt("is_anime", if is_anime { "yes" } else { "no" }.into());
         add_opt("has_next", if has_next { "yes" } else { "no" }.into());
         add_opt("next_label", next_label.clone());
         add_opt("autoplay", if autoplay { "yes" } else { "no" }.into());
         add_opt("autoskip", if autoskip { "yes" } else { "no" }.into());
+        add_opt("autoskip_recap", if autoskip_recap { "yes" } else { "no" }.into());
         add_opt("autoskip_credits", if autoskip_credits { "yes" } else { "no" }.into());
         add_opt("shader_dir", shader_dir.to_string_lossy().to_string());
         add_opt("shader_preset", shader_preset.into());
@@ -584,10 +600,10 @@ async fn watch(app: Arc<App>, gen: u64) {
                 s.next_triggered = true;
             }
             if !s.has_osd && !s.live && !s.skips.is_empty() {
-                for (i, (st, en, label)) in s.skips.iter().enumerate() {
+                for (i, (st, en, label, _, auto)) in s.skips.iter().enumerate() {
                     if !s.skipped.contains(&i) && s.pos >= *st && s.pos < *en - 2.0 {
                         let ll = label.to_lowercase();
-                        let is_skip = ll.contains("intro") || ll.contains("opening") || ll.contains("recap") || ll.contains("previously");
+                        let is_skip = *auto && (ll.contains("intro") || ll.contains("opening") || ll.contains("recap") || ll.contains("previously") || ll.contains("ending"));
                         s.skipped.push(i);
                         skip_cmd = Some((*en, s.autoskip && is_skip));
                         break;

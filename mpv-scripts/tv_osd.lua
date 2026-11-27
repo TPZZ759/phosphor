@@ -110,17 +110,24 @@ local raw_opts = {
     sub              = "",
     recap_s          = "-1",
     recap_e          = "-1",
+    recap_auto       = "yes",
     intro_s          = "-1",
     intro_e          = "-1",
+    intro_auto       = "yes",
     intro_label      = "Intro",
+    ed_s             = "-1",
+    ed_e             = "-1",
+    ed_auto          = "yes",
     credits          = "-1",
     credits_end      = "-1",
+    credits_mixed    = "no",
     has_post_credits = "no",
     is_anime         = "no",
     has_next         = "no",
     next_label       = "",
     autoplay         = "no",
     autoskip         = "no",
+    autoskip_recap   = "yes",
     autoskip_credits = "yes",
     shader_dir       = "",
     shader_preset    = "off",
@@ -134,17 +141,24 @@ local opts = {
     sub              = "",
     recap_s          = -1,
     recap_e          = -1,
+    recap_auto       = true,
     intro_s          = -1,
     intro_e          = -1,
+    intro_auto       = true,
     intro_label      = "Intro",
+    ed_s             = -1,
+    ed_e             = -1,
+    ed_auto          = true,
     credits          = -1,
     credits_end      = -1,
+    credits_mixed    = false,
     has_post_credits = false,
     is_anime         = false,
     has_next         = false,
     next_label       = "",
     autoplay         = false,
     autoskip         = false,
+    autoskip_recap   = true,
     autoskip_credits = true,
     shader_dir       = "",
     shader_preset    = "off",
@@ -187,7 +201,7 @@ local function resolve_shader_dir()
             return parent .. "\\mpv-shaders"
         end
     end
-    return ".\mpv-shaders"
+    return "mpv-shaders"
 end
 
 local function sync_parsed_opts()
@@ -195,18 +209,25 @@ local function sync_parsed_opts()
     opts.sub              = tostring(raw_opts.sub or "")
     opts.recap_s          = parse_num(raw_opts.recap_s, -1)
     opts.recap_e          = parse_num(raw_opts.recap_e, -1)
+    opts.recap_auto       = parse_bool(raw_opts.recap_auto, true)
     opts.intro_s          = parse_num(raw_opts.intro_s, -1)
     opts.intro_e          = parse_num(raw_opts.intro_e, -1)
+    opts.intro_auto       = parse_bool(raw_opts.intro_auto, true)
     opts.intro_label      = tostring(raw_opts.intro_label or "Intro")
     if opts.intro_label == "" then opts.intro_label = "Intro" end
+    opts.ed_s             = parse_num(raw_opts.ed_s, -1)
+    opts.ed_e             = parse_num(raw_opts.ed_e, -1)
+    opts.ed_auto          = parse_bool(raw_opts.ed_auto, true)
     opts.credits          = parse_num(raw_opts.credits, -1)
     opts.credits_end      = parse_num(raw_opts.credits_end, -1)
+    opts.credits_mixed    = parse_bool(raw_opts.credits_mixed, false)
     opts.has_post_credits = parse_bool(raw_opts.has_post_credits, false)
     opts.is_anime         = parse_bool(raw_opts.is_anime, false)
     opts.has_next         = parse_bool(raw_opts.has_next, false)
     opts.next_label       = tostring(raw_opts.next_label or "")
     opts.autoplay         = parse_bool(raw_opts.autoplay, false)
     opts.autoskip         = parse_bool(raw_opts.autoskip, false)
+    opts.autoskip_recap   = parse_bool(raw_opts.autoskip_recap, true)
     opts.autoskip_credits = parse_bool(raw_opts.autoskip_credits, true)
     opts.shader_dir       = tostring(raw_opts.shader_dir or "")
     opts.shader_preset    = normalize_preset(raw_opts.shader_preset)
@@ -266,14 +287,22 @@ local state = {
     replay_prev_sid = "no",
     replay_prev_vis = true,
 
-    -- Intro & Recap Skip
+    -- Intro, Recap & In-Episode Ending Skip
     intro_visible = false,
-    intro_kind = "intro", -- "recap" | "intro"
+    intro_kind = "intro", -- "recap" | "intro" | "ending"
     recap_autoskipped = false,
     recap_dismissed = false,
     intro_autoskipped = false,
     intro_dismissed = false,
+    ed_autoskipped = false,
+    ed_dismissed = false,
     skip_key_bound = false,
+    undo_from = nil,
+    undo_kind = nil,
+    undo_label = nil,
+    undo_expire = 0,
+    last_time_pos = 0,
+    self_seek_until = 0,
 
     -- Up Next
     up_next_visible = false,
@@ -862,38 +891,97 @@ local function set_skip_key_bound(active)
     end
 end
 
+local function undo_last_autoskip()
+    if not state.undo_from or mp.get_time() > (state.undo_expire or 0) then
+        return
+    end
+    local target = state.undo_from
+    local kind = state.undo_kind
+    local lbl = state.undo_label or "Skip"
+    state.undo_from = nil
+    state.undo_kind = nil
+    state.undo_label = nil
+    state.undo_expire = 0
+    if kind == "recap" then
+        state.recap_autoskipped = true
+    elseif kind == "ending" then
+        state.ed_autoskipped = true
+    else
+        state.intro_autoskipped = true
+    end
+    state.self_seek_until = mp.get_time() + 1.0
+    mp.set_property_number("time-pos", target)
+    show_toast("Undo " .. lbl .. " · " .. fmt_time(target), 2.5)
+    render()
+end
+
 do_skip_intro = function(auto)
-    if state.intro_kind == "recap" and opts.recap_e > 0 then
+    local pre_pos = state.time_pos or 0
+    if state.intro_kind == "ending" and opts.ed_e > 0 then
+        state.self_seek_until = mp.get_time() + 1.0
+        mp.set_property_number("time-pos", opts.ed_e)
+        state.intro_visible = false
+        state.ed_dismissed = true
+        set_skip_key_bound(false)
+        if auto then
+            state.undo_from = pre_pos
+            state.undo_kind = "ending"
+            state.undo_label = "Ending"
+            state.undo_expire = mp.get_time() + 8.0
+            show_toast("Auto-Skipped Ending -> Post-Credits  ·  Press U to Undo", 5.5)
+        else
+            show_toast("Skipped Ending -> Post-Credits")
+        end
+        render()
+    elseif state.intro_kind == "recap" and opts.recap_e > 0 then
         local target = opts.recap_e
         local lbl = "Recap"
-        -- Chain immediately adjacent Intro/Opening (gap <= 6s) into one seamless jump!
-        if opts.intro_s >= 0 and opts.intro_e > opts.intro_s and opts.intro_s <= target + 6.0 and opts.intro_e > target then
+        -- Chain immediately adjacent Intro/Opening (gap <= 6s) into one seamless jump when both auto-skip!
+        if opts.intro_s >= 0 and opts.intro_e > opts.intro_s and opts.intro_s <= target + 6.0 and opts.intro_e > target and (not auto or opts.intro_auto) then
             target = opts.intro_e
             state.intro_dismissed = true
             state.intro_autoskipped = true
             lbl = opts.is_anime and "Recap + Opening" or "Recap + Intro"
         end
+        state.self_seek_until = mp.get_time() + 1.0
         mp.set_property_number("time-pos", target)
         state.intro_visible = false
         state.recap_dismissed = true
         set_skip_key_bound(false)
-        show_toast((auto and "Auto-Skipped " or "Skipped ") .. lbl)
+        if auto then
+            state.undo_from = pre_pos
+            state.undo_kind = "recap"
+            state.undo_label = lbl
+            state.undo_expire = mp.get_time() + 8.0
+            show_toast("Auto-Skipped " .. lbl .. "  ·  Press U to Undo", 5.5)
+        else
+            show_toast("Skipped " .. lbl)
+        end
         render()
     elseif opts.intro_e > 0 then
         local target = opts.intro_e
         local lbl = opts.intro_label ~= "" and opts.intro_label or (opts.is_anime and "Opening" or "Intro")
-        -- Chain immediately adjacent post-OP Recap (gap <= 6s) into one seamless jump!
-        if opts.recap_s >= 0 and opts.recap_e > opts.recap_s and opts.recap_s >= opts.intro_s and opts.recap_s <= target + 6.0 and opts.recap_e > target then
+        -- Chain immediately adjacent post-OP Recap (gap <= 6s) into one seamless jump when both auto-skip!
+        if opts.recap_s >= 0 and opts.recap_e > opts.recap_s and opts.recap_s >= opts.intro_s and opts.recap_s <= target + 6.0 and opts.recap_e > target and (not auto or (opts.recap_auto and opts.autoskip_recap)) then
             target = opts.recap_e
             state.recap_dismissed = true
             state.recap_autoskipped = true
             lbl = lbl .. " + Recap"
         end
+        state.self_seek_until = mp.get_time() + 1.0
         mp.set_property_number("time-pos", target)
         state.intro_visible = false
         state.intro_dismissed = true
         set_skip_key_bound(false)
-        show_toast((auto and "Auto-Skipped " or "Skipped ") .. lbl)
+        if auto then
+            state.undo_from = pre_pos
+            state.undo_kind = "intro"
+            state.undo_label = lbl
+            state.undo_expire = mp.get_time() + 8.0
+            show_toast("Auto-Skipped " .. lbl .. "  ·  Press U to Undo", 5.5)
+        else
+            show_toast("Skipped " .. lbl)
+        end
         render()
     end
 end
@@ -968,12 +1056,13 @@ local function update_intro_and_up_next()
     local pos = state.time_pos or 0
     local dur = state.duration or 0
 
-    -- Recap window: [recap_s, recap_e - 2], then Intro window: [intro_s, intro_e - 2]
+    -- Recap window: [recap_s, recap_e - 2], Intro window: [intro_s, intro_e - 2], In-Episode Ending window: [ed_s, ed_e - 2]
     local has_recap = (opts.recap_s >= 0 and opts.recap_e > opts.recap_s and (opts.recap_e - 2) >= opts.recap_s)
     local has_intro = (opts.intro_s >= 0 and opts.intro_e > opts.intro_s and (opts.intro_e - 2) >= opts.intro_s)
+    local has_ed = (opts.ed_s >= 0 and opts.ed_e > opts.ed_s and (opts.ed_e - 2) >= opts.ed_s)
     if has_recap and pos >= opts.recap_s and pos <= (opts.recap_e - 2) then
         state.intro_kind = "recap"
-        if opts.autoskip and not state.recap_autoskipped then
+        if opts.autoskip_recap and opts.recap_auto and not state.recap_autoskipped and pos >= opts.recap_s + 0.12 then
             state.recap_autoskipped = true
             do_skip_intro(true)
             return
@@ -983,11 +1072,21 @@ local function update_intro_and_up_next()
         end
     elseif has_intro and pos >= opts.intro_s and pos <= (opts.intro_e - 2) then
         state.intro_kind = "intro"
-        if opts.autoskip and not state.intro_autoskipped then
+        if opts.autoskip and opts.intro_auto and not state.intro_autoskipped and pos >= opts.intro_s + 0.12 then
             state.intro_autoskipped = true
             do_skip_intro(true)
             return
         elseif not state.intro_dismissed then
+            state.intro_visible = true
+            set_skip_key_bound(true)
+        end
+    elseif has_ed and pos >= opts.ed_s and pos <= (opts.ed_e - 2) then
+        state.intro_kind = "ending"
+        if opts.autoskip_credits and opts.ed_auto and not state.ed_autoskipped and pos >= opts.ed_s + 0.12 then
+            state.ed_autoskipped = true
+            do_skip_intro(true)
+            return
+        elseif not state.ed_dismissed then
             state.intro_visible = true
             set_skip_key_bound(true)
         end
@@ -999,23 +1098,31 @@ local function update_intro_and_up_next()
         if has_intro and pos < opts.intro_s then
             state.intro_dismissed = false
         end
+        if has_ed and pos < opts.ed_s then
+            state.ed_dismissed = false
+        end
         set_skip_key_bound(false)
     end
 
-    -- Up Next / Auto-Skip Credits window: credits >= 0 -> time_pos >= credits; else duration - 40
+    -- Up Next / Auto-Skip Credits window: credits >= 0 -> time_pos >= credits;
+    -- if in-episode Ending exists (C-part), wait until dur - 15 (never cut off the C-part!)
     if opts.has_next and not state.quitting_for_next then
         local has_known_credits = (opts.credits >= 0 and (dur <= 120 or opts.credits >= dur * 0.55))
         local trigger = nil
         if has_known_credits then
             trigger = opts.credits
         elseif dur > 0 then
-            trigger = math.max(0, dur - 40)
+            if has_ed then
+                trigger = math.max(dur - 15, opts.ed_e + 10)
+            else
+                trigger = math.max(0, dur - (opts.is_anime and 22 or 40))
+            end
         end
 
         if trigger ~= nil and pos >= trigger and dur > 0 then
             if not state.up_next_dismissed then
                 if not state.up_next_visible then
-                    local fast_credits = has_known_credits and opts.autoplay and opts.autoskip_credits
+                    local fast_credits = has_known_credits and (not opts.credits_mixed) and opts.autoplay and opts.autoskip_credits
                     local cd = fast_credits and UP_NEXT_CREDITS_SKIP_SECS or UP_NEXT_COUNTDOWN_SECS
                     state.up_next_visible = true
                     state.up_next_credits_skip = fast_credits
@@ -1338,6 +1445,16 @@ render = function()
                 push(ass_rect(ix1 - 1, ty0 - 4, ix1 + 2, ty1 + 4, C.cyan, "&H00&", 1))
             end
 
+            -- In-episode Anime Ending highlight (Amber #FFB300)
+            if opts.ed_s >= 0 and opts.ed_e > opts.ed_s then
+                local ex0 = bar_x0 + bar_w * clamp(opts.ed_s / dur, 0, 1)
+                local ex1 = bar_x0 + bar_w * clamp(opts.ed_e / dur, 0, 1)
+                if ex1 - ex0 < 4 then ex1 = math.min(bar_x1, ex0 + 4) end
+                push(ass_rect(ex0, ty0 - 1, ex1, ty1 + 1, C.amber, "&H35&", 2))
+                push(ass_rect(ex0 - 1, ty0 - 4, ex0 + 2, ty1 + 4, C.amber, "&H00&", 1))
+                push(ass_rect(ex1 - 1, ty0 - 4, ex1 + 2, ty1 + 4, C.amber, "&H00&", 1))
+            end
+
             -- Credits marker highlight (Amber #FFB300)
             if opts.credits >= 0 and opts.credits < dur then
                 local crx = bar_x0 + bar_w * clamp(opts.credits / dur, 0, 1)
@@ -1364,11 +1481,17 @@ render = function()
                 local tip_str = fmt_time(h_time)
                 local tip_color = C.white
                 if opts.intro_s >= 0 and opts.intro_e > opts.intro_s and h_time >= opts.intro_s and h_time <= opts.intro_e then
-                    tip_str = tip_str .. " · Intro"
+                    tip_str = tip_str .. (opts.is_anime and " · Opening" or " · Intro")
                     tip_color = C.cyan
+                elseif opts.ed_s >= 0 and opts.ed_e > opts.ed_s and h_time >= opts.ed_s and h_time <= opts.ed_e then
+                    tip_str = tip_str .. " · Ending"
+                    tip_color = C.amber
                 elseif opts.credits >= 0 and h_time >= opts.credits then
                     tip_str = tip_str .. " · Credits"
                     tip_color = C.amber
+                elseif opts.ed_e > 0 and h_time > opts.ed_e then
+                    tip_str = tip_str .. " · Post-Credits"
+                    tip_color = C.white
                 end
 
                 push(ass_rect(hx - 1, ty0 - 5, hx + 1, ty1 + 5, C.white, "&H30&"))
@@ -1548,7 +1671,8 @@ render = function()
     -- 2. Floating Skip Intro Pill (Bottom-Right, shifts cleanly above HUD)
     ----------------------------------------------------------------------------
     if state.intro_visible then
-        local skip_lbl = (state.intro_kind == "recap") and "Skip Recap  >" or ("Skip " .. (opts.intro_label ~= "" and opts.intro_label or "Intro") .. "  >")
+        local skip_lbl = (state.intro_kind == "ending") and "Skip Ending -> Post-Credits  >"
+            or ((state.intro_kind == "recap") and "Skip Recap  >" or ("Skip " .. (opts.intro_label ~= "" and opts.intro_label or "Intro") .. "  >"))
         local sw = math.max(210, estimate_text_w(skip_lbl, 22) + 84)
         local sh = 52
         local sx1 = W - pad
@@ -1876,6 +2000,20 @@ end)
 
 mp.observe_property("time-pos", "number", function(_, val)
     if val ~= nil then
+        -- Manual scrub-back immunity: if the user seeks backward into/before a skip segment,
+        -- disable auto-skip on it so we never yank them forward while rewinding!
+        if mp.get_time() > (state.self_seek_until or 0) and state.last_time_pos and val < state.last_time_pos - 2.0 then
+            if opts.recap_s >= 0 and val < opts.recap_e and state.last_time_pos >= opts.recap_s then
+                state.recap_autoskipped = true
+            end
+            if opts.intro_s >= 0 and val < opts.intro_e and state.last_time_pos >= opts.intro_s then
+                state.intro_autoskipped = true
+            end
+            if opts.ed_s >= 0 and val < opts.ed_e and state.last_time_pos >= opts.ed_s then
+                state.ed_autoskipped = true
+            end
+        end
+        state.last_time_pos = val
         state.time_pos = val
     end
 end)
@@ -1952,6 +2090,13 @@ mp.register_event("file-loaded", function()
     state.intro_dismissed = false
     state.recap_autoskipped = false
     state.recap_dismissed = false
+    state.ed_autoskipped = false
+    state.ed_dismissed = false
+    state.undo_from = nil
+    state.undo_kind = nil
+    state.undo_label = nil
+    state.undo_expire = 0
+    state.last_time_pos = 0
     state.up_next_visible = false
     state.up_next_dismissed = false
     state.up_next_credits_skip = false
@@ -2031,5 +2176,8 @@ mp.add_forced_key_binding("B", "tv_osd_crop_upper", toggle_smart_crop)
 
 mp.add_forced_key_binding("r", "tv_osd_replay_lower", trigger_replay)
 mp.add_forced_key_binding("R", "tv_osd_replay_upper", trigger_replay)
+
+mp.add_forced_key_binding("u", "tv_osd_undo_lower", undo_last_autoskip)
+mp.add_forced_key_binding("U", "tv_osd_undo_upper", undo_last_autoskip)
 
 msg.info("tv_osd loaded (preset=" .. opts.shader_preset .. ", night=" .. tostring(opts.night) .. ", live=" .. tostring(opts.is_live) .. ")")

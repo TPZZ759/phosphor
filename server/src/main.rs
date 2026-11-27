@@ -595,7 +595,7 @@ async fn episodes_watched(State(app): A, Json(b): Json<Value>) -> Response {
 async fn prefs_get(State(app): A) -> Response { j(app.state.read(|st| st["prefs"].clone())) }
 async fn prefs_post(State(app): A, Json(b): Json<Value>) -> Response {
     if let Some(h) = b["hide"].as_array() { let h: Vec<Value> = h.iter().filter(|x| x.is_string()).cloned().collect(); app.state.with(|st| st["prefs"]["hide"] = json!(h)); }
-    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "hideCams", "ufcSpoilerFree", "autoplay", "autoskip", "autoSkipCredits"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
+    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "hideCams", "ufcSpoilerFree", "autoplay", "autoskip", "autoSkipRecap", "autoSkipCredits"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     for k in ["display", "pro", "oledPeak", "mpvShaders"] { if let Some(v) = b[k].as_str() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     app.state.save(); app.memo.clear(); tokio::spawn(prewarm(app.clone()));
     j(json!({ "ok": true, "prefs": app.state.read(|st| st["prefs"].clone()) }))
@@ -1479,7 +1479,8 @@ async fn skips_resolve(State(app): A, Query(q): Q) -> Response {
     let e = if ep > 0 { app.skips.entry(ep) } else { Value::Null };
     let a_intro = e["intro"].as_array().and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
     let a_credits = e["credits"].as_f64();
-    let m = skipdb::merge_all(&[], None, a_intro, a_credits, remote.as_ref(), dur);
+    let a_credits_end = e["creditsEnd"].as_f64();
+    let m = skipdb::merge_all(&[], None, None, a_intro, a_credits, a_credits_end, remote.as_ref(), dur, is_anime);
     j(json!({
         "tmdb": tmdb,
         "imdb": imdb,
@@ -1487,8 +1488,10 @@ async fn skips_resolve(State(app): A, Query(q): Q) -> Response {
         "skips": m.skips,
         "intro": m.intro.map(|(s, e)| json!([s, e])),
         "recap": m.recap.map(|(s, e)| json!([s, e])),
+        "ending": m.ending.map(|(s, e)| json!([s, e])),
         "credits": m.credits,
         "creditsEnd": m.credits_end,
+        "creditsMixed": m.credits_mixed,
         "postCredits": m.post_credits.map(|(s, e)| json!([s, e])),
         "hasPostCredits": m.has_post_credits,
         "source": m.source,
@@ -1506,6 +1509,7 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     } else {
         (String::new(), String::new(), false)
     };
+    let cached_dur = if kind == "series" { app.stream.cached_duration(&url) } else { 0.0 };
 
     // Run public skipdb lookup (IntroDB + TheIntroDB v2 + AniSkip) IN PARALLEL with stream probe
     // so resolving crowd-sourced intro/recap/credits adds 0ms to playback startup!
@@ -1518,12 +1522,12 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     };
     let skip_fut = async {
         if kind == "series" && sn >= 0 && en > 0 {
-            skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, abs_ep, 0.0, is_anime).await
+            skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, abs_ep, cached_dur, is_anime).await
         } else {
             None
         }
     };
-    let (mut p, remote_skips) = tokio::join!(probe_fut, skip_fut);
+    let (mut p, mut remote_skips) = tokio::join!(probe_fut, skip_fut);
 
     if let (Ok(nid), Some(aud)) = (id.parse::<i64>(), p["audio"].as_array()) {
         let has_en = anime::record_probe(&app, &kind, nid, aud);
@@ -1531,19 +1535,26 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     }
     if kind == "series" {
         let dur = p["duration"].as_f64().unwrap_or(0.0);
+        if is_anime && cached_dur <= 120.0 && dur > 120.0 && sn >= 0 && en > 0 {
+            remote_skips = skipdb::refine_with_duration(&app, &tmdb, &imdb, sn, en, abs_ep, dur, true, remote_skips).await;
+        }
         let ep_id = id.parse::<i64>().unwrap_or(0);
         if ep_id > 0 && sid > 0 { app.skips.register(ep_id, sid, sn, en, dur); }
         let e = if ep_id > 0 { app.skips.entry(ep_id) } else { Value::Null };
         let ch_skips = p["skips"].as_array().cloned().unwrap_or_default();
         let ch_credits = p["chapterCredits"].as_f64();
+        let ch_credits_end = p["chapterCreditsEnd"].as_f64();
         let a_intro = e["intro"].as_array().and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
         let a_credits = e["credits"].as_f64();
-        let merged = skipdb::merge_all(&ch_skips, ch_credits, a_intro, a_credits, remote_skips.as_ref(), dur);
+        let a_credits_end = e["creditsEnd"].as_f64();
+        let merged = skipdb::merge_all(&ch_skips, ch_credits, ch_credits_end, a_intro, a_credits, a_credits_end, remote_skips.as_ref(), dur, is_anime);
         p["skips"] = Value::Array(merged.skips);
         p["intro"] = merged.intro.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
         p["recap"] = merged.recap.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
+        p["ending"] = merged.ending.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
         p["credits"] = merged.credits.map(|c| json!(c)).unwrap_or(Value::Null);
         p["creditsEnd"] = merged.credits_end.map(|c| json!(c)).unwrap_or(Value::Null);
+        p["creditsMixed"] = json!(merged.credits_mixed);
         p["postCredits"] = merged.post_credits.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
         p["hasPostCredits"] = json!(merged.has_post_credits);
         if !merged.source.is_empty() { p["skipSource"] = json!(merged.source); }
@@ -1701,7 +1712,7 @@ async fn intro_worker(app: &Arc<App>) {
             // First check free crowd-sourced skip DBs (IntroDB / TheIntroDB / AniSkip — zero provider load!).
             // Only audio-fingerprint segments still missing after crowd-sourced lookup!
             let remote = skipdb::resolve_episode(app, &tmdb, &imdb, sn, n, abs_idx as i64, dur, is_anime).await;
-            let have_remote_intro = remote.as_ref().map_or(false, |r| r.intro.is_some());
+            let have_remote_intro = remote.as_ref().map_or(false, |r| r.intro.is_some() && !r.intro_uncertain);
             let have_remote_credits = remote.as_ref().map_or(false, |r| r.credits.is_some());
             for which in ["h", "t"] {
                 if (which == "h" && have_remote_intro) || (which == "t" && have_remote_credits) { continue; }
