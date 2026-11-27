@@ -1,4 +1,4 @@
-// Phosphor — pure-black OLED streaming front-end for Xtream Codes IPTV (Rust server).
+// Personal streaming front-end for an Xtream Codes subscription — Rust server.
 mod subsync; mod fmp4; mod intro; mod skipdb; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
 pub use extras::notify;
 
@@ -34,7 +34,7 @@ fn not_ready(app: &App) -> Option<Response> {
 
 #[tokio::main]
 async fn main() {
-    // Self-test hook: phosphor.exe --subsync <audio.pcm> <subs.vtt>
+    // Self-test hook: tv.exe --subsync <audio.pcm> <subs.vtt>
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 4 && args[1] == "--intro" {
         let rd = |p: &str| -> Vec<i16> { std::fs::read(p).unwrap_or_default().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect() };
@@ -45,7 +45,7 @@ async fn main() {
     if args.len() == 5 && args[1] == "--subsync-at" { println!("{}", subsync::sync_at(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), args[4].parse().unwrap_or(0))); return; }
     if args.len() == 2 && args[1] == "--display" { display::self_test(); return; }
     if args.len() == 4 && args[1] == "--subsync" { println!("{}", subsync::sync(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]))); return; }
-    let root = std::env::var("PHOSPHOR_ROOT").or_else(|_| std::env::var("TV_ROOT")).map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let root = std::env::var("TV_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::current_dir().unwrap());
     let data = root.join("data"); let _ = std::fs::create_dir_all(data.join("raw"));
     let cfg = Arc::new(store::Config::load(root.join("config.json")));
     let http = reqwest::Client::builder()
@@ -54,7 +54,7 @@ async fn main() {
         .pool_max_idle_per_host(16)
         .build().unwrap();
     let app = Arc::new(App {
-        public: std::env::var("PHOSPHOR_PUBLIC").or_else(|_| std::env::var("TV_PUBLIC")).map(std::path::PathBuf::from).unwrap_or_else(|_| root.join("public")),
+        public: std::env::var("TV_PUBLIC").map(std::path::PathBuf::from).unwrap_or_else(|_| root.join("public")),
         state: store::State::load(data.join("state.json")),
         xc: xc::Xc::new(cfg.clone(), http.clone()),
         tmdb: tmdb::Tmdb::new(cfg.clone(), http.clone(), data.join("tmdb-cache.json")),
@@ -101,12 +101,12 @@ async fn main() {
     // no-cache: the browser revalidates (cheap 304s), so front-end updates always load.
     let router = api.fallback_service(static_files).layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache")));
     let port = app.cfg.get("port").as_u64().unwrap_or(7878);
-    let addr = std::env::var("PHOSPHOR_PORT").or_else(|_| std::env::var("TV_PORT")).ok().and_then(|p| p.parse().ok()).unwrap_or(port as u16);
+    let addr = std::env::var("TV_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(port as u16);
     spool::set_port(addr);
     livebuf::set_port(addr);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", addr)).await.expect("port in use");
     if let Ok(l6) = tokio::net::TcpListener::bind(("::1", addr)).await { let r6 = router.clone(); tokio::spawn(async move { let _ = axum::serve(l6, r6).await; }); }
-    println!("Phosphor running at http://localhost:{addr}");
+    println!("TV running at http://localhost:{addr}");
     axum::serve(listener, router).await.unwrap();
 }
 
@@ -335,17 +335,40 @@ async fn series_page(State(app): A) -> Response {
 }
 async fn anime_page(State(app): A) -> Response {
     if let Some(r) = not_ready(&app) { return r; }
-    let base = app.memo("anime", 30 * 60_000, anime::page).await;
+    let (base, cw_all, fy_all) = tokio::join!(
+        app.memo("anime", 30 * 60_000, anime::page),
+        rec::continue_watching(&app),
+        app.memo("foryou", 20 * 60_000, rec::for_you)
+    );
     let mut v = (*base).clone();
     let cat = app.catalog();
-    let cw: Vec<Value> = rec::continue_watching(&app).await.into_iter().filter(|it| {
+    let cw: Vec<Value> = cw_all.into_iter().filter(|it| {
         if it["k"] == "e" { it["sid"].as_i64().and_then(|sid| cat.series_item(sid)).map_or(false, |s| anime::is_anime_item(&app, s)) }
         else if it["k"] == "m" { it["id"].as_i64().and_then(|id| cat.movie(id)).map_or(false, |m| anime::is_anime_item(&app, m)) }
         else { false }
     }).collect();
-    if !cw.is_empty() {
-        if let Some(rows) = v["rows"].as_array_mut() {
-            rows.insert(0, json!({ "id": "an-continue", "title": "Continue Watching Anime", "items": cw, "style": "continue" }));
+    let new_eps: Vec<Value> = rec::new_episodes(&app).into_iter().filter(|it| {
+        it["id"].as_i64().and_then(|sid| cat.series_item(sid)).map_or(false, |s| anime::is_anime_item(&app, s))
+    }).collect();
+    let fy_anime: Vec<Value> = fy_all.as_array().into_iter().flatten().filter(|it| {
+        let id = it["id"].as_i64().unwrap_or(0);
+        if it["k"] == "s" { cat.series_item(id).map_or(false, |s| anime::is_anime_item(&app, s)) }
+        else if it["k"] == "m" { cat.movie(id).map_or(false, |m| anime::is_anime_item(&app, m)) }
+        else { false }
+    }).cloned().collect();
+    if let Some(rows) = v["rows"].as_array_mut() {
+        let mut insert_at = 0usize;
+        if !cw.is_empty() {
+            rows.insert(insert_at, json!({ "id": "an-continue", "title": "Continue Watching Anime", "items": cw, "style": "continue" }));
+            insert_at += 1;
+        }
+        if !new_eps.is_empty() {
+            rows.insert(insert_at, json!({ "id": "an-new-eps", "title": "New Episodes", "sub": "From anime you follow", "items": new_eps, "style": "wide" }));
+            insert_at += 1;
+        }
+        if fy_anime.len() >= 4 {
+            let at = (insert_at + 1).min(rows.len());
+            rows.insert(at, json!({ "id": "an-foryou", "title": "Picked For You", "sub": "Based on what you watch and like", "items": fy_anime }));
         }
     }
     j(v)
@@ -1033,55 +1056,216 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
             }
         }
     }
+    // Universal TMDB episode enrichment: fetch TMDB season episode lists (24h cached on disk!) so
+    // generic provider placeholders ("Episode 52"), blank plots, missing air dates, and missing/w185
+    // stills are upgraded to crisp TMDB titles, synopses, and w500 HD stills across ALL TV & Anime!
+    let prov_non_special_total: i64 = merged_seasons.iter().filter(|(&sn, _)| sn > 0).map(|(_, m)| m.len() as i64).sum();
+    let max_prov_ep: i64 = merged_seasons.iter().filter(|(&sn, _)| sn > 0)
+        .flat_map(|(_, m)| m.keys().copied()).max().unwrap_or(0);
+    let continuous_numbering = merged_seasons.iter()
+        .any(|(&sn, m)| sn > 1 && m.keys().next().copied().unwrap_or(0) > 10);
+    let tmdb_seasons_meta: Vec<(i64, i64, String)> = dd["seasons"].as_array().into_iter().flatten()
+        .filter_map(|x| {
+            let sn = x["season_number"].as_i64()?;
+            let ec = x["episode_count"].as_i64().unwrap_or(0);
+            if sn > 0 && ec > 0 { Some((sn, ec, s(&x["name"]))) } else { None }
+        }).collect();
+    let tmdb_s1_count = tmdb_seasons_meta.iter().find(|(sn, _, _)| *sn == 1).map(|x| x.1).unwrap_or(0);
+    // Detect shows like Black Clover where the provider splits TMDB Season 1 (170 eps) into S1..S4
+    let split_from_tmdb_s1 = continuous_numbering && tmdb_s1_count > 40 && prov_non_special_total <= tmdb_s1_count + 5;
+
+    let mut tmdb_by_se: HashMap<(i64, i64), Value> = HashMap::new();
+    let mut tmdb_by_abs: HashMap<i64, Value> = HashMap::new();
+    if let Some(ref t) = tm {
+        let fetch_sns: Vec<i64> = if split_from_tmdb_s1 {
+            vec![1]
+        } else {
+            let mut sns: Vec<i64> = tmdb_seasons_meta.iter().map(|x| x.0).collect();
+            if sns.is_empty() {
+                sns = merged_seasons.keys().copied().filter(|&sn| sn > 0).collect();
+            }
+            sns.sort_unstable();
+            sns.dedup();
+            // Cap at 24 seasons so even mega-shows (One Piece, Simpsons) load fast on cold cache
+            sns.truncate(24);
+            sns
+        };
+        let fetched = futures_util::future::join_all(
+            fetch_sns.iter().map(|&sn| app.tmdb.get(format!("/tv/{t}/season/{sn}"), crate::tmdb::NO, TTL_D))
+        ).await;
+        let mut cum_abs = 0i64;
+        for (sn, sdata) in fetch_sns.into_iter().zip(fetched) {
+            let Some(sd) = sdata else { continue };
+            for ep in sd["episodes"].as_array().into_iter().flatten() {
+                let en = ep["episode_number"].as_i64().unwrap_or(0);
+                if en <= 0 { continue; }
+                cum_abs += 1;
+                tmdb_by_se.insert((sn, en), ep.clone());
+                tmdb_by_abs.insert(cum_abs, ep.clone());
+            }
+        }
+    }
+
+    // Auto-heal single-number provider episode skips on continuous-numbered shows (e.g. Black Clover
+    // 19425 jumps 102 -> 104..171 across 170 episodes while TMDB S1 has exactly 170 episodes!).
+    let sequential_abs = continuous_numbering
+        && prov_non_special_total > 0
+        && max_prov_ep > prov_non_special_total
+        && (tmdb_by_abs.len() as i64) >= prov_non_special_total
+        && (tmdb_s1_count == prov_non_special_total || (max_prov_ep - prov_non_special_total) <= 3);
+
     let mut dubbed_count = 0usize; let mut sub_only_count = 0usize;
     let mut seasons: Vec<Value> = vec![];
     let mut max_abs = 0i64;
+    let mut running_seq = 0i64;
+    let max_prov_season = merged_seasons.keys().copied().filter(|&sn| sn > 0).max().unwrap_or(0);
     for (sn, ep_map) in merged_seasons {
         let tm_s = dd["seasons"].as_array().and_then(|a| a.iter().find(|x| x["season_number"].as_i64() == Some(sn)));
         let raw_eps: Vec<(Value, String)> = ep_map.into_values().collect();
         let first_num = raw_eps.first().map(|(e, _)| util::i(&e["episode_num"])).unwrap_or(0);
         let season_offset = if sn > 0 && max_abs > 0 && first_num > 0 && first_num <= max_abs { max_abs } else { 0 };
         let mut season_max = max_abs;
+        let mut first_season_abs = 0i64;
+        let mut last_season_abs = 0i64;
         let eps: Vec<Value> = raw_eps.into_iter().map(|(e, ep_cat_name)| {
             let eid = util::i(&e["id"]); let ekey = format!("e:{eid}");
-            let ep_num = util::i(&e["episode_num"]);
-            // Check canonical progress key first, then any variant episode ID for this (season, ep_num)
+            let raw_ep_num = util::i(&e["episode_num"]);
+            // Check canonical progress key first, then any variant episode ID for this (season, raw_ep_num)
             let p = if !progress[&ekey].is_null() {
                 &progress[&ekey]
             } else {
-                ep_var_ids.get(&(sn, ep_num))
+                ep_var_ids.get(&(sn, raw_ep_num))
                     .and_then(|ids| ids.iter().find_map(|&vid| {
                         let k = format!("e:{vid}");
                         (!progress[&k].is_null()).then_some(&progress[&k])
                     }))
                     .unwrap_or(&Value::Null)
             };
-            let title = crate::re!(r"(?i)^.*?S\d+E\d+\s*-?\s*").replace(&s(&e["title"]), "").to_string();
-            let dur = p["dur"].as_f64().unwrap_or(0.0);
-            let ext = { let x = s(&e["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
-            let aired = { let a = s(&e["info"]["releasedate"]); if a.is_empty() { s(&e["info"]["air_date"]) } else { a } };
-            let title = if title.is_empty() { format!("Episode {}", s(&e["episode_num"])) } else { title };
-            let dub = if is_anime { anime::ep_dub_status(&app, eid, Some(&e), if ep_cat_name.is_empty() { &cat_name } else { &ep_cat_name }) } else { "yes" };
-            if is_anime { if dub == "yes" { dubbed_count += 1; } else if dub == "no" { sub_only_count += 1; } }
             let abs_ep = if sn > 0 {
-                let a = if ep_num > 0 { season_offset + ep_num } else { season_max + 1 };
+                running_seq += 1;
+                let a = if sequential_abs {
+                    running_seq
+                } else if raw_ep_num > 0 {
+                    season_offset + raw_ep_num
+                } else {
+                    season_max + 1
+                };
                 if a > season_max { season_max = a; }
+                if first_season_abs == 0 { first_season_abs = a; }
+                last_season_abs = a;
                 a
             } else { 0 };
+            let display_n = if sequential_abs && abs_ep > 0 { abs_ep } else { raw_ep_num };
+
+            // Look up matching TMDB episode metadata (abs-first for continuous/split-S1 anime, S:E-first for standard shows)
+            let tm_ep = if sn > 0 {
+                if split_from_tmdb_s1 || continuous_numbering {
+                    tmdb_by_abs.get(&abs_ep).or_else(|| tmdb_by_se.get(&(sn, display_n)))
+                } else {
+                    tmdb_by_se.get(&(sn, display_n)).or_else(|| tmdb_by_abs.get(&abs_ep))
+                }
+            } else {
+                None
+            };
+
+            let raw_title = crate::re!(r"(?i)^.*?S\d+E\d+\s*-?\s*").replace(&s(&e["title"]), "").trim().to_string();
+            let is_generic_title = raw_title.is_empty()
+                || crate::re!(r"(?i)^(?:episode|ep\.?)\s*\d+$").is_match(&raw_title)
+                || raw_title.chars().all(|c| c.is_ascii_digit());
+            let tm_title = tm_ep.map(|x| s(&x["name"])).filter(|x| !x.is_empty());
+            let title = if is_generic_title {
+                tm_title.unwrap_or_else(|| format!("Episode {display_n}"))
+            } else {
+                raw_title
+            };
+
+            let raw_plot = s(&e["info"]["plot"]);
+            let plot = if !raw_plot.is_empty() {
+                raw_plot
+            } else {
+                tm_ep.map(|x| s(&x["overview"])).unwrap_or_default()
+            };
+
+            let raw_still = s(&e["info"]["movie_image"]);
+            let tm_still = tm_ep.and_then(|x| x["still_path"].as_str()).filter(|x| !x.is_empty()).map(|sp| tmdb_img(sp, "w500"));
+            let still = if raw_still.is_empty() || (raw_still.contains("image.tmdb.org/t/p/w185/") && tm_still.is_some()) {
+                tm_still.unwrap_or(raw_still)
+            } else {
+                raw_still
+            };
+
+            let raw_aired = { let a = s(&e["info"]["releasedate"]); if a.is_empty() { s(&e["info"]["air_date"]) } else { a } };
+            let aired = if !raw_aired.is_empty() {
+                raw_aired
+            } else {
+                tm_ep.map(|x| s(&x["air_date"])).unwrap_or_default()
+            };
+
+            let raw_dur = duration_of(&e["info"]);
+            let ep_dur = if raw_dur > 0 {
+                raw_dur
+            } else {
+                tm_ep.and_then(|x| x["runtime"].as_i64()).filter(|&r| r > 0).map(|r| r * 60).unwrap_or(0)
+            };
+
+            let dur = p["dur"].as_f64().unwrap_or(0.0);
+            let ext = { let x = s(&e["container_extension"]); if x.is_empty() { "mkv".to_string() } else { x } };
+            let dub = if is_anime { anime::ep_dub_status(&app, eid, Some(&e), if ep_cat_name.is_empty() { &cat_name } else { &ep_cat_name }) } else { "yes" };
+            if is_anime { if dub == "yes" { dubbed_count += 1; } else if dub == "no" { sub_only_count += 1; } }
             let ftag = if abs_ep > 0 {
                 show_filler.as_ref().map(|sf| filler::episode_tag(sf, abs_ep)).unwrap_or("")
             } else { "" };
-            let (ep_uhd, ep_dv, ep_da) = ep_qual.get(&(sn, ep_num)).copied().unwrap_or((false, false, false));
-            json!({ "id": eid, "n": ep_num, "abs": abs_ep, "title": title,
-                "plot": s(&e["info"]["plot"]), "still": s(&e["info"]["movie_image"]), "duration": duration_of(&e["info"]), "ext": ext,
+            let (ep_uhd, ep_dv, ep_da) = ep_qual.get(&(sn, raw_ep_num)).copied().unwrap_or((false, false, false));
+            json!({ "id": eid, "n": display_n, "rawN": raw_ep_num, "abs": abs_ep, "title": title,
+                "plot": plot, "still": still, "duration": ep_dur, "ext": ext,
                 "aired": aired, "dub": dub, "filler": ftag, "dubWatching": dub_watches.contains(&ekey),
                 "uhd": ep_uhd, "dv": ep_dv, "dolbyAudio": ep_da,
                 "extSub": extsubs::cached_vtt(&app, &ekey),
                 "progress": if dur > 0.0 { p["pos"].as_f64().unwrap_or(0.0) / dur } else { 0.0 }, "resume": p["pos"].as_f64().unwrap_or(0.0), "isNew": new_ids.contains(&eid) })
         }).collect();
         max_abs = season_max;
-        seasons.push(json!({ "n": sn, "name": tm_s.map(|x| s(&x["name"])).filter(|x| !x.is_empty()).unwrap_or(format!("Season {sn}")), "episodes": eps }));
+        let season_name = if split_from_tmdb_s1 && first_season_abs > 0 && last_season_abs >= first_season_abs {
+            format!("Season {sn} (Eps {first_season_abs}–{last_season_abs})")
+        } else {
+            tm_s.map(|x| s(&x["name"])).filter(|x| !x.is_empty()).unwrap_or_else(|| format!("Season {sn}"))
+        };
+        seasons.push(json!({ "n": sn, "name": season_name, "episodes": eps }));
     }
+
+    // Detect if a newer TMDB season is currently airing / released that hasn't reached the English provider
+    // catalog yet (e.g. Black Clover Season 2 airing Oct-Nov 2026 while provider has S1 1..170).
+    let airing_season = {
+        let last_air = &dd["last_episode_to_air"];
+        let next_air = &dd["next_episode_to_air"];
+        let last_sn = last_air["season_number"].as_i64().unwrap_or(0);
+        let next_sn = next_air["season_number"].as_i64().unwrap_or(0);
+        let target_sn = if next_sn > 0 { next_sn } else { last_sn };
+        let missing_newer = if split_from_tmdb_s1 {
+            target_sn >= 2
+        } else {
+            target_sn > max_prov_season && max_prov_season > 0
+        };
+        if missing_newer {
+            let sname = tmdb_seasons_meta.iter().find(|(sn, _, _)| *sn == target_sn)
+                .map(|x| x.2.clone()).filter(|x| !x.is_empty())
+                .unwrap_or_else(|| format!("Season {target_sn}"));
+            let aired_eps = if last_sn == target_sn { last_air["episode_number"].as_i64().unwrap_or(0) } else { 0 };
+            Some(json!({
+                "season": target_sn,
+                "name": sname,
+                "airedEps": aired_eps,
+                "lastEp": if last_sn == target_sn { last_air["episode_number"].clone() } else { Value::Null },
+                "lastTitle": if last_sn == target_sn { last_air["name"].clone() } else { Value::Null },
+                "lastDate": if last_sn == target_sn { last_air["air_date"].clone() } else { Value::Null },
+                "nextEp": if next_sn == target_sn { next_air["episode_number"].clone() } else { Value::Null },
+                "nextTitle": if next_sn == target_sn { next_air["name"].clone() } else { Value::Null },
+                "nextDate": if next_sn == target_sn { next_air["air_date"].clone() } else { Value::Null },
+                "status": s(&dd["status"]),
+            }))
+        } else {
+            None
+        }
+    };
     // next up: first unfinished episode after the most recently watched one (skipping sub-only and optional filler on anime)
     let flat: Vec<Value> = seasons.iter().flat_map(|s0| s0["episodes"].as_array().cloned().unwrap_or_default().into_iter().map(move |mut e| { e["season"] = s0["n"].clone(); e })).collect();
     let playable: Vec<Value> = if is_anime {
@@ -1127,6 +1311,7 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
     out["qualityTier"] = json!(best_t.as_u8());
     out["qualityLabel"] = json!(best_t.label());
     out["isAnime"] = json!(is_anime);
+    if let Some(air) = airing_season { out["airingSeason"] = air; }
     if is_anime {
         out["dubbedCount"] = json!(dubbed_count);
         out["subOnlyCount"] = json!(sub_only_count);
@@ -1254,15 +1439,18 @@ fn resolve_series_ids(app: &App, sid: i64, q_tmdb: Option<&str>, q_imdb: Option<
     let mut tmdb = q_tmdb.unwrap_or("").trim().to_string();
     let mut imdb = q_imdb.unwrap_or("").trim().to_string();
     let mut is_anime = q_anime;
-    if (tmdb.is_empty() || tmdb == "0") && sid > 0 {
+    if sid > 0 {
         if let Some(it) = app.catalog().series_item(sid) {
-            if let Some(ref tm) = it.tmdb { tmdb = tm.clone(); }
+            if tmdb.is_empty() || tmdb == "0" {
+                if let Some(ref tm) = it.tmdb { tmdb = tm.clone(); }
+            }
+            if !is_anime && anime::is_anime_item(app, it) { is_anime = true; }
         }
     }
     if !tmdb.is_empty() && tmdb != "0" {
         if let Some(m) = app.meta_get("tv", &tmdb) {
             if imdb.is_empty() && m.im.starts_with("tt") { imdb = m.im.clone(); }
-            if !is_anime && m.g.contains(&16) && m.l == "ja" { is_anime = true; }
+            if !is_anime && m.g.contains(&16) && (m.l == "ja" || m.oc.iter().any(|c| c == "JP")) { is_anime = true; }
         }
     }
     (tmdb, imdb, is_anime)
@@ -1280,12 +1468,13 @@ async fn skips_resolve(State(app): A, Query(q): Q) -> Response {
     let sid = num("sid");
     let sn = num("s");
     let en = num("n");
+    let abs_ep = num("abs");
     let ep = num("ep");
     let dur = q.get("dur").and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
     let q_anime = q.get("anime").map_or(false, |v| v == "1" || v == "true");
     let (tmdb, imdb, is_anime) = resolve_series_ids(&app, sid, q.get("tmdb").map(|s| s.as_str()), q.get("imdb").map(|s| s.as_str()), q_anime);
     let remote = if sn >= 0 && en > 0 {
-        skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, dur, is_anime).await
+        skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, abs_ep, dur, is_anime).await
     } else { None };
     let e = if ep > 0 { app.skips.entry(ep) } else { Value::Null };
     let a_intro = e["intro"].as_array().and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
@@ -1299,7 +1488,9 @@ async fn skips_resolve(State(app): A, Query(q): Q) -> Response {
         "intro": m.intro.map(|(s, e)| json!([s, e])),
         "recap": m.recap.map(|(s, e)| json!([s, e])),
         "credits": m.credits,
+        "creditsEnd": m.credits_end,
         "postCredits": m.post_credits.map(|(s, e)| json!([s, e])),
+        "hasPostCredits": m.has_post_credits,
         "source": m.source,
     }))
 }
@@ -1308,7 +1499,7 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     let url = upstream(&app, &kind, &id, q.get("ext"), false);
     yield_background(&app).await;
     let num = |k: &str| q.get(k).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
-    let (sid, sn, en) = (num("sid"), num("s"), num("n"));
+    let (sid, sn, en, abs_ep) = (num("sid"), num("s"), num("n"), num("abs"));
     let q_anime = q.get("anime").map_or(false, |v| v == "1" || v == "true");
     let (tmdb, imdb, is_anime) = if kind == "series" {
         resolve_series_ids(&app, sid, q.get("tmdb").map(|s| s.as_str()), q.get("imdb").map(|s| s.as_str()), q_anime)
@@ -1327,7 +1518,7 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     };
     let skip_fut = async {
         if kind == "series" && sn >= 0 && en > 0 {
-            skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, 0.0, is_anime).await
+            skipdb::resolve_episode(&app, &tmdb, &imdb, sn, en, abs_ep, 0.0, is_anime).await
         } else {
             None
         }
@@ -1352,10 +1543,12 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
         p["intro"] = merged.intro.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
         p["recap"] = merged.recap.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
         p["credits"] = merged.credits.map(|c| json!(c)).unwrap_or(Value::Null);
+        p["creditsEnd"] = merged.credits_end.map(|c| json!(c)).unwrap_or(Value::Null);
         p["postCredits"] = merged.post_credits.map(|(s, e)| json!([s, e])).unwrap_or(Value::Null);
+        p["hasPostCredits"] = json!(merged.has_post_credits);
         if !merged.source.is_empty() { p["skipSource"] = json!(merged.source); }
         if sn >= 0 && en > 0 {
-            skipdb::spawn_prefetch_ahead(app.clone(), tmdb, imdb, sn, en, is_anime);
+            skipdb::spawn_prefetch_ahead(app.clone(), tmdb, imdb, sn, en, abs_ep, is_anime);
         }
     }
     j(p)
@@ -1497,14 +1690,17 @@ async fn intro_worker(app: &Arc<App>) {
         flat.sort_by_key(|x| (x.0, x.1));
         let Some(ix) = flat.iter().position(|x| x.2 == last_ep) else { continue };
         // the episode being watched, the next two, and one before (a reference for matching)
-        let targets: Vec<_> = flat.iter().enumerate().filter(|(i, _)| *i + 1 >= ix && *i <= ix + 2).map(|(_, x)| x.clone()).collect();
+        let targets: Vec<(usize, (i64, i64, i64, String, f64))> = flat.iter().enumerate()
+            .filter(|(i, _)| *i + 1 >= ix && *i <= ix + 2)
+            .map(|(i, x)| (i + 1, x.clone()))
+            .collect();
         let (tmdb, imdb, is_anime) = resolve_series_ids(app, sid, None, None, false);
         let mut changed = false;
-        for (sn, n, ep, ext, dur) in targets {
+        for (abs_idx, (sn, n, ep, ext, dur)) in targets {
             app.skips.register(ep, sid, sn, n, dur);
             // First check free crowd-sourced skip DBs (IntroDB / TheIntroDB / AniSkip — zero provider load!).
             // Only audio-fingerprint segments still missing after crowd-sourced lookup!
-            let remote = skipdb::resolve_episode(app, &tmdb, &imdb, sn, n, dur, is_anime).await;
+            let remote = skipdb::resolve_episode(app, &tmdb, &imdb, sn, n, abs_idx as i64, dur, is_anime).await;
             let have_remote_intro = remote.as_ref().map_or(false, |r| r.intro.is_some());
             let have_remote_credits = remote.as_ref().map_or(false, |r| r.credits.is_some());
             for which in ["h", "t"] {

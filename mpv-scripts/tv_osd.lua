@@ -112,7 +112,11 @@ local raw_opts = {
     recap_e          = "-1",
     intro_s          = "-1",
     intro_e          = "-1",
+    intro_label      = "Intro",
     credits          = "-1",
+    credits_end      = "-1",
+    has_post_credits = "no",
+    is_anime         = "no",
     has_next         = "no",
     next_label       = "",
     autoplay         = "no",
@@ -132,7 +136,11 @@ local opts = {
     recap_e          = -1,
     intro_s          = -1,
     intro_e          = -1,
+    intro_label      = "Intro",
     credits          = -1,
+    credits_end      = -1,
+    has_post_credits = false,
+    is_anime         = false,
     has_next         = false,
     next_label       = "",
     autoplay         = false,
@@ -179,7 +187,7 @@ local function resolve_shader_dir()
             return parent .. "\\mpv-shaders"
         end
     end
-    return "C:\\Users\\V\\Documents\\tv\\mpv-shaders"
+    return ".\mpv-shaders"
 end
 
 local function sync_parsed_opts()
@@ -189,7 +197,12 @@ local function sync_parsed_opts()
     opts.recap_e          = parse_num(raw_opts.recap_e, -1)
     opts.intro_s          = parse_num(raw_opts.intro_s, -1)
     opts.intro_e          = parse_num(raw_opts.intro_e, -1)
+    opts.intro_label      = tostring(raw_opts.intro_label or "Intro")
+    if opts.intro_label == "" then opts.intro_label = "Intro" end
     opts.credits          = parse_num(raw_opts.credits, -1)
+    opts.credits_end      = parse_num(raw_opts.credits_end, -1)
+    opts.has_post_credits = parse_bool(raw_opts.has_post_credits, false)
+    opts.is_anime         = parse_bool(raw_opts.is_anime, false)
     opts.has_next         = parse_bool(raw_opts.has_next, false)
     opts.next_label       = tostring(raw_opts.next_label or "")
     opts.autoplay         = parse_bool(raw_opts.autoplay, false)
@@ -851,18 +864,36 @@ end
 
 do_skip_intro = function(auto)
     if state.intro_kind == "recap" and opts.recap_e > 0 then
-        mp.set_property_number("time-pos", opts.recap_e)
+        local target = opts.recap_e
+        local lbl = "Recap"
+        -- Chain immediately adjacent Intro/Opening (gap <= 6s) into one seamless jump!
+        if opts.intro_s >= 0 and opts.intro_e > opts.intro_s and opts.intro_s <= target + 6.0 and opts.intro_e > target then
+            target = opts.intro_e
+            state.intro_dismissed = true
+            state.intro_autoskipped = true
+            lbl = opts.is_anime and "Recap + Opening" or "Recap + Intro"
+        end
+        mp.set_property_number("time-pos", target)
         state.intro_visible = false
         state.recap_dismissed = true
         set_skip_key_bound(false)
-        show_toast(auto and "Auto-Skipped Recap" or "Skipped Recap")
+        show_toast((auto and "Auto-Skipped " or "Skipped ") .. lbl)
         render()
     elseif opts.intro_e > 0 then
-        mp.set_property_number("time-pos", opts.intro_e)
+        local target = opts.intro_e
+        local lbl = opts.intro_label ~= "" and opts.intro_label or (opts.is_anime and "Opening" or "Intro")
+        -- Chain immediately adjacent post-OP Recap (gap <= 6s) into one seamless jump!
+        if opts.recap_s >= 0 and opts.recap_e > opts.recap_s and opts.recap_s >= opts.intro_s and opts.recap_s <= target + 6.0 and opts.recap_e > target then
+            target = opts.recap_e
+            state.recap_dismissed = true
+            state.recap_autoskipped = true
+            lbl = lbl .. " + Recap"
+        end
+        mp.set_property_number("time-pos", target)
         state.intro_visible = false
         state.intro_dismissed = true
         set_skip_key_bound(false)
-        show_toast(auto and "Auto-Skipped Intro" or "Skipped Intro")
+        show_toast((auto and "Auto-Skipped " or "Skipped ") .. lbl)
         render()
     end
 end
@@ -1517,7 +1548,8 @@ render = function()
     -- 2. Floating Skip Intro Pill (Bottom-Right, shifts cleanly above HUD)
     ----------------------------------------------------------------------------
     if state.intro_visible then
-        local sw = 210
+        local skip_lbl = (state.intro_kind == "recap") and "Skip Recap  >" or ("Skip " .. (opts.intro_label ~= "" and opts.intro_label or "Intro") .. "  >")
+        local sw = math.max(210, estimate_text_w(skip_lbl, 22) + 84)
         local sh = 52
         local sx1 = W - pad
         local sx0 = sx1 - sw
@@ -1527,7 +1559,6 @@ render = function()
 
         local bg = hov and C.red or C.black
         local bc = hov and C.red_hover or C.white
-        local skip_lbl = (state.intro_kind == "recap") and "Skip Recap  >" or "Skip Intro  >"
         push(ass_rect(sx0, sy0, sx1, sy1, bg, "&H08&", 10, 2.0, bc))
         push(ass_text(sx0 + 24, (sy0 + sy1) * 0.5, 4, 22, C.white, skip_lbl, true))
         push(ass_text(sx1 - 18, (sy0 + sy1) * 0.5, 6, 16, hov and C.white or C.muted, "[S]", false))
@@ -1540,7 +1571,8 @@ render = function()
     -- 3. Floating Up Next Countdown Card (Bottom-Right)
     ----------------------------------------------------------------------------
     if state.up_next_visible then
-        local cw = 392
+        local can_skip_ed = opts.has_post_credits and opts.credits_end > 0 and (state.time_pos or 0) < (opts.credits_end - 4)
+        local cw = can_skip_ed and 448 or 392
         local ch = 158
         local cx1 = W - pad
         local cx0 = cx1 - cw
@@ -1564,7 +1596,9 @@ render = function()
         end
 
         -- Header row: UP NEXT + countdown
-        local hdr_txt = state.up_next_credits_skip and "SKIPPING CREDITS · UP NEXT" or "UP NEXT"
+        local hdr_txt = state.up_next_credits_skip
+            and (opts.is_anime and "SKIPPING ENDING · UP NEXT" or "SKIPPING CREDITS · UP NEXT")
+            or "UP NEXT"
         push(ass_text(cx0 + 22, cy0 + 20, 7, 16, C.red, hdr_txt, true))
         if opts.autoplay then
             local cd_str = string.format("Starting in %ds", math.max(0, state.up_next_remaining or 0))
@@ -1573,25 +1607,54 @@ render = function()
 
         -- Next episode title
         local nlabel = (opts.next_label ~= "") and opts.next_label or "Next Episode"
-        push(ass_text(cx0 + 22, cy0 + 48, 7, 23, C.white, truncate_text(nlabel, 30), true))
+        push(ass_text(cx0 + 22, cy0 + 48, 7, 23, C.white, truncate_text(nlabel, can_skip_ed and 34 or 30), true))
 
-        -- Buttons: Play Now & Watch Credits
+        -- Buttons: Play Now (+ optional Skip ED -> Post-Credits on anime) & Watch Credits/ED
         local btn_y1 = cy1 - 18
         local btn_y0 = btn_y1 - 44
-        local play_x0 = cx0 + 22
-        local play_x1 = play_x0 + 158
-        local dis_x0 = play_x1 + 12
-        local dis_x1 = cx1 - 22
+        if can_skip_ed then
+            local play_x0 = cx0 + 22
+            local play_x1 = play_x0 + 132
+            local ed_x0 = play_x1 + 10
+            local ed_x1 = ed_x0 + 144
+            local dis_x0 = ed_x1 + 10
+            local dis_x1 = cx1 - 22
 
-        local play_hov = is_hovered(play_x0, btn_y0, play_x1, btn_y1)
-        push(ass_rect(play_x0, btn_y0, play_x1, btn_y1, play_hov and C.red_hover or C.red, "&H00&", 8))
-        push(ass_text((play_x0 + play_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 19, C.white, "Play Now", true))
-        register_hit("up_next_play", play_x0, btn_y0, play_x1, btn_y1, trigger_play_next)
+            local play_hov = is_hovered(play_x0, btn_y0, play_x1, btn_y1)
+            push(ass_rect(play_x0, btn_y0, play_x1, btn_y1, play_hov and C.red_hover or C.red, "&H00&", 8))
+            push(ass_text((play_x0 + play_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 18, C.white, "Play Now", true))
+            register_hit("up_next_play", play_x0, btn_y0, play_x1, btn_y1, trigger_play_next)
 
-        local dis_hov = is_hovered(dis_x0, btn_y0, dis_x1, btn_y1)
-        push(ass_rect(dis_x0, btn_y0, dis_x1, btn_y1, dis_hov and C.pill_hover or C.pill, "&H00&", 8, 1.2, dis_hov and C.border_hi or C.border))
-        push(ass_text((dis_x0 + dis_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 18, C.text, "Watch Credits", false))
-        register_hit("up_next_dismiss", dis_x0, btn_y0, dis_x1, btn_y1, dismiss_up_next)
+            local ed_hov = is_hovered(ed_x0, btn_y0, ed_x1, btn_y1)
+            push(ass_rect(ed_x0, btn_y0, ed_x1, btn_y1, ed_hov and C.pill_hover or C.pill, "&H00&", 8, 1.2, ed_hov and C.white or C.border_hi))
+            push(ass_text((ed_x0 + ed_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 17, C.white, "Post-Credits >", true))
+            register_hit("up_next_skip_ed", ed_x0, btn_y0, ed_x1, btn_y1, function()
+                dismiss_up_next()
+                mp.set_property_number("time-pos", opts.credits_end)
+                show_toast("Skipped Ending -> Post-Credits")
+                render()
+            end)
+
+            local dis_hov = is_hovered(dis_x0, btn_y0, dis_x1, btn_y1)
+            push(ass_rect(dis_x0, btn_y0, dis_x1, btn_y1, dis_hov and C.pill_hover or C.pill, "&H00&", 8, 1.2, dis_hov and C.border_hi or C.border))
+            push(ass_text((dis_x0 + dis_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 17, C.text, "Stay", false))
+            register_hit("up_next_dismiss", dis_x0, btn_y0, dis_x1, btn_y1, dismiss_up_next)
+        else
+            local play_x0 = cx0 + 22
+            local play_x1 = play_x0 + 158
+            local dis_x0 = play_x1 + 12
+            local dis_x1 = cx1 - 22
+
+            local play_hov = is_hovered(play_x0, btn_y0, play_x1, btn_y1)
+            push(ass_rect(play_x0, btn_y0, play_x1, btn_y1, play_hov and C.red_hover or C.red, "&H00&", 8))
+            push(ass_text((play_x0 + play_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 19, C.white, "Play Now", true))
+            register_hit("up_next_play", play_x0, btn_y0, play_x1, btn_y1, trigger_play_next)
+
+            local dis_hov = is_hovered(dis_x0, btn_y0, dis_x1, btn_y1)
+            push(ass_rect(dis_x0, btn_y0, dis_x1, btn_y1, dis_hov and C.pill_hover or C.pill, "&H00&", 8, 1.2, dis_hov and C.border_hi or C.border))
+            push(ass_text((dis_x0 + dis_x1) * 0.5, (btn_y0 + btn_y1) * 0.5, 5, 18, C.text, opts.is_anime and "Watch Ending" or "Watch Credits", false))
+            register_hit("up_next_dismiss", dis_x0, btn_y0, dis_x1, btn_y1, dismiss_up_next)
+        end
     end
 
     ----------------------------------------------------------------------------

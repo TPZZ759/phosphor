@@ -824,6 +824,12 @@ body.playing #view, body.playing .modal { visibility: hidden; }
   border: 1px solid rgba(255, 77, 94, .32); display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
   font-size: 13px; color: #ffd4d8;
 }
+.airing-banner {
+  margin: 0 0 12px; padding: 11px 14px; border-radius: 10px; background: rgba(255, 181, 71, .09);
+  border: 1px solid rgba(255, 181, 71, .32); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: 13px; color: #ffe3b0;
+}
+.airing-banner b { color: #ffb547; }
 
 /* UFC & Sports Replays */
 .fight-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; padding: 0 var(--gutter); }

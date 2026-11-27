@@ -342,7 +342,7 @@ const BUILTIN: &[BuiltinShow] = &[
         title: "Black Clover",
         slug: "black-clover",
         aliases: &["black clover"],
-        total: 176,
+        total: 170,
         filler: &[(29, 29), (66, 66), (68, 68), (82, 82), (123, 125), (131, 131), (134, 135), (142, 149)],
         mixed: &[(2, 2), (8, 9), (12, 12), (30, 30), (69, 69), (102, 102)],
     },

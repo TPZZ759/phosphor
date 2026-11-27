@@ -5,7 +5,7 @@ use crate::app::App;
 use crate::catalog::Item;
 use crate::meta::Meta;
 use crate::rec::{match_results, sp};
-use crate::tmdb::{TTL_D, TTL_H};
+use crate::tmdb::TTL_H;
 use crate::util::{now_ms, s};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -150,47 +150,84 @@ pub fn movie_dub_status(app: &App, it: &Item) -> &'static str {
 }
 
 /// True for authentic Japanese anime (movies & series) in English/Anime categories,
-/// excluding Western cartoons (e.g. Batman / Tom & Jerry) that providers sometimes toss into MANGA/ANIME.
+/// excluding Western cartoons (e.g. Korra, Cuphead, Disenchantment, Alvin & the Chipmunks)
+/// that IPTV providers frequently file into NETFLIX ANIME or EN - MANGA/ANIME.
 pub fn is_anime_item(app: &App, it: &Item) -> bool {
     if !it.en { return false; }
     let cat_name = app.catalog().cat_name(if it.k == "s" { "series" } else { "movie" }, &it.cat).to_uppercase();
-    if cat_name.contains("NETFLIX ANIME") || cat_name.contains("NETFLIX ANIMI") || cat_name.contains("CRUNCHYROLL") {
-        return true;
-    }
     if let Some(m) = app.meta_of(it) {
         let is_anim = m.g.contains(&16);
         let is_jp = m.l == "ja" || m.oc.iter().any(|c| c == "JP");
         if is_anim && is_jp { return true; }
-        // If TMDB explicitly says it's Western non-Japanese animation, exclude even if in EN - MANGA/ANIME
-        if !m.l.is_empty() && m.l != "ja" && !m.oc.iter().any(|c| c == "JP") { return false; }
+        // If TMDB explicitly reports a non-Japanese language/origin or non-animation genre, exclude it
+        // even if the provider placed it inside NETFLIX ANIME or CRUNCHYROLL.
+        if !m.l.is_empty() && !is_jp { return false; }
+        if !m.g.is_empty() && !is_anim { return false; }
     }
     // Fallback before TMDB metadata is indexed
-    if it.origin == "JP" && (it.genre.to_lowercase().contains("anim") || cat_name.contains("ANIME") || cat_name.contains("MANGA")) {
+    if it.origin == "JP" && (it.genre.to_lowercase().contains("anim") || cat_name.contains("ANIME") || cat_name.contains("ANIMI") || cat_name.contains("MANGA") || cat_name.contains("CRUNCHYROLL")) {
+        return true;
+    }
+    if cat_name.contains("CRUNCHYROLL") && it.origin != "US" && it.origin != "GB" && it.origin != "FR" {
         return true;
     }
     false
 }
 
-/// Series-level dub summary across cached episode probes: ("yes" | "no" | "unknown", dubbed_count, sub_only_count)
+/// Series-level dub summary across cached episode probes (checks primary + native EN variants):
+/// ("yes" | "no" | "unknown", dubbed_count, sub_only_count).
+///
+/// Smart threshold: never wipe out a multi-season anime (like Black Clover's 170 episodes) just
+/// because 1-2 late/finale episodes were probed Japanese-only while the rest of the show is unchecked!
+/// Only mark an entire series "no" (sub-only) when every episode is checked sub-only, OR early/S1
+/// episodes are confirmed sub-only alongside >=2 sub-only probes, OR >=50% of all episodes are sub-only.
 pub fn series_dub_summary(app: &App, sid: i64) -> (&'static str, usize, usize) {
-    let key = format!("get_series_info:{sid}");
-    let info = app.xinfo.lock().unwrap().get(&key).map(|(_, v)| v.clone());
-    let Some(info) = info else { return ("unknown", 0, 0); };
+    let cat = app.catalog();
+    let mut sids: Vec<i64> = vec![sid];
+    if let Some(it) = cat.series_item(sid) {
+        if it.id != sid { sids.insert(0, it.id); }
+        for v in &it.variants {
+            if !v.sub_market && !sids.contains(&v.id) { sids.push(v.id); }
+        }
+    }
+    let infos: Vec<Arc<Value>> = {
+        let g = app.xinfo.lock().unwrap();
+        sids.iter().filter_map(|id| g.get(&format!("get_series_info:{id}")).map(|(_, v)| v.clone())).collect()
+    };
+    if infos.is_empty() { return ("unknown", 0, 0); }
     let dubs = app.dubs.snapshot();
-    let mut yes = 0usize; let mut no = 0usize;
-    if let Some(m) = info["episodes"].as_object() {
-        for list in m.values() {
-            for e in list.as_array().into_iter().flatten() {
-                let eid = crate::util::i(&e["id"]);
-                if let Some(d) = dubs.get(&format!("e:{eid}")) {
-                    if d.has_en { yes += 1; } else { no += 1; }
+    let mut seen_eids: HashSet<i64> = HashSet::new();
+    let mut total_eps = 0usize;
+    let mut yes = 0usize;
+    let mut no = 0usize;
+    let mut early_no = false;
+    for info in &infos {
+        if let Some(m) = info["episodes"].as_object() {
+            for (sk, list) in m {
+                let sn: i64 = sk.parse().unwrap_or(0);
+                for (idx, e) in list.as_array().into_iter().flatten().enumerate() {
+                    let eid = crate::util::i(&e["id"]);
+                    if eid <= 0 || !seen_eids.insert(eid) { continue; }
+                    total_eps += 1;
+                    if let Some(d) = dubs.get(&format!("e:{eid}")) {
+                        if d.has_en {
+                            yes += 1;
+                        } else {
+                            no += 1;
+                            if sn == 1 && idx < 3 { early_no = true; }
+                        }
+                    }
                 }
             }
         }
     }
-    if yes > 0 { ("yes", yes, no) }
-    else if no > 0 { ("no", 0, no) }
-    else { ("unknown", 0, 0) }
+    if yes > 0 {
+        ("yes", yes, no)
+    } else if no > 0 && (total_eps <= 2 || no >= total_eps || (early_no && no >= 2) || (total_eps > 0 && no * 2 >= total_eps)) {
+        ("no", 0, no)
+    } else {
+        ("unknown", 0, no)
+    }
 }
 
 fn anime_card(app: &App, it: &Item, tm: Option<&Value>) -> Value {
@@ -204,19 +241,27 @@ fn anime_card(app: &App, it: &Item, tm: Option<&Value>) -> Value {
     };
     c["dubStatus"] = json!(ds);
     if dc > 0 { c["dubbedCount"] = json!(dc); }
+    if it.k == "s" {
+        if let Some(sf) = crate::filler::builtin_lookup(&it.title) {
+            c["fillerPct"] = json!(sf.filler_pct().round() as i64);
+        }
+    }
     c
 }
 
-fn anime_pool(app: &App) -> (Vec<Item>, Vec<Item>) {
+fn anime_pool_with(app: &App, include_sub_only: bool) -> (Vec<Item>, Vec<Item>) {
     let cat = app.catalog();
     let tv: Vec<Item> = cat.series.iter().filter(|it| is_anime_item(app, it)).filter(|it| {
-        let (st, _, _) = series_dub_summary(app, it.id);
-        st != "no"
+        include_sub_only || series_dub_summary(app, it.id).0 != "no"
     }).cloned().collect();
     let mv: Vec<Item> = cat.movies.iter().filter(|it| is_anime_item(app, it)).filter(|it| {
-        movie_dub_status(app, it) != "no"
+        include_sub_only || movie_dub_status(app, it) != "no"
     }).cloned().collect();
     (tv, mv)
+}
+
+fn anime_pool(app: &App) -> (Vec<Item>, Vec<Item>) {
+    anime_pool_with(app, false)
 }
 
 fn sort_pairs<'a>(mut v: Vec<(&'a Item, Option<Meta>)>, mode: &str) -> Vec<&'a Item> {
@@ -272,77 +317,194 @@ fn has_kw_or_genre(app: &App, it: &Item, genres: &[i64], plot_re: &regex::Regex)
     plot_re.is_match(&it.plot) || plot_re.is_match(&it.title) || plot_re.is_match(&it.genre)
 }
 
-/// GET /api/anime: Hero + curated English-dubbed anime rows.
+/// GET /api/anime: Modern hero + rich curated anime rows (matching & exceeding the TV Series hub).
 pub async fn page(app: Arc<App>) -> Value {
     let (tv, mv) = anime_pool(&app);
+    let cat = app.catalog();
     let mut rows: Vec<Value> = vec![];
-
-    // Trending / Popular via TMDB Japanese animation ∩ our anime pool
     let mut hero_items: Vec<Value> = vec![];
+
+    let decorate_tv = |app: &App, list: Vec<Value>| -> Vec<Value> {
+        list.into_iter().filter(|c| {
+            let id = c["id"].as_i64().unwrap_or(0);
+            app.catalog().series_item(id).map_or(false, |it| is_anime_item(app, it))
+                && series_dub_summary(app, id).0 != "no"
+        }).map(|mut c| {
+            let id = c["id"].as_i64().unwrap_or(0);
+            let (st, dc, _) = series_dub_summary(app, id);
+            c["isAnime"] = json!(true);
+            c["dubStatus"] = json!(st);
+            if dc > 0 { c["dubbedCount"] = json!(dc); }
+            if let Some(sf) = crate::filler::builtin_lookup(&s(&c["title"])) {
+                c["fillerPct"] = json!(sf.filler_pct().round() as i64);
+            }
+            c
+        }).collect()
+    };
+    let decorate_mv = |app: &App, list: Vec<Value>| -> Vec<Value> {
+        list.into_iter().filter(|c| {
+            let id = c["id"].as_i64().unwrap_or(0);
+            app.catalog().movie(id).map_or(false, |it| is_anime_item(app, it) && movie_dub_status(app, it) != "no")
+        }).map(|mut c| {
+            let id = c["id"].as_i64().unwrap_or(0);
+            let ds = app.catalog().movie(id).map(|it| movie_dub_status(app, it)).unwrap_or("unknown");
+            c["isAnime"] = json!(true);
+            c["dubStatus"] = json!(ds);
+            c
+        }).collect()
+    };
+
     if app.tmdb.enabled() {
-        let (tr_tv, tr_mv) = tokio::join!(
-            app.tmdb.pages("/discover/tv", 3, [sp("with_genres", "16"), sp("with_original_language", "ja"), sp("sort_by", "popularity.desc"), sp("vote_count.gte", "50")], 6 * TTL_H),
+        let cur_year = chrono::Datelike::year(&chrono::Utc::now());
+        let modern_from = format!("{}-01-01", (cur_year - 9).max(2016));
+        let recent_from = format!("{}-01-01", (cur_year - 2).max(2024));
+        let (wk_trend, on_air, mod_pop, new_rel, tr_mv) = tokio::join!(
+            app.tmdb.pages("/trending/tv/week", 4, crate::tmdb::NO, 3 * TTL_H),
+            app.tmdb.pages("/tv/on_the_air", 4, crate::tmdb::NO, 3 * TTL_H),
+            app.tmdb.pages("/discover/tv", 3, [sp("with_genres", "16"), sp("with_original_language", "ja"), sp("first_air_date.gte", &modern_from), sp("sort_by", "popularity.desc"), sp("vote_count.gte", "80")], 6 * TTL_H),
+            app.tmdb.pages("/discover/tv", 3, [sp("with_genres", "16"), sp("with_original_language", "ja"), sp("first_air_date.gte", &recent_from), sp("sort_by", "popularity.desc")], 6 * TTL_H),
             app.tmdb.pages("/discover/movie", 2, [sp("with_genres", "16"), sp("with_original_language", "ja"), sp("sort_by", "popularity.desc"), sp("vote_count.gte", "50")], 6 * TTL_H)
         );
-        let tv_hits: Vec<Value> = match_results(&app, &tr_tv, Some("tv"), 40).into_iter().filter(|c| {
+        let wk_hits = decorate_tv(&app, match_results(&app, &wk_trend, Some("tv"), 40));
+        let air_hits = decorate_tv(&app, match_results(&app, &on_air, Some("tv"), 40));
+        let mod_hits = decorate_tv(&app, match_results(&app, &mod_pop, Some("tv"), 40));
+        let new_hits = decorate_tv(&app, match_results(&app, &new_rel, Some("tv"), 40));
+        let mv_hits = decorate_mv(&app, match_results(&app, &tr_mv, Some("movie"), 40));
+
+        // Trending Anime This Week = live TMDB weekly trending anime + modern 2017+ buzz (deduped)
+        let mut trend_seen: HashSet<i64> = HashSet::new();
+        let mut trending: Vec<Value> = vec![];
+        for c in wk_hits.iter().chain(mod_hits.iter()) {
             let id = c["id"].as_i64().unwrap_or(0);
-            series_dub_summary(&app, id).0 != "no"
-        }).map(|mut c| {
+            if id > 0 && trend_seen.insert(id) { trending.push(c.clone()); }
+        }
+        trending.truncate(40);
+
+        // Airing Now & New Releases (2024-2026)
+        let mut air_seen: HashSet<i64> = HashSet::new();
+        let mut airing: Vec<Value> = vec![];
+        for c in air_hits.iter().chain(new_hits.iter()) {
             let id = c["id"].as_i64().unwrap_or(0);
-            let (ds, dc) = { let (st, y, _) = series_dub_summary(&app, id); (st, y) };
-            c["isAnime"] = json!(true); c["dubStatus"] = json!(ds); if dc > 0 { c["dubbedCount"] = json!(dc); }
-            c
-        }).collect();
-        let mv_hits: Vec<Value> = match_results(&app, &tr_mv, Some("movie"), 30).into_iter().filter(|c| {
+            if id > 0 && air_seen.insert(id) { airing.push(c.clone()); }
+        }
+        // Supplement with local 2025-2026 anime sorted by popularity/rating
+        let local_new: Vec<&Item> = sort_meta(&app, tv.iter().filter(|it| {
+            let yr = app.meta_of(it).map(|m| m.year()).filter(|&y| y > 0).or(it.year).unwrap_or(0);
+            yr >= cur_year - 1
+        }).collect(), "popular");
+        for it in local_new {
+            if air_seen.insert(it.id) { airing.push(anime_card(&app, it, None)); }
+        }
+        airing.truncate(40);
+
+        // Modern vibrant Hero (6 slides): prioritize current trending & 2017+ flagship anime (max 1 pre-2015 classic!)
+        let mut hero_seen: HashSet<i64> = HashSet::new();
+        let mut classics = 0usize;
+        for c in wk_hits.iter().chain(mod_hits.iter()).chain(air_hits.iter()).chain(mv_hits.iter()) {
+            if hero_items.len() >= 6 { break; }
             let id = c["id"].as_i64().unwrap_or(0);
-            app.catalog().movie(id).map_or(true, |it| movie_dub_status(&app, it) != "no")
-        }).map(|mut c| {
-            let id = c["id"].as_i64().unwrap_or(0);
-            let ds = app.catalog().movie(id).map(|it| movie_dub_status(&app, it)).unwrap_or("unknown");
-            c["isAnime"] = json!(true); c["dubStatus"] = json!(ds);
-            c
-        }).collect();
-        hero_items = tv_hits.iter().chain(mv_hits.iter()).filter(|x| !s(&x["backdrop"]).is_empty() && !s(&x["overview"]).is_empty()).take(6).cloned().collect();
-        if !tv_hits.is_empty() { rows.push(json!({ "id": "an-trend", "title": "Trending Anime Series", "sub": "English dubbed · non-dubbed episodes filtered", "items": tv_hits })); }
-        if !mv_hits.is_empty() { rows.push(json!({ "id": "an-films", "title": "Popular Anime Films & Studio Ghibli", "items": mv_hits })); }
+            if id == 0 || s(&c["backdrop"]).is_empty() || s(&c["overview"]).is_empty() { continue; }
+            let yr = c["year"].as_i64().unwrap_or(0);
+            if yr > 0 && yr < 2015 {
+                if classics >= 1 { continue; }
+                classics += 1;
+            }
+            if hero_seen.insert(id) { hero_items.push(c.clone()); }
+        }
+
+        if !trending.is_empty() {
+            rows.push(json!({ "id": "an-trend", "title": "Trending Anime This Week", "sub": "What's hot right now · auto-skip ready", "items": trending }));
+        }
+        if !airing.is_empty() {
+            rows.push(json!({ "id": "an-air", "title": "Airing Now & New Releases", "sub": format!("Currently airing & {}-{} drops", cur_year - 1, cur_year), "items": airing }));
+        }
+        if !mv_hits.is_empty() {
+            rows.push(json!({ "id": "an-films", "title": "Studio Ghibli & Popular Anime Films", "items": mv_hits }));
+        }
     }
 
     let tv_refs: Vec<&Item> = tv.iter().collect();
     let mv_refs: Vec<&Item> = mv.iter().collect();
 
     if hero_items.len() < 3 {
-        hero_items = sort_meta(&app, tv_refs.clone(), "popular").into_iter()
-            .filter(|x| !x.backdrop.is_empty() || app.meta_of(x).map_or(false, |m| !m.bd.is_empty()))
-            .take(6).map(|x| anime_card(&app, x, None)).collect();
+        let mut seen: HashSet<i64> = hero_items.iter().filter_map(|x| x["id"].as_i64()).collect();
+        for x in sort_meta(&app, tv_refs.clone(), "popular") {
+            if hero_items.len() >= 6 { break; }
+            let has_bd = !x.backdrop.is_empty() || app.meta_of(x).map_or(false, |m| !m.bd.is_empty());
+            if has_bd && seen.insert(x.id) { hero_items.push(anime_card(&app, x, None)); }
+        }
     }
 
-    // Verified English Dubbed row (shows with confirmed EN audio tracks!)
-    let verified: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| series_dub_summary(&app, it.id).0 == "yes").collect(), "popular")
-        .into_iter().chain(sort_meta(&app, mv_refs.iter().copied().filter(|it| movie_dub_status(&app, it) == "yes").collect(), "popular"))
-        .take(36).map(|x| anime_card(&app, x, None)).collect();
-    if !verified.is_empty() {
-        rows.push(json!({ "id": "an-verified", "title": "Verified English Dubs", "sub": "Confirmed English audio tracks", "items": verified }));
-    }
-
-    // Shonen & Action
-    let shonen: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[10759], crate::re!(r"(?i)battle|shonen|fighter|tournament|ninja|pirate|hero|hunter|slayer|curse|alchemy"))).collect(), "popular")
+    // Platform rows (parity with TV page's Popular on Netflix / Stan / Disney+!)
+    let cr_items: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| cat.item_has_platform(it, "Crunchyroll")).collect(), "popular")
         .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
-    if !shonen.is_empty() { rows.push(json!({ "id": "an-shonen", "title": "Shonen & Action", "items": shonen })); }
+    if cr_items.len() >= 4 {
+        rows.push(json!({ "id": "an-plat-cr", "title": "Popular on Crunchyroll", "sub": "Simuldub & Crunchyroll originals", "items": cr_items }));
+    }
+    let nf_items: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| cat.item_has_platform(it, "Netflix")).collect(), "popular")
+        .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
+    if nf_items.len() >= 6 {
+        rows.push(json!({ "id": "an-plat-nf", "title": "Popular on Netflix Anime", "items": nf_items }));
+    }
 
-    // Dark Fantasy & Seinen
-    let dark: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[80, 9648], crate::re!(r"(?i)demon|vampire|blood|death|dark|curse|ghoul|psycho|assassin|revenge|monster|titan|chainsaw|berserk|parasyte|hell"))).collect(), "rating")
+    // Shonen & Battle Classics
+    let shonen: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[10759], crate::re!(r"(?i)battle|shonen|fighter|tournament|ninja|pirate|hero|hunter|slayer|curse|alchemy|clover|magic knight|soul reaper"))).collect(), "popular")
+        .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
+    if !shonen.is_empty() { rows.push(json!({ "id": "an-shonen", "title": "Shonen & Battle Classics", "items": shonen })); }
+
+    // Dark Fantasy, Seinen & Psychological
+    let dark: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[80, 9648], crate::re!(r"(?i)demon|vampire|blood|death|dark|curse|ghoul|psycho|assassin|revenge|monster|titan|chainsaw|berserk|parasyte|hell|cyberpunk|vinland"))).collect(), "rating")
         .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
     if !dark.is_empty() { rows.push(json!({ "id": "an-dark", "title": "Dark Fantasy & Seinen", "items": dark })); }
 
-    // Isekai & Sci-Fi / Fantasy
-    let fantasy: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[10765], crate::re!(r"(?i)reincarnat|another world|isekai|dungeon|magic|guild|level|rpg|mecha|gundam|cyber|future|space"))).collect(), "popular")
+    // Isekai, Magic & Fantasy
+    let fantasy: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[10765], crate::re!(r"(?i)reincarnat|another world|isekai|dungeon|magic|guild|level|rpg|mecha|gundam|cyber|future|space|elf|slime"))).collect(), "popular")
         .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
-    if !fantasy.is_empty() { rows.push(json!({ "id": "an-fantasy", "title": "Isekai, Fantasy & Sci-Fi", "items": fantasy })); }
+    if !fantasy.is_empty() { rows.push(json!({ "id": "an-fantasy", "title": "Isekai, Magic & Sci-Fi", "items": fantasy })); }
 
-    // Anime Films (fallback / full list including Ghibli)
+    // Zero & Low-Filler Bangers (unique anime-native row: acclaimed shows with <15% filler!)
+    let no_filler: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| {
+        let good = app.meta_of(it).map_or(it.rating >= 7.8, |m| m.va >= 7.8 && m.vc >= 150);
+        if !good { return false; }
+        match crate::filler::builtin_lookup(&it.title) {
+            Some(sf) => sf.filler_pct() <= 15.0,
+            None => true,
+        }
+    }).collect(), "rating").into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
+    if no_filler.len() >= 6 {
+        rows.push(json!({ "id": "an-nofiller", "title": "Zero & Low-Filler Bangers", "sub": "All story, minimal filler (<15%)", "items": no_filler }));
+    }
+
+    // Short & Complete (Binge in a Weekend — 1-2 season completed masterpieces, parity with TV's Bingeable Miniseries!)
+    let short_binge: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| {
+        app.meta_of(it).map_or(false, |m| m.st.eq_ignore_ascii_case("Ended") && m.va >= 7.6 && m.vc >= 80 && m.ns > 0 && m.ns <= 2)
+    }).collect(), "rating").into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
+    if short_binge.len() >= 6 {
+        rows.push(json!({ "id": "an-short", "title": "Short & Complete (1–2 Seasons)", "sub": "Finished stories you can binge this weekend", "items": short_binge }));
+    }
+
+    // Comedy & Slice of Life
+    let comedy: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[35], crate::re!(r"(?i)comedy|school|slice of life|hilarious|spy|family|romantic|romance"))).collect(), "rating")
+        .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
+    if comedy.len() >= 6 { rows.push(json!({ "id": "an-comedy", "title": "Comedy & Slice of Life", "items": comedy })); }
+
+    // Mystery & Supernatural Thriller
+    let mystery: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| has_kw_or_genre(&app, it, &[9648], crate::re!(r"(?i)mystery|detective|supernatural|time travel|conspiracy|murder|thriller|psychic"))).collect(), "rating")
+        .into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
+    if mystery.len() >= 6 { rows.push(json!({ "id": "an-mystery", "title": "Mystery & Supernatural", "items": mystery })); }
+
+    // Anime Films fallback if TMDB disabled
     let films: Vec<Value> = sort_meta(&app, mv_refs.clone(), "rating").into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
     if !films.is_empty() && !rows.iter().any(|r| r["id"] == "an-films") {
-        rows.push(json!({ "id": "an-films", "title": "Anime Films & Studio Ghibli", "items": films }));
+        rows.push(json!({ "id": "an-films", "title": "Studio Ghibli & Anime Films", "items": films }));
+    }
+
+    // 4K & Remastered Anime
+    let uhd_items: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().chain(mv_refs.iter().copied()).filter(|it| {
+        it.uhd || it.dv || it.hdr || it.variants.iter().any(|v| !v.cam && (v.uhd || v.dv || v.hdr))
+    }).collect(), "popular").into_iter().take(36).map(|x| anime_card(&app, x, None)).collect();
+    if uhd_items.len() >= 3 {
+        rows.push(json!({ "id": "an-4k", "title": "4K & HDR Anime", "sub": "Ultra-sharp OLED showcase", "items": uhd_items }));
     }
 
     // Completed Binge-Ready Series
@@ -351,22 +513,53 @@ pub async fn page(app: Arc<App>) -> Value {
     }).collect(), "rating").into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
     if !completed.is_empty() { rows.push(json!({ "id": "an-done", "title": "Completed Series (Binge-Ready)", "items": completed })); }
 
+    // Verified English Dubbed row (shown when we have multiple verified titles)
+    let verified: Vec<Value> = sort_meta(&app, tv_refs.iter().copied().filter(|it| series_dub_summary(&app, it.id).0 == "yes").collect(), "popular")
+        .into_iter().chain(sort_meta(&app, mv_refs.iter().copied().filter(|it| movie_dub_status(&app, it) == "yes").collect(), "popular"))
+        .take(36).map(|x| anime_card(&app, x, None)).collect();
+    if verified.len() >= 3 {
+        rows.push(json!({ "id": "an-verified", "title": "Verified English Dubs", "sub": "Confirmed English audio tracks", "items": verified }));
+    }
+
     // Recently Updated Anime
     let recent: Vec<Value> = sort_meta(&app, tv_refs.clone(), "added").into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
     if !recent.is_empty() { rows.push(json!({ "id": "an-new", "title": "Recently Updated Anime", "items": recent })); }
 
     // All-Time Greats (8.0+)
-    let all_items: Vec<&Item> = tv_refs.into_iter().chain(mv_refs.into_iter()).filter(|it| {
+    let all_items: Vec<&Item> = tv_refs.iter().copied().chain(mv_refs.iter().copied()).filter(|it| {
         app.meta_of(it).map_or(it.rating >= 8.0, |m| m.va >= 8.0 && m.vc >= 100)
     }).collect();
     let greats: Vec<Value> = sort_meta(&app, all_items, "rating").into_iter().take(40).map(|x| anime_card(&app, x, None)).collect();
     if !greats.is_empty() { rows.push(json!({ "id": "an-top", "title": "All-Time Anime Greats (8.0+)", "items": greats })); }
 
+    // Precompute filter-bar facet counts (platforms & genres) so #/anime renders live chip counts immediately
+    let mut g_counts: HashMap<i64, usize> = HashMap::new();
+    let mut p_counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut uhd_total = 0usize;
+    for it in tv.iter().chain(mv.iter()) {
+        if it.uhd || it.variants.iter().any(|v| !v.cam && v.uhd) { uhd_total += 1; }
+        if let Some(m) = app.meta_of(it) {
+            for &g in &m.g {
+                // Map movie genres to unified TV genre buckets for chip counts
+                let canon = match g { 28 | 12 => 10759, 14 | 878 => 10765, 10752 => 10768, x => x };
+                *g_counts.entry(canon).or_default() += 1;
+            }
+        }
+        for p in cat.item_platforms(it) { *p_counts.entry(p).or_default() += 1; }
+    }
+    let mut plat_vec: Vec<(&str, usize)> = p_counts.into_iter().collect();
+    plat_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    plat_vec.truncate(10);
+    let g_map: serde_json::Map<String, Value> = g_counts.into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+
     json!({
         "hero": hero_items,
         "rows": rows,
-        "counts": { "series": tv.len(), "movies": mv.len() },
-        "dubStats": dub_stats(&app)
+        "counts": { "series": tv.len(), "movies": mv.len(), "total": tv.len() + mv.len(), "uhd": uhd_total },
+        "genres": Value::Object(g_map),
+        "platforms": plat_vec.into_iter().map(|(n, c)| json!({ "name": n, "count": c })).collect::<Vec<_>>(),
+        "dubStats": dub_stats(&app),
+        "skipStats": app.skipdb.stats()
     })
 }
 
@@ -568,21 +761,26 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
     let rmin = num("rmin");
     let platform = get("platform").trim().to_string();
     let uhd = get("uhd") == "1";
-    let completed = get("completed") == "1" || get("status").eq_ignore_ascii_case("ended");
+    let status_f = get("status").trim().to_lowercase(); // "" | airing | ended | short
+    let completed = get("completed") == "1" || status_f == "ended";
+    let airing_only = status_f == "airing" || status_f == "returning";
+    let short_only = status_f == "short";
     let unwatched = get("unwatched") == "1";
-    let verified_only = get("dub") == "verified";
+    let dub_mode = get("dub").trim().to_lowercase(); // "" | verified | all
+    let verified_only = dub_mode == "verified";
+    let include_sub_only = dub_mode == "all" || get("sub") == "1";
     let no_filler = get("noFiller") == "1" || get("nofiller") == "1";
     let sort = get("sort");
     let seen = if unwatched { Some(crate::discover::watched_set(app)) } else { None };
     let cat = app.catalog();
-    let (tv, mv) = anime_pool(app);
+    let (tv, mv) = anime_pool_with(app, include_sub_only);
     let mut pool: Vec<Item> = vec![];
     if kind != "movie" { pool.extend(tv); }
     if kind != "tv" { pool.extend(mv); }
 
     let mut matched: Vec<(&Item, Option<Meta>, bool)> = vec![];
     for it in &pool {
-        if uhd && !(it.uhd || it.variants.iter().any(|v| v.uhd)) { continue; }
+        if uhd && !(it.uhd || it.variants.iter().any(|v| !v.cam && v.uhd)) { continue; }
         if !platform.is_empty() && !cat.item_has_platform(it, &platform) { continue; }
         if let Some(seen) = &seen {
             if let Some(t) = &it.tmdb {
@@ -617,6 +815,8 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
             if !ok { continue; }
         }
         if completed && !m.as_ref().map_or(false, |m| m.st.eq_ignore_ascii_case("Ended")) { continue; }
+        if airing_only && !m.as_ref().map_or(false, |m| m.st.eq_ignore_ascii_case("Returning Series") || m.st.eq_ignore_ascii_case("In Production")) { continue; }
+        if short_only && (it.k != "s" || !m.as_ref().map_or(false, |m| m.st.eq_ignore_ascii_case("Ended") && m.ns > 0 && m.ns <= 2)) { continue; }
         if no_filler && it.k == "s" {
             if let Some(sf) = crate::filler::builtin_lookup(&it.title) {
                 if sf.filler_pct() > 20.0 { continue; }
@@ -715,7 +915,11 @@ pub async fn dub_worker(app: &Arc<App>) {
         }
         if by_s.is_empty() { continue; }
         let mut picks: Vec<(i64, String)> = vec![];
-        for eps in by_s.values() {
+        // Always probe S1E1 first (representative of whether the show is dubbed at all) before checking latest ep
+        if let Some(first_s) = by_s.values().next() {
+            if let Some(first) = first_s.first() { picks.push((first.1, first.2.clone())); }
+        }
+        for eps in by_s.values().skip(1) {
             if let Some(first) = eps.first() { picks.push((first.1, first.2.clone())); }
         }
         if let Some((_, last_s)) = by_s.iter().next_back() {

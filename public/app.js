@@ -692,7 +692,7 @@ async function pageDocs() {
   drawBody();
 }
 
-let animeState = { mode: 'curated', kind: 'all', g: '', q: '', decade: '', rmin: '', platform: '', noFiller: false, uhd: false, completed: false, unwatched: false, verified: false, sort: 'popular' };
+let animeState = { mode: 'curated', kind: 'all', g: '', q: '', decade: '', rmin: '', platform: '', status: '', dub: '', noFiller: false, uhd: false, unwatched: false, sort: 'popular' };
 async function pageAnime() {
   const d = await api('/api/anime').catch(() => ({}));
   if (!d || !Array.isArray(d.rows)) {
@@ -701,70 +701,115 @@ async function pageAnime() {
     return;
   }
   const heroItems = d.hero || [];
+  const gCnt = d.genres || {};
   const anGenres = [['', 'All genres'], ['10759', 'Action & Shonen'], ['10765', 'Fantasy & Sci-Fi'], ['18', 'Drama'], ['35', 'Comedy'], ['9648', 'Mystery'], ['80', 'Crime & Dark']];
-  const anPlats = [['', 'All platforms'], ['crunchyroll', 'Crunchyroll'], ['netflix', 'Netflix'], ['disney', 'Disney+'], ['amazon', 'Amazon'], ['hbo', 'HBO']];
+  const platList = (d.platforms || []).length
+    ? d.platforms.map((p) => [p.name.toLowerCase().replace(/[^a-z]/g, ''), `${p.name} (${p.count})`])
+    : [['crunchyroll', 'Crunchyroll'], ['netflix', 'Netflix'], ['disney', 'Disney+'], ['amazon', 'Amazon'], ['hbo', 'HBO']];
+  const anPlats = [['', 'All platforms'], ...platList];
+  const anStatus = [['', 'All statuses'], ['airing', 'Airing / Returning'], ['ended', 'Completed'], ['short', 'Short & Complete (1–2S)']];
+  const anDub = [['', 'English Dubbed'], ['verified', 'Verified Dubs Only'], ['all', 'All (incl. Sub-Only)']];
   const vmode = getViewMode();
+  const totalCnt = d.counts?.total ?? ((d.counts?.series || 0) + (d.counts?.movies || 0));
+  const skipMatched = d.skipStats?.matched || 0;
   view.innerHTML = heroHTML(heroItems) + `<div class="rows">
     <div class="anime-bar">
       <div class="anime-bar-row">
         <div class="chips">
           <button class="chip ${animeState.mode === 'curated' ? 'on' : ''}" data-amode="curated">Curated</button>
-          <button class="chip ${animeState.mode === 'grid' && animeState.kind === 'all' ? 'on' : ''}" data-amode="all">All Anime</button>
+          <button class="chip ${animeState.mode === 'grid' && animeState.kind === 'all' ? 'on' : ''}" data-amode="all">All Anime <span class="chip-cnt">${totalCnt}</span></button>
           <button class="chip ${animeState.mode === 'grid' && animeState.kind === 'tv' ? 'on' : ''}" data-amode="tv">Series <span class="chip-cnt">${d.counts?.series || 0}</span></button>
           <button class="chip ${animeState.mode === 'grid' && animeState.kind === 'movie' ? 'on' : ''}" data-amode="movie">Movies <span class="chip-cnt">${d.counts?.movies || 0}</span></button>
         </div>
         <input type="search" class="explore-search" id="aQuery" placeholder="Search anime by title, plot, genre…" value="${esc(animeState.q)}">
+        ${skipMatched > 0 ? `<span class="pill plat" title="AniSkip + IntroDB + TheIntroDB auto-skip active for OP, Recap & ED">⚡ Auto-Skip Active</span>` : ''}
         <button class="btn btn-ghost btn-sm" data-surprise="anime">🎲 Pick anime</button>
         ${viewToggleHTML(vmode)}
       </div>
       <div class="anime-bar-row">
-        <div class="chips">${anGenres.map(([id, lab]) => `<button class="chip sm ${animeState.g === id && animeState.mode === 'grid' ? 'on' : ''}" data-ag="${id}">${esc(lab)}</button>`).join('')}</div>
+        <div class="chips">${anGenres.map(([id, lab]) => {
+          const c = id ? (gCnt[id] || 0) : 0;
+          return `<button class="chip sm ${animeState.g === id && animeState.mode === 'grid' ? 'on' : ''}" data-ag="${id}">${esc(lab)}${c ? `<span class="chip-cnt">${c}</span>` : ''}</button>`;
+        }).join('')}</div>
       </div>
       <div class="anime-bar-row">
         ${sel('aPlat', anPlats, animeState.platform)}
+        ${sel('aStatus', anStatus, animeState.status)}
+        ${sel('aDub', anDub, animeState.dub)}
         ${sel('aDecade', DECADES, animeState.decade)}
         ${sel('aRating', RATINGS_DEEP, animeState.rmin)}
         ${sel('aSort', [['popular', 'Popular'], ['rating', 'Top rated'], ['votes', 'Most voted'], ['newest', 'Newest'], ['oldest', 'Oldest'], ['added', 'Recently added'], ['az', 'A–Z']], animeState.sort)}
-        <label class="tog"><input type="checkbox" id="aVer" ${animeState.verified ? 'checked' : ''}> Verified dubs</label>
         <label class="tog"><input type="checkbox" id="aNoFill" ${animeState.noFiller ? 'checked' : ''}> Low filler (&lt;20%)</label>
-        <label class="tog"><input type="checkbox" id="aUhd" ${animeState.uhd ? 'checked' : ''}> 4K</label>
-        <label class="tog"><input type="checkbox" id="aDone" ${animeState.completed ? 'checked' : ''}> Completed</label>
+        <label class="tog"><input type="checkbox" id="aUhd" ${animeState.uhd ? 'checked' : ''}> 4K${d.counts?.uhd ? ` (${d.counts.uhd})` : ''}</label>
         <label class="tog"><input type="checkbox" id="aUnw" ${animeState.unwatched ? 'checked' : ''}> Unwatched</label>
         <button class="btn btn-ghost btn-sm" id="aReset">Reset</button>
       </div>
     </div>
-    <div id="animeBody"></div></div>`;
-  wireHero(heroItems, () => 'English Dubbed Anime');
+    <div id="animeBody"></div><div id="animeMore" class="more-sentinel"></div></div>`;
+  wireHero(heroItems, (i, h) => h.k === 'm' ? 'Acclaimed Anime Film' : h.year >= 2024 ? `New & Trending Anime · ${h.year}` : `#${i + 1} Trending Anime`);
 
-  let curItems = [];
-  const drawBody = async () => {
+  let page = 0; let loading = false; let done = false; let reqId = 0; let curItems = [];
+  const buildParams = (pg) => {
+    const q = new URLSearchParams({ kind: animeState.kind, sort: animeState.sort, page: String(pg), per: '60' });
+    if (animeState.q.trim()) q.set('q', animeState.q.trim());
+    if (animeState.g) q.set('g', animeState.g);
+    if (animeState.platform) q.set('platform', animeState.platform);
+    if (animeState.status) q.set('status', animeState.status);
+    if (animeState.dub) q.set('dub', animeState.dub);
+    if (animeState.decade) { const [a, b] = animeState.decade.split('-'); if (+a) q.set('y1', a); if (+b < 9999) q.set('y2', b); }
+    if (animeState.rmin) q.set('rmin', animeState.rmin);
+    if (animeState.uhd) q.set('uhd', '1');
+    if (animeState.unwatched) q.set('unwatched', '1');
+    if (animeState.noFiller) q.set('noFiller', '1');
+    return q;
+  };
+  const renderGridItems = (items, append) => {
+    const mode = getViewMode();
+    const host = $('#animeItems');
+    if (!host) return;
+    if (!append) {
+      host.className = mode === 'list' ? 'rich-list' : 'grid';
+      host.innerHTML = items.length ? items.map(mode === 'list' ? richCard : poster).join('') : '<div class="empty" style="grid-column:1/-1">No anime matches those filters. Try widening the genre or status.</div>';
+    } else {
+      host.insertAdjacentHTML('beforeend', items.map(mode === 'list' ? richCard : poster).join(''));
+    }
+  };
+  const loadGrid = async (pg, reset) => {
+    if (loading && !reset) return;
+    loading = true;
+    const my = ++reqId;
+    const body = $('#animeBody'); if (!body) return;
+    if (reset) {
+      page = 0; done = false; curItems = [];
+      body.innerHTML = '<div class="browse-meta" id="animeMeta">Loading…</div><div id="animeItems" class="grid"></div>';
+    }
+    try {
+      const r = await api(`/api/anime/browse?${buildParams(pg)}`);
+      if (my !== reqId || animeState.mode !== 'grid') return;
+      const items = r.items || [];
+      curItems = reset ? items : curItems.concat(items);
+      const f = r.facets || {};
+      const bits = [`<b>${(r.total || 0).toLocaleString()}</b> anime title${r.total === 1 ? '' : 's'}`];
+      if (f.series != null && f.movies != null) bits.push(`${f.series} series · ${f.movies} films`);
+      if (f.verified) bits.push(`${f.verified} verified dubs`);
+      if (f.uhd) bits.push(`${f.uhd} in 4K`);
+      if ($('#animeMeta')) $('#animeMeta').innerHTML = `<div class="browse-stats">${bits.join(' · ')}</div>`;
+      renderGridItems(items, !reset);
+      page = pg;
+      done = (pg + 1) * (r.per || 60) >= (r.total || 0);
+    } finally {
+      if (my === reqId) loading = false;
+    }
+  };
+  const drawBody = () => {
     const body = $('#animeBody'); if (!body) return;
     if (animeState.mode === 'curated') {
-      curItems = [];
+      done = true; curItems = [];
       body.innerHTML = (d.rows || []).map(renderRow).join('') || '<div class="empty">No anime found in your library yet.</div>';
       wireRows();
       return;
     }
-    body.innerHTML = '<div class="loading" style="min-height:200px"><div class="spinner"></div></div>';
-    const q = new URLSearchParams({ kind: animeState.kind, sort: animeState.sort });
-    if (animeState.q.trim()) q.set('q', animeState.q.trim());
-    if (animeState.g) q.set('g', animeState.g);
-    if (animeState.platform) q.set('platform', animeState.platform);
-    if (animeState.decade) { const [a, b] = animeState.decade.split('-'); if (+a) q.set('y1', a); if (+b < 9999) q.set('y2', b); }
-    if (animeState.rmin) q.set('rmin', animeState.rmin);
-    if (animeState.uhd) q.set('uhd', '1');
-    if (animeState.completed) q.set('completed', '1');
-    if (animeState.unwatched) q.set('unwatched', '1');
-    if (animeState.verified) q.set('dub', 'verified');
-    if (animeState.noFiller) q.set('noFiller', '1');
-    const r = await api(`/api/anime/browse?${q}`).catch(() => ({ total: 0, items: [] }));
-    curItems = r.items || [];
-    const f = r.facets || {};
-    const bits = [`<b>${(r.total || 0).toLocaleString()}</b> anime title${r.total === 1 ? '' : 's'}`];
-    if (f.verified) bits.push(`${f.verified} verified dubs`);
-    if (f.uhd) bits.push(`${f.uhd} in 4K`);
-    body.innerHTML = `<div class="browse-meta"><div class="browse-stats">${bits.join(' · ')}</div></div>`
-      + (curItems.length ? renderCards(curItems, getViewMode()) : '<div class="empty">No dubbed anime matches those filters.</div>');
+    loadGrid(0, true);
   };
   const syncActive = () => {
     $$('[data-amode]').forEach((b) => b.classList.toggle('on', b.dataset.amode === 'curated' ? animeState.mode === 'curated' : (animeState.mode === 'grid' && animeState.kind === b.dataset.amode)));
@@ -779,26 +824,23 @@ async function pageAnime() {
   $$('[data-ag]').forEach((b) => (b.onclick = () => { animeState.mode = 'grid'; animeState.g = b.dataset.ag; syncActive(); drawBody(); }));
   $('#aQuery').oninput = debounce((e) => { animeState.q = e.target.value; if (animeState.q.trim() || animeState.mode === 'grid') { animeState.mode = 'grid'; syncActive(); drawBody(); } }, 220);
   $('#aPlat').onchange = (e) => { animeState.platform = e.target.value; animeState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#aStatus').onchange = (e) => { animeState.status = e.target.value; animeState.mode = 'grid'; syncActive(); drawBody(); };
+  $('#aDub').onchange = (e) => { animeState.dub = e.target.value; animeState.mode = 'grid'; syncActive(); drawBody(); };
   $('#aDecade').onchange = (e) => { animeState.decade = e.target.value; animeState.mode = 'grid'; syncActive(); drawBody(); };
   $('#aRating').onchange = (e) => { animeState.rmin = e.target.value; animeState.mode = 'grid'; syncActive(); drawBody(); };
-  $('#aVer').onchange = (e) => { animeState.verified = e.target.checked; animeState.mode = 'grid'; syncActive(); drawBody(); };
   $('#aNoFill').onchange = (e) => { animeState.noFiller = e.target.checked; animeState.mode = 'grid'; syncActive(); drawBody(); };
   $('#aUhd').onchange = (e) => { animeState.uhd = e.target.checked; animeState.mode = 'grid'; syncActive(); drawBody(); };
-  $('#aDone').onchange = (e) => { animeState.completed = e.target.checked; animeState.mode = 'grid'; syncActive(); drawBody(); };
   $('#aUnw').onchange = (e) => { animeState.unwatched = e.target.checked; animeState.mode = 'grid'; syncActive(); drawBody(); };
   $('#aSort').onchange = (e) => { animeState.sort = e.target.value; animeState.mode = 'grid'; syncActive(); drawBody(); };
-  $('#aReset').onclick = () => { animeState = { mode: 'curated', kind: 'all', g: '', q: '', decade: '', rmin: '', platform: '', noFiller: false, uhd: false, completed: false, unwatched: false, verified: false, sort: 'popular' }; pageAnime(); };
+  $('#aReset').onclick = () => { animeState = { mode: 'curated', kind: 'all', g: '', q: '', decade: '', rmin: '', platform: '', status: '', dub: '', noFiller: false, uhd: false, unwatched: false, sort: 'popular' }; pageAnime(); };
   $$('[data-vmode]', view).forEach((b) => (b.onclick = () => {
     setViewMode(b.dataset.vmode);
     $$('[data-vmode]', view).forEach((x) => x.classList.toggle('on', x === b));
-    if (animeState.mode === 'grid') {
-      const body = $('#animeBody');
-      if (body && curItems.length) {
-        const metaEl = $('.browse-meta', body)?.outerHTML || '';
-        body.innerHTML = metaEl + renderCards(curItems, getViewMode());
-      }
-    } else { animeState.mode = 'grid'; syncActive(); drawBody(); }
+    if (animeState.mode === 'grid') renderGridItems(curItems, false);
+    else { animeState.mode = 'grid'; syncActive(); drawBody(); }
   }));
+  const io = new IntersectionObserver((ents) => { if (ents[0].isIntersecting && animeState.mode === 'grid' && !done && !loading) loadGrid(page + 1, false); }, { rootMargin: '800px' });
+  io.observe($('#animeMore'));
   drawBody();
 }
 
@@ -1199,9 +1241,9 @@ async function pageRadar() {
     }
     if (show('upgrades')) {
       const ups = d.upgrades || [];
-      body += `<div class="section-label">Recent 4K &amp; Clean HD Upgrades in your library · ${ups.length}</div>`;
+      body += `<div class="section-label">Recent 4K &amp; Clean HD Upgrades on provider · ${ups.length}</div>`;
       body += ups.length ? `<div class="grid" style="padding:0 var(--gutter)">${ups.map(poster).join('')}</div>`
-        : '<div class="empty" style="padding:18px var(--gutter)">Quality baseline recorded — as your provider upgrades titles from CAM → HD or HD → 4K DV on future syncs, they’ll appear here automatically!</div>';
+        : '<div class="empty" style="padding:18px var(--gutter)">Quality baseline recorded — as provider upgrades titles from CAM → HD or HD → 4K DV on future syncs, they’ll appear here automatically!</div>';
     }
     view.innerHTML = `<div class="page-pad"><div class="page-head">
       <h1 class="page-title">Release Radar</h1>
@@ -1309,7 +1351,7 @@ async function pageMarathons(slug, qs) {
     </div>
   </a>`;
   view.innerHTML = `<div class="page-pad">
-    <div class="page-head"><h1 class="page-title">Marathons &amp; Watch Order</h1><span class="muted">Chronological &amp; release binge guides matched live to your library</span></div>
+    <div class="page-head"><h1 class="page-title">Marathons &amp; Watch Order</h1><span class="muted">Chronological &amp; release binge guides matched live to your provider library</span></div>
     <div class="mar-grid">${(d.marathons || []).map(card).join('')}</div>
     ${(d.collections || []).length ? `<div class="section-label" style="margin-top:30px">More Franchises &amp; Collections in Your Library</div><div class="mar-grid">${d.collections.map(card).join('')}</div>` : ''}
   </div>`;
@@ -2280,7 +2322,14 @@ async function openDetail(it) {
   const meta = [d.rating ? `<span class="star" title="${d.votes ? `${d.votes.toLocaleString()} TMDB votes` : ''}">★ ${(+d.rating).toFixed(1)}${d.votes ? ` <small class="muted">(${fmtVotes(d.votes)})</small>` : ''}</span>` : '', d.year ? `<span>${d.year}</span>` : '', d.cert ? `<span class="pill">${esc(d.cert)}</span>` : '',
     d.runtime ? `<span>${runtime(d.runtime)}</span>` : '', isSeries ? `<span>${d.seasons.length} Season${d.seasons.length === 1 ? '' : 's'}</span>` : '', qPill,
     d.isDoc ? `<span class="pill doc">Documentary${d.docTopics?.length ? ` · ${esc(d.docTopics.slice(0, 2).join(', '))}` : ''}</span>` : '',
-    d.isAnime ? `<span class="pill dub">English Dub${d.dubbedCount ? ` · ${d.dubbedCount} verified` : ''}</span>` : ''].join('');
+    d.isAnime ? `<span class="pill dub">${d.dubbedCount ? `English Dub · ${d.dubbedCount} verified` : 'Anime · Auto-Skip Ready'}</span>` : ''].join('');
+  const airBanner = isSeries && d.airingSeason ? (() => {
+    const a = d.airingSeason;
+    const latest = a.nextEp ? `Next: Ep ${a.nextEp}${a.nextTitle ? ` “${a.nextTitle}”` : ''}${a.nextDate ? ` (${a.nextDate})` : ''}`
+      : a.lastEp ? `Latest: Ep ${a.lastEp}${a.lastTitle ? ` “${a.lastTitle}”` : ''}${a.lastDate ? ` (${a.lastDate})` : ''}` : '';
+    const head = a.airedEps > 0 ? `${a.name} is airing now (${a.airedEps} eps aired)` : `${a.name} is airing now`;
+    return `<div class="airing-banner"><span><b>${esc(head)}</b>${latest ? ` · ${esc(latest)}` : ''} — not yet added to English catalogue.</span>${!d.following ? '<button class="btn btn-accent btn-sm" id="dAirFollow">🔔 Follow for new episodes</button>' : '<span class="muted">✓ Following for alerts</span>'}</div>`;
+  })() : '';
 
   openModal(`<div class="sheet">
     <button class="close" aria-label="Close">${I.close}</button>
@@ -2309,7 +2358,7 @@ async function openDetail(it) {
         ${d.network ? `<div><b>Network:</b> ${esc(d.network)}${d.status ? ` · ${esc(d.status)}` : ''}</div>` : ''}
         ${!isSeries && d.variants?.length > 1 ? `<div><b>Versions:</b><div class="versions">${d.variants.map((v, i) => `<button class="chip ${i ? '' : 'on'}" data-variant="${v.id}" title="${esc(v.cat)}">${esc(v.label)}</button>`).join('')}</div></div>` : ''}
       </div></div>
-    ${isSeries ? `<div class="sheet-section"><h3><span>Episodes <button class="btn btn-ghost btn-sm" id="seasonWatched" style="margin-left:10px">Mark season watched</button></span> ${d.seasons.length > 1 ? `<select class="sel" id="seasonSel">${d.seasons.map((s) => `<option value="${s.n}">${esc(s.name)}</option>`).join('')}</select>` : ''}</h3><div class="episodes" id="eps"></div></div>` : ''}
+    ${isSeries ? `<div class="sheet-section"><h3><span>Episodes <button class="btn btn-ghost btn-sm" id="seasonWatched" style="margin-left:10px">Mark season watched</button></span> ${d.seasons.length > 1 ? `<select class="sel" id="seasonSel">${d.seasons.map((s) => `<option value="${s.n}">${esc(s.name)}</option>`).join('')}</select>` : ''}</h3>${airBanner}<div class="episodes" id="eps"></div></div>` : ''}
     ${d.similar?.length ? `<div class="sheet-section"><h3>More Like This</h3><div class="more-grid">${d.similar.slice(0, 12).map(poster).join('')}</div></div>` : ''}
   </div>`);
 
@@ -2337,8 +2386,10 @@ async function openDetail(it) {
   if ($('#dFollow')) $('#dFollow').onclick = async () => {
     d.following = !d.following; await post('/api/follow', { sid: d.id, on: d.following, item: card });
     $('#dFollow').classList.toggle('on', d.following); $('#dFollow').innerHTML = d.following ? I.bellOn : I.bell;
+    if ($('#dAirFollow')) { $('#dAirFollow').textContent = d.following ? '✓ Following' : '🔔 Follow for new episodes'; $('#dAirFollow').disabled = d.following; }
     toast(d.following ? `Following ${d.title}. You'll get an alert when new episodes land` : 'Stopped following');
   };
+  if ($('#dAirFollow')) $('#dAirFollow').onclick = () => $('#dFollow')?.click();
   // Muted trailer plays in the header after a moment (Trailer button = with sound).
   clearTimeout(detailTrailerT);
   if (d.trailer) detailTrailerT = setTimeout(() => {
@@ -2366,7 +2417,7 @@ async function openDetail(it) {
       const rowHtml = (e) => `<div class="ep ${e.dub === 'no' ? 'subonly' : ''} ${e.filler === 'filler' ? 'is-filler' : ''}" data-ep="${e.id}" tabindex="0" role="button">
         <div class="n">${e.n}</div>
         <div class="still">${e.still || d.backdrop ? `<img src="${esc(e.still || d.backdrop)}" alt="" loading="lazy" onerror="this.remove()">` : ''}${e.progress ? `<div class="bar"><i style="width:${Math.round(e.progress * 100)}%"></i></div>` : ''}</div>
-        <div><div class="t"><span>${e.isNew ? '<span class="new-badge inline">NEW</span> ' : ''}${d.isAnime && e.dub === 'yes' ? '<span class="badge-dub inline">DUB</span>' : ''}${d.isAnime && e.dub === 'no' ? '<span class="pill" style="margin-right:6px">Sub only</span>' : ''}${e.filler === 'filler' ? '<span class="badge-filler inline">FILLER</span>' : e.filler === 'mixed' ? '<span class="badge-mixed inline">MIXED</span>' : ''}${esc(e.title)}</span><small>${e.duration ? runtime(Math.round(e.duration / 60)) : ''}</small></div>
+        <div><div class="t"><span>${e.isNew ? '<span class="new-badge inline">NEW</span> ' : ''}${d.isAnime && e.dub === 'yes' ? '<span class="badge-dub inline">DUB</span>' : ''}${d.isAnime && e.dub === 'no' ? '<span class="pill" style="margin-right:6px">Sub only</span>' : ''}${e.filler === 'filler' ? '<span class="badge-filler inline">FILLER</span>' : e.filler === 'mixed' ? '<span class="badge-mixed inline">MIXED</span>' : ''}${esc(e.title)}</span><small>${[e.aired ? e.aired.slice(0, 10) : '', e.duration ? runtime(Math.round(e.duration / 60)) : ''].filter(Boolean).join(' · ')}</small></div>
         <p>${esc(e.plot)}</p>
         ${d.isAnime && e.dub === 'no' ? `<div style="margin-top:6px"><button class="btn btn-ghost btn-sm ${e.dubWatching ? 'on' : ''}" data-dub-watch="${e.id}" data-sn="${s.n}">${e.dubWatching ? '🔔 Watching for English dub' : '🔔 Notify when dubbed'}</button></div>` : ''}</div></div>`;
       const unknownCnt = d.isAnime ? s.episodes.filter((e) => !e.dub || e.dub === 'unknown').length : 0;
@@ -2489,7 +2540,7 @@ function playEpisode(d, flat, ep, resume, extra = {}) {
   const nxt = flat.slice(idx + 1).find((x) => (!d.isAnime || x.dub !== 'no') && (!d.isAnime || !d.skipFiller || x.filler !== 'filler')) || null;
   const prv = idx > 0 ? [...flat.slice(0, idx)].reverse().find((x) => (!d.isAnime || x.dub !== 'no') && (!d.isAnime || !d.skipFiller || x.filler !== 'filler')) || null : null;
   Player.open({
-    kind: 'series', id: ep.id, ext: ep.ext, sid: d.id, season: ep.season, epn: ep.n, title: d.title, sub: `S${ep.season}:E${ep.n} · ${ep.title}`,
+    kind: 'series', id: ep.id, ext: ep.ext, sid: d.id, season: ep.season, epn: ep.n, rawN: ep.rawN ?? ep.n, abs: ep.abs || 0, title: d.title, sub: `S${ep.season}:E${ep.n} · ${ep.title}`,
     resume: resume || 0, duration: ep.duration || 0, isAnime: !!d.isAnime, allowSubOnly: !!extra.allowSubOnly,
     progressKey: `e:${ep.id}`, tmdb: d.tmdb, imdb: d.imdb || '', extSub: ep.extSub || null, historyKind: 's', historyTitle: d.title,
     item: { k: 'e', id: ep.id, sid: d.id, title: d.title, sub: `S${ep.season}:E${ep.n} · ${ep.title}`, backdrop: ep.still || d.backdrop, poster: d.poster },
@@ -2534,7 +2585,7 @@ const Player = (() => {
   // Fallback chain: each attempt = {id, tx, alt}. On failure we move to the next one.
   let attempts = []; let ai = 0;
   // source health: startup time, stalls, watched time per stream id (feeds best-version ranking)
-  let loadT = 0; let reportedStart = false; let stallAt = 0; let stalls = []; let stallTimer2; let watchedAt = 0; let watchedSecs = 0; let credits = null; let skipped = new Set();
+  let loadT = 0; let reportedStart = false; let stallAt = 0; let stalls = []; let stallTimer2; let watchedAt = 0; let watchedSecs = 0; let credits = null; let creditsEnd = null; let hasPostCredits = false; let skipped = new Set();
   let subSel = -1; let subTrack = null; let subSeen = 0;
   // resume-in-place budget (network drops), one failure report per version per title, load generation
   let retries = 0; let retryAt = 0; let lastFreeze = 0; let failed = new Set(); let loadGen = 0; let openGen = 0;
@@ -2776,14 +2827,24 @@ const Player = (() => {
     }
     if (credits && credits > duration * 0.55 && credits < duration) {
       const a = Math.max(0, Math.min(100, (credits / duration) * 100));
-      parts.push(`<i class="seg credits" style="left:${a.toFixed(2)}%;width:${(100 - a).toFixed(2)}%"></i>`);
+      const endPos = (hasPostCredits && creditsEnd && creditsEnd > credits + 5 && creditsEnd < duration - 12) ? creditsEnd : duration;
+      const b = Math.max(a, Math.min(100, (endPos / duration) * 100));
+      parts.push(`<i class="seg credits" style="left:${a.toFixed(2)}%;width:${(b - a).toFixed(2)}%"></i>`);
     }
     segs.innerHTML = parts.join('');
   }
   function segmentLabelAt(sec) {
     const sk = SKIPS.find((c) => sec >= c.s && sec <= c.e);
-    if (sk) return /recap|previously/i.test(sk.title || '') ? 'Recap' : 'Intro';
-    if (credits && duration && credits > duration * 0.55 && sec >= credits) return 'Credits';
+    if (sk) {
+      const t = sk.title || '';
+      if (/recap/i.test(t) && /intro|opening/i.test(t)) return o?.isAnime ? 'Recap + Opening' : 'Recap + Intro';
+      if (/recap|previously/i.test(t)) return 'Recap';
+      return o?.isAnime ? 'Opening' : 'Intro';
+    }
+    if (credits && duration && credits > duration * 0.55 && sec >= credits) {
+      if (hasPostCredits && creditsEnd && sec >= creditsEnd) return 'Post-Credits / Preview';
+      return o?.isAnime ? 'Ending' : 'Credits';
+    }
     return '';
   }
   function updateBufferedBar() {
@@ -3609,7 +3670,7 @@ const Player = (() => {
       fps: pic.fps || o.fps || 0, hdr: !!pic.hdr, dv: pic.dv || 0, bits: pic.bits || (pic.hdr ? 10 : 8),
       h: pic.h || 0, w: pic.w || 0, ch: curAud?.ch || 2, sc: SURROUND_OUT,
       night: localGet('night', '0') === '1', deint: !!(o.live && localGet('di.' + o.id, '0') === '1'),
-      isAnime: !!o.isAnime, skips: SKIPS, credits,
+      isAnime: !!o.isAnime, skips: SKIPS, credits, creditsEnd, hasPostCredits,
       hasNext: !!o.next, nextLabel: o.next?.label || '', autoplay: localGet('autoplay', '1') === '1',
       autoskip: localGet('autoskip', '1') === '1',
       autoskipCredits: localGet('autoSkipCredits', '1') === '1',
@@ -3723,7 +3784,7 @@ const Player = (() => {
     document.body.classList.add('playing');
     if (o) await close(true);
     if (my !== openGen) return;
-    o = opts; credits = null; skipped = new Set(); stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false;
+    o = opts; credits = null; creditsEnd = null; hasPostCredits = false; skipped = new Set(); stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false;
     subSel = -1; subTrack = null; clearInterval(subTimer);
     mseFailed = false; mseActive = false; mseTarget = offset; mseSessionStart = offset;
     playRate = 1; zoomMode = 'fit'; draggingSeek = false; hoveringCtrl = false;
@@ -3795,7 +3856,7 @@ const Player = (() => {
     if (!o.live && !o.catchup) {
       // Series: resolve ranked/picked version BEFORE probing so we open directly on the best copy
       if (o.kind === 'series' && o.sid && o.season != null && o.epn != null) {
-        const list = await api(`/api/ep-alts/${o.sid}/${o.season}/${o.epn}`).catch(() => null);
+        const list = await api(`/api/ep-alts/${o.sid}/${o.season}/${o.rawN ?? o.epn}`).catch(() => null);
         if (!o || o !== opts) return;
         if (Array.isArray(list) && list.length) {
           const best = list[0];
@@ -3808,6 +3869,7 @@ const Player = (() => {
       if (o.ext) pq.set('ext', o.ext);
       if (o.kind === 'series' && o.sid) {
         pq.set('sid', o.sid); pq.set('s', o.season); pq.set('n', o.epn);
+        if (o.abs) pq.set('abs', o.abs);
         if (o.tmdb) pq.set('tmdb', o.tmdb);
         if (o.imdb) pq.set('imdb', o.imdb);
         if (o.isAnime) pq.set('anime', '1');
@@ -3862,6 +3924,8 @@ const Player = (() => {
         SKIPS.unshift({ s: Math.max(0, probe.recap[0] - 1), e: probe.recap[1], title: 'Recap' });
       }
       credits = typeof probe?.credits === 'number' ? probe.credits : null;
+      creditsEnd = typeof probe?.creditsEnd === 'number' ? probe.creditsEnd : null;
+      hasPostCredits = !!probe?.hasPostCredits;
       renderSeekMarkers();
       const ql = qLabel(probe?.pic, probe?.audio); if (ql) $('#pSub').insertAdjacentHTML('beforeend', ` <span class="qbadge">${esc(ql)}</span>`);
       if (proRule(probe?.pic) && (await proInfo()).available) { renderSources(); setMediaSession(); if (await toPro()) return; }
@@ -4079,12 +4143,18 @@ const Player = (() => {
     const p = pos();
     updateBufferedBar();
     const sk = SKIPS.find((c) => p >= c.s && p < c.e - 2);
+    const skipLabelFor = (s) => {
+      const t = s?.title || '';
+      if (/recap/i.test(t) && /intro|opening/i.test(t)) return o.isAnime ? 'Recap + Opening' : 'Recap + Intro';
+      if (/recap|previously/i.test(t)) return 'Recap';
+      return o.isAnime ? 'Opening' : 'Intro';
+    };
     let btn = $('#pSkip', el);
     if (sk && !btn) { btn = document.createElement('button'); btn.id = 'pSkip'; btn.className = 'btn btn-primary skip-btn'; el.appendChild(btn); }
-    if (btn) { if (!sk) btn.remove(); else { btn.textContent = /recap|previously/i.test(sk.title) ? 'Skip recap' : 'Skip intro'; btn.onclick = () => { skipped.add(sk); seekTo(sk.e); focusPlayer(); }; } }
+    if (btn) { if (!sk) btn.remove(); else { btn.textContent = `Skip ${skipLabelFor(sk)}`; btn.onclick = () => { skipped.add(sk); seekTo(sk.e); focusPlayer(); }; } }
     if (sk && started && !skipped.has(sk) && localGet('autoskip', '1') === '1' && /intro|opening|recap|previously/i.test(sk.title)) {
       skipped.add(sk);
-      showOsd(/recap|previously/i.test(sk.title) ? 'Skipped recap' : 'Skipped intro');
+      showOsd(`Skipped ${skipLabelFor(sk)}`);
       seekTo(sk.e);
       return;
     }
@@ -4113,17 +4183,20 @@ const Player = (() => {
     const auto = localGet('autoplay', '1') === '1'; const ask = AUTOPLAY.chain >= 10;
     const hasKnownCredits = !!(credits && duration && credits > duration * 0.55);
     const fastCredits = auto && !ask && hasKnownCredits && localGet('autoSkipCredits', '1') === '1';
+    const canSkipEd = !!(hasPostCredits && creditsEnd && duration && creditsEnd < duration - 12 && pos() < creditsEnd - 4);
+    const credNoun = o.isAnime ? 'ending' : 'credits';
     const n = document.createElement('div'); n.className = 'next-up';
-    n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : fastCredits ? 'Skipping credits · Up next' : 'Up next'}</small><b>${esc(o.next.label)}</b></div>
-      <div class="nu-btns"><button class="btn btn-primary btn-sm" id="nuPlay">${I.play}<span>${ask ? 'Keep watching' : 'Play now'}</span></button><button class="btn btn-ghost btn-sm" id="nuStay">${credits ? 'Watch credits' : 'Dismiss'}</button></div>`;
+    n.innerHTML = `${o.next.still ? `<img src="${esc(o.next.still)}" alt="">` : ''}<div><small>${ask ? 'Still watching?' : fastCredits ? `Skipping ${credNoun} · Up next` : 'Up next'}</small><b>${esc(o.next.label)}</b></div>
+      <div class="nu-btns"><button class="btn btn-primary btn-sm" id="nuPlay">${I.play}<span>${ask ? 'Keep watching' : 'Play now'}</span></button>${canSkipEd ? '<button class="btn btn-ghost btn-sm" id="nuPost">Post-credits →</button>' : ''}<button class="btn btn-ghost btn-sm" id="nuStay">${credits ? `Watch ${credNoun}` : 'Dismiss'}</button></div>`;
     el.appendChild(n);
     let left = fastCredits ? 3 : 10; let t = null;
     const go = (byUser) => { clearInterval(t); if (byUser) AUTOPLAY.chain = 0; else AUTOPLAY.chain++; o.next.go(); };
     $('#nuPlay', n).onclick = () => go(true);
+    if ($('#nuPost', n)) $('#nuPost', n).onclick = () => { clearInterval(t); n.remove(); showOsd('Skipped Ending → Post-Credits'); seekTo(creditsEnd); focusPlayer(); };
     $('#nuStay', n).onclick = () => { clearInterval(t); n.remove(); };
     if (auto && !ask) {
       const lab = $('#nuPlay span', n);
-      const labelFor = (s) => (fastCredits ? `Skipping credits in ${s}s` : `Next episode in ${s}`);
+      const labelFor = (s) => (fastCredits ? `Skipping ${credNoun} in ${s}s` : `Next episode in ${s}`);
       lab.textContent = labelFor(left);
       t = setInterval(() => {
         if (!o || !n.isConnected) return clearInterval(t);
@@ -5182,12 +5255,12 @@ async function renderDisplay(prefs) {
     ${t && max >= t.hz * 1.5 ? `<p class="tip">Your screen runs at ${t.hz} Hz. Setting Windows to <b>${max} Hz</b> (Settings › System › Display › Advanced display › refresh rate) makes menus smoother, and ${max % 24 === 0 ? '24, 30 and 60 fps then play without any switching' : 'more videos play without switching'}.</p>` : ''}
     <p class="tip"><b>OLED True Black tip:</b> Windows 11 lifts near-blacks on SDR video whenever desktop HDR is on. Keep <b>OLED True Black</b> checked above (and leave NVIDIA <i>RTX HDR</i> off if blacks look grey); in the NVIDIA App you can still enable <b>RTX Video Super Resolution</b> (quality 4) for crisp 1080p→4K upscaling.</p>
     <h4 style="margin-top:18px">Pro player (mpv · OLED tuned)</h4>
-    <p>Plays straight to your OLED with infinite contrast (0-nit blacks), grain-free 10-bit PQ HDR / Dolby Vision, pure gamma 2.2 SDR, intro auto-skip, auto-next episode, and GPU neural upscaling. ${m.available ? '<span class="ok">Installed.</span>' : 'Not installed yet.'}</p>
+    <p>Plays straight to your OLED with infinite contrast (0-nit blacks), grain-free 10-bit PQ HDR / Dolby Vision, pure gamma 2.2 SDR, intro auto-skip, auto-next episode, and GPU upscaling. ${m.available ? '<span class="ok">Installed.</span>' : 'Not installed yet.'}</p>
     ${m.available ? `<div class="field"><select id="proSel">${[['hdr4k', 'Use mpv for all 4K HDR & Dolby Vision titles (recommended)'], ['dv', 'Use mpv for Dolby Vision titles only'], ['all', 'Use mpv for all films and episodes'], ['never', 'Only when I press P']].map(([v, l]) => `<option value="${v}" ${(prefs.pro || localGet('pro', 'hdr4k')) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       <div class="field" style="margin-top:8px"><select id="shaderSel">${[['auto', 'GPU Shaders: Auto (Anime4K for Anime + FSRCNNX for 1080p films)'], ['anime', 'GPU Shaders: Anime4K for Anime only'], ['anime_hq', 'GPU Shaders: Anime4K HQ (VL) for Anime'], ['off', 'GPU Shaders: Off (Ctrl+1/2/3 still toggles live in mpv)']].map(([v, l]) => `<option value="${v}" ${(prefs.mpvShaders || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       <div class="field" style="margin-top:8px"><select id="peakSel">${[['auto', 'OLED Peak Brightness: Auto (from Windows HDR EDID)'], ['400', 'OLED Peak: 400 nits (TrueBlack 400)'], ['600', 'OLED Peak: 600 nits'], ['800', 'OLED Peak: 800 nits'], ['1000', 'OLED Peak: 1000 nits (Peak 1000)']].map(([v, l]) => `<option value="${v}" ${peak === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       <div class="hide-grid" style="margin-top:10px">
-        ${tog('optMpvVsr', !!prefs.mpvVsr, 'NVIDIA RTX Video Super Resolution in mpv (upscales 1080p/720p & live TV on RTX GPUs)')}
+        ${tog('optMpvVsr', !!prefs.mpvVsr, 'RTX Video Super Resolution in mpv (upscales 1080p/720p & live TV on GPU)')}
         ${tog('optMpvAnimeSharp', prefs.mpvAnimeSharp !== false, 'Crisp anime upscaling in mpv (ewa_lanczossharp + light sharpen)')}
       </div>`
       : `<div class="btns"><button class="btn btn-accent btn-sm" id="proInstall">Install mpv (free, via winget)</button><span class="muted" id="proSt"></span></div>`}`;

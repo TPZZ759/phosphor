@@ -1,5 +1,5 @@
 // Pro player: hands a title to mpv (gpu-next/libplacebo, true OLED infinite contrast, exact HDR /
-// Dolby Vision & gamma 2.2 SDR colour, GPU neural upscaling, display-synced motion). mpv reads the
+// Dolby Vision & gamma 2.2 SDR colour, GPU upscaling, display-synced motion). mpv reads the
 // provider directly over the single connection, so the browser stream is stopped first. Progress,
 // intro-skipping, phone remote control, and auto-next-episode run over mpv's IPC pipe; when mpv
 // closes, the display goes back to its own settings.
@@ -371,7 +371,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         } else {
             a.push("--deband=no".into());
         }
-        // GPU neural upscaling & live deinterlace
+        // GPU upscaling & live deinterlace
         if use_vsr {
             if deint {
                 a.push("--vf-append=d3d11vpp=deint=yes:mode=bob:scale=2:scaling-mode=nvidia".into());
@@ -399,6 +399,8 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         }).collect()
     }).unwrap_or_default();
     let credits = b["credits"].as_f64().filter(|x| *x > 30.0);
+    let credits_end = b["creditsEnd"].as_f64().filter(|x| *x > 35.0);
+    let has_post_credits = b["hasPostCredits"].as_bool().unwrap_or(false);
     let autoskip = b["autoskip"].as_bool().unwrap_or(true);
     let autoskip_credits = b["autoskipCredits"].as_bool().unwrap_or(true);
 
@@ -427,19 +429,38 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         };
         add_opt("title", title.clone());
         add_opt("sub", sub_label.clone());
-        if let Some((rst, ren, _)) = skips.iter().find(|(_, _, l)| {
-            let ll = l.to_lowercase(); ll.contains("recap") || ll.contains("previously")
-        }) {
-            add_opt("recap_s", format!("{rst:.2}"));
-            add_opt("recap_e", format!("{ren:.2}"));
-        }
-        if let Some((ist, ien, _)) = skips.iter().find(|(_, _, l)| {
-            let ll = l.to_lowercase(); ll.contains("intro") || ll.contains("opening") || ll == "op"
-        }) {
-            add_opt("intro_s", format!("{ist:.2}"));
-            add_opt("intro_e", format!("{ien:.2}"));
+        // Combined "Recap + Intro" segment goes to intro_s/intro_e with custom label so mpv performs one seamless skip.
+        let combined = skips.iter().find(|(_, _, l)| {
+            let ll = l.to_lowercase();
+            ll.contains("recap") && (ll.contains("intro") || ll.contains("opening"))
+        });
+        if let Some((cst, cen, clab)) = combined {
+            add_opt("intro_s", format!("{cst:.2}"));
+            add_opt("intro_e", format!("{cen:.2}"));
+            add_opt("intro_label", clab.clone());
+        } else {
+            if let Some((rst, ren, _)) = skips.iter().find(|(_, _, l)| {
+                let ll = l.to_lowercase(); ll.contains("recap") || ll.contains("previously")
+            }) {
+                add_opt("recap_s", format!("{rst:.2}"));
+                add_opt("recap_e", format!("{ren:.2}"));
+            }
+            if let Some((ist, ien, ilab)) = skips.iter().find(|(_, _, l)| {
+                let ll = l.to_lowercase(); ll.contains("intro") || ll.contains("opening") || ll == "op"
+            }) {
+                add_opt("intro_s", format!("{ist:.2}"));
+                add_opt("intro_e", format!("{ien:.2}"));
+                if is_anime && ilab.eq_ignore_ascii_case("intro") {
+                    add_opt("intro_label", "Opening".into());
+                } else {
+                    add_opt("intro_label", ilab.clone());
+                }
+            }
         }
         if let Some(cr) = credits { add_opt("credits", format!("{cr:.2}")); }
+        if let Some(ce) = credits_end { add_opt("credits_end", format!("{ce:.2}")); }
+        add_opt("has_post_credits", if has_post_credits { "yes" } else { "no" }.into());
+        add_opt("is_anime", if is_anime { "yes" } else { "no" }.into());
         add_opt("has_next", if has_next { "yes" } else { "no" }.into());
         add_opt("next_label", next_label.clone());
         add_opt("autoplay", if autoplay { "yes" } else { "no" }.into());
@@ -449,7 +470,7 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         add_opt("shader_preset", shader_preset.into());
         add_opt("night", if night { "yes" } else { "no" }.into());
         add_opt("is_live", if live { "yes" } else { "no" }.into());
-        let port = std::env::var("PHOSPHOR_PORT").or_else(|_| std::env::var("TV_PORT")).ok().unwrap_or_else(|| app.cfg.get("port").as_u64().unwrap_or(7878).to_string());
+        let port = std::env::var("TV_PORT").ok().unwrap_or_else(|| app.cfg.get("port").as_u64().unwrap_or(7878).to_string());
         add_opt("api_base", format!("http://127.0.0.1:{port}"));
     }
 
