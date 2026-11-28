@@ -703,15 +703,17 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         "--cache=yes".into(),
         format!(
             "--demuxer-max-bytes={}",
-            if live || used_spool || used_livebuf {
+            if live || used_livebuf {
                 "256MiB"
+            } else if used_spool {
+                "512MiB"
             } else {
                 "1024MiB"
             }
         ),
         format!(
             "--demuxer-max-back-bytes={}",
-            if live || used_spool || used_livebuf {
+            if live || used_livebuf {
                 "128MiB"
             } else {
                 "256MiB"
@@ -719,12 +721,17 @@ pub async fn play(State(app): State<Arc<App>>, Json(b): Json<Value>) -> Response
         ),
         format!(
             "--demuxer-readahead-secs={}",
-            if live || used_spool || used_livebuf { "30" } else { "180" }
+            if live || used_livebuf { "30" } else { "180" }
         ),
         format!(
             "--cache-secs={}",
-            if live || used_spool || used_livebuf { "30" } else { "180" }
+            if live || used_livebuf { "30" } else { "180" }
         ),
+        if live || used_livebuf {
+            "--hr-seek=default".into()
+        } else {
+            "--hr-seek=yes".into()
+        },
         "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5"
             .into(),
         "--audio-channels=auto".into(),

@@ -401,17 +401,17 @@ where
             }
             if &typ == b"moof" {
                 if shift.is_none() {
-                    // Fetch markers once (waiting up to 1.2 s instead of 3.0 s)
+                    // Fetch markers once (poll every 15 ms up to 1.2 s so local-spool seeks flush immediately)
                     let s = match cached_starts {
                         Some(prev) => prev,
                         None => {
                             let mut got = None;
-                            for _ in 0..24 {
+                            for _ in 0..80 {
                                 got = starts();
                                 if got.is_some() {
                                     break;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
                             }
                             cached_starts = Some(got);
                             got

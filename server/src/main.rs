@@ -193,6 +193,10 @@ async fn shutdown_route(State(app): A) -> Response {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         shutdown_notify().notify_waiters();
+        // Open browser SSE tabs (/api/remote/events) keep axum graceful_shutdown waiting;
+        // state/tmdb/skipdb/display are already flushed above, so exit cleanly after 350ms.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        std::process::exit(0);
     });
     j(json!({ "ok": true, "shuttingDown": true }))
 }

@@ -28,34 +28,39 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 const BLOCK: u64 = 1 << 20;
-const MEM_CAP: u64 = 900 << 20; // most memory the cache may hold
-const BEHIND: u64 = 96 << 20; // kept behind the playhead (quick back-seeks)
-const PRIME_BYTES: u64 = 24 << 20; // initial warm-up before readers attach (or EOF)
+const MEM_CAP: u64 = 2048 << 20; // 2 GiB gigabit RAM cache (whole episodes/1080p films fit 100% in RAM)
+const BEHIND: u64 = 256 << 20; // 256 MiB kept behind playhead for instant rewinds
+const PRIME_BYTES: u64 = 8 << 20; // fast 8 MiB header prime before first reader attaches
+const REUSE_GAP: u64 = 32 << 20; // stream through up to 32 MiB on gigabit rather than reconnecting
+const PIN_EDGE_BLOCKS: u64 = 4; // pin first 4 MiB + last 4 MiB (MKV Cues / MP4 moov-at-EOF never evicted)
 const READER_GAP_GRACE_MS: i64 = 5_000; // keep warm TCP socket across ffprobe -> mpv HDR settle
-const AHEAD_SECS: f64 = 150.0;
+const AHEAD_SECS: f64 = 600.0; // 10 minutes read-ahead on large 4K films
+const CAP_MIN: u64 = 192 << 20;
+const CAP_MAX: u64 = 1536 << 20;
+const CAP_DEFAULT: u64 = 384 << 20;
 #[cfg_attr(not(test), allow(dead_code))]
 const REOPEN_WAIT_MS: i64 = crate::slot::CROSS_URL_COOLDOWN_MS; // polite gap when switching titles or recovering from a slot error
 
 enum OpenErr {
     Unsupported,     // provider ignores Range or sent mismatched Content-Range -> fall back
-    RateOrSlot(u16), // 401/403/404/410/429/460 (slot still releasing, max connections, or auth)
+    RateOrSlot(u16), // 401/403/404/410/429/460/509 (slot still releasing, max connections, or auth)
     Transient,       // network drop or 5xx
 }
 
 fn is_slot_or_auth_status(code: u16) -> bool {
-    matches!(code, 401 | 403 | 404 | 410 | 429 | 460)
+    matches!(code, 401 | 403 | 404 | 410 | 429 | 460 | 509)
 }
 
 fn should_retry_portal_url(code: u16) -> bool {
-    // Only clear cached 302 CDN URL and retry portal on expired/missing token errors — NEVER on 460/429!
+    // Only clear cached 302 CDN URL and retry portal immediately on expired/missing token errors — NEVER immediately on 460/429/509!
     matches!(code, 401 | 403 | 404 | 410)
 }
 
 fn slot_backoff_ms(consecutive: u32) -> u64 {
     match consecutive {
-        0 | 1 => 3000,
-        2 => 6000,
-        _ => 10_000,
+        0 | 1 => 2000,
+        2 => 4000,
+        _ => 7000,
     }
 }
 
@@ -151,7 +156,8 @@ struct St {
     readers: HashMap<u64, Reader>,
     next_reader: u64,
     bitrate: f64, // bytes per second (file size / duration), once known
-    prime: bool,  // fetch the start of the file (up to PRIME_BYTES or EOF) even before readers join
+    prime: bool,  // fetch the start of the file (up to PRIME_BYTES or EOF) before first reader joins
+    refilling: bool, // high/low-water hysteresis: fill to cap_high, stay closed until ahead < cap_low
     connected: bool,
     upstream_pos: u64,
     reconnects: u32,
@@ -200,17 +206,32 @@ impl St {
         self.frontier(p) >= total
     }
 
-    fn cap(&self) -> u64 {
+    /// High-water target ahead of playhead: if the whole file fits in RAM (<= 2 GiB), pull 100%
+    /// straight to EOF in one gigabit burst; for huge 4K films, cache 10 minutes (192 MiB..1.5 GiB).
+    fn cap_high(&self) -> u64 {
+        if let Some(total) = self.total.filter(|&t| t > 0 && t <= MEM_CAP) {
+            return total;
+        }
         if self.bitrate > 0.0 {
-            ((self.bitrate * AHEAD_SECS) as u64).clamp(48 << 20, 700 << 20)
+            ((self.bitrate * AHEAD_SECS) as u64).clamp(CAP_MIN, CAP_MAX)
         } else {
-            128 << 20
+            CAP_DEFAULT
         }
     }
 
-    /// Where the download should be: a reader waiting on missing bytes first, else read-ahead,
-    /// else initial 24 MB prime (or EOF).
-    fn target(&self) -> Option<u64> {
+    /// Low-water mark for hysteresis: after hitting `cap_high()` and closing the upstream socket,
+    /// stay completely offline until remaining buffer drops below 50% (5 minutes left) or a seek
+    /// lands outside RAM — eliminating rapid 1 MB open/close churn and provider 509 storms.
+    fn cap_low(&self) -> u64 {
+        if let Some(total) = self.total.filter(|&t| t > 0 && t <= MEM_CAP) {
+            return total;
+        }
+        self.cap_high() / 2
+    }
+
+    /// Where the download should be: a reader waiting on missing bytes first, else hysteretic
+    /// read-ahead (`cap_low` -> `cap_high`), else initial 8 MiB prime before any reader joins.
+    fn target(&mut self) -> Option<u64> {
         let total = self.total.unwrap_or(u64::MAX);
         let waiting = self
             .readers
@@ -219,13 +240,27 @@ impl St {
             .filter(|(_, w)| *w < total && self.have(*w).is_none())
             .max_by_key(|x| x.0);
         if let Some((_, w)) = waiting {
+            self.refilling = true;
             return Some(self.frontier(w));
         }
         if let Some(p) = self.primary() {
             let f = self.frontier(p);
-            if f < total && f - p < self.cap() {
+            if f >= total {
+                self.refilling = false;
+                return None;
+            }
+            let ahead = f.saturating_sub(p);
+            if ahead >= self.cap_high() {
+                self.refilling = false;
+                return None;
+            }
+            if ahead < self.cap_low() {
+                self.refilling = true;
+            }
+            if self.refilling {
                 return Some(f);
             }
+            return None;
         }
         if self.prime {
             let prime_goal = PRIME_BYTES.min(total);
@@ -243,7 +278,10 @@ impl St {
             let idx = pos / BLOCK;
             let off = (pos % BLOCK) as usize;
             let room = (BLOCK as usize - off).min(data.len() - i);
-            let b = self.blocks.entry(idx).or_default();
+            let b = self
+                .blocks
+                .entry(idx)
+                .or_insert_with(|| Vec::with_capacity(BLOCK as usize));
             if b.len() == off {
                 b.extend_from_slice(&data[i..i + room]);
                 self.mem += room as u64;
@@ -261,9 +299,14 @@ impl St {
         }
         let p = self.primary().unwrap_or(0);
         let keep_from = p.saturating_sub(BEHIND) / BLOCK;
-        let keep_to = (p + self.cap()) / BLOCK + 1;
+        let keep_to = (p + self.cap_high()) / BLOCK + 1;
+        // Pin first 4 MiB (container headers) and last 4 MiB (MKV Cues / MP4 moov-at-EOF)
+        // permanently so deep seeks never require 2 extra provider reconnects!
+        let tail_pin_from = self
+            .total
+            .filter(|&t| t > 0)
+            .map(|t| (t.saturating_sub(1) / BLOCK).saturating_sub(PIN_EDGE_BLOCKS - 1));
         // Protect blocks within ±4 blocks of ANY active reader's cursor or pending seek offset
-        // so secondary readers (e.g. MKV Cues at EOF) never livelock against eviction when mem > 900 MB.
         let mut reader_windows: Vec<(u64, u64)> = Vec::with_capacity(self.readers.len() * 2);
         for r in self.readers.values() {
             let rb = r.pos / BLOCK;
@@ -274,7 +317,9 @@ impl St {
             }
         }
         let is_protected = |k: u64| -> bool {
-            (k >= keep_from && k <= keep_to)
+            k < PIN_EDGE_BLOCKS
+                || tail_pin_from.map_or(false, |tf| k >= tf)
+                || (k >= keep_from && k <= keep_to)
                 || reader_windows.iter().any(|&(lo, hi)| k >= lo && k <= hi)
         };
         let mut idx: Vec<u64> = self
@@ -483,8 +528,8 @@ impl Spool {
             grace_since = None;
 
             let at = self.st.lock().unwrap().upstream_pos;
-            // Keep reading through a small gap (already-cached bytes) rather than reconnecting
-            let reuse = body.is_some() && t >= at && t - at < (8 << 20);
+            // On gigabit, streaming through up to 32 MiB beats tearing down & reconnecting (0 ms cooldown, 0% 509 risk)
+            let reuse = body.is_some() && t >= at && t - at < REUSE_GAP;
             if !reuse {
                 if body.take().is_some() {
                     crate::slot::mark_released();
@@ -564,13 +609,18 @@ impl Spool {
                             if st.failing_since.is_none() {
                                 st.failing_since = Some(now_ms());
                             }
+                            // After 2 consecutive 509/460/429 rejections on a cached 302 CDN edge,
+                            // clear resolved_url so the next retry obtains a fresh edge token/node.
+                            if slot_errs >= 2 && matches!(code, 429 | 460 | 509) {
+                                st.resolved_url = None;
+                            }
                             st.total.is_some()
                         };
                         self.data.notify_waiters();
                         let limit = if code == 404 || code == 410 {
                             2
                         } else if have_total {
-                            5
+                            6
                         } else {
                             3
                         };
@@ -807,6 +857,7 @@ fn build_http_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .ok()
@@ -917,6 +968,7 @@ pub async fn attach(url: &str, ua: &str) -> Option<String> {
         ua: ua.to_string(),
         st: Mutex::new(St {
             prime: true,
+            refilling: true,
             ..Default::default()
         }),
         data: Notify::new(),
@@ -1001,6 +1053,7 @@ pub async fn pre_spool_next(url: &str, ua: &str) -> bool {
         ua: ua.to_string(),
         st: Mutex::new(St {
             prime: true,
+            refilling: true,
             ..Default::default()
         }),
         data: Notify::new(),
@@ -1119,13 +1172,16 @@ pub fn stats() -> serde_json::Value {
     let Some(s) = CUR.lock().unwrap().clone().filter(|s| !s.closed.load(SeqCst)) else {
         return serde_json::json!(null);
     };
-    let (ahead, bitrate, connected, reconnects, mem, eof) = {
+    let (ahead, cap_hi, total, bitrate, connected, refilling, reconnects, mem, eof) = {
         let st = s.st.lock().unwrap();
         let p = st.primary().unwrap_or(0);
         (
             st.frontier(p).saturating_sub(p),
+            st.cap_high(),
+            st.total.unwrap_or(0),
             st.bitrate,
             st.connected,
+            st.refilling,
             st.reconnects,
             st.mem,
             st.is_eof(),
@@ -1135,10 +1191,19 @@ pub fn stats() -> serde_json::Value {
     let pre_ready = pre
         .as_ref()
         .map_or(false, |ps| !ps.closed.load(SeqCst) && ps.st.lock().unwrap().total.is_some());
+    let cached_pct = if total > 0 {
+        ((mem as f64 / total as f64) * 100.0).min(100.0).round()
+    } else {
+        0.0
+    };
     serde_json::json!({
         "aheadMB": (ahead >> 20),
         "aheadSecs": if bitrate > 0.0 { (ahead as f64 / bitrate).round() } else { -1.0 },
+        "capMB": (cap_hi >> 20),
+        "totalMB": (total >> 20),
+        "cachedPct": cached_pct,
         "connected": connected,
+        "refilling": refilling,
         "reconnects": reconnects,
         "memMB": mem >> 20,
         "eof": eof,
@@ -1182,6 +1247,8 @@ pub async fn serve(Path(gen): Path<u64>, headers: HeaderMap) -> Response {
     };
     let id = {
         let mut st = sp.st.lock().unwrap();
+        // Once any real reader attaches, disable startup byte-0 priming so deep seeks never snap back!
+        st.prime = false;
         st.next_reader += 1;
         let id = st.next_reader;
         st.readers.insert(
@@ -1226,7 +1293,7 @@ pub async fn serve(Path(gen): Path<u64>, headers: HeaderMap) -> Response {
                 if let Some((b, off)) = st.have(pos) {
                     let n = (b.len() - off)
                         .min((end - pos + 1) as usize)
-                        .min(512 * 1024);
+                        .min(BLOCK as usize);
                     let chunk = Bytes::copy_from_slice(&b[off..off + n]);
                     if let Some(r) = st.readers.get_mut(&g.1) {
                         r.pos = pos + n as u64;
@@ -1278,7 +1345,7 @@ mod tests {
 
     #[test]
     fn slot_and_auth_status_classification_and_backoff() {
-        for code in [401, 403, 404, 410, 429, 460] {
+        for code in [401, 403, 404, 410, 429, 460, 509] {
             assert!(
                 is_slot_or_auth_status(code),
                 "expected {code} to be slot/auth"
@@ -1293,13 +1360,13 @@ mod tests {
         for code in [401, 403, 404, 410] {
             assert!(should_retry_portal_url(code));
         }
-        for code in [429, 460, 500, 503] {
+        for code in [429, 460, 509, 500, 503] {
             assert!(!should_retry_portal_url(code));
         }
-        assert_eq!(slot_backoff_ms(1), 3000);
-        assert_eq!(slot_backoff_ms(2), 6000);
-        assert_eq!(slot_backoff_ms(3), 10_000);
-        assert_eq!(slot_backoff_ms(9), 10_000);
+        assert_eq!(slot_backoff_ms(1), 2000);
+        assert_eq!(slot_backoff_ms(2), 4000);
+        assert_eq!(slot_backoff_ms(3), 7000);
+        assert_eq!(slot_backoff_ms(9), 7000);
         assert_eq!(REOPEN_WAIT_MS, 1500);
     }
 
@@ -1349,21 +1416,76 @@ mod tests {
                 waiting: Some(1999 * BLOCK),
             },
         );
-        // Populate 910 MB across distant middle blocks + EOF blocks
-        for k in 300..1205u64 {
+        // Populate > MEM_CAP across distant middle blocks + head + EOF blocks
+        for k in 0..4u64 {
             st.blocks.insert(k, vec![0u8; BLOCK as usize]);
             st.mem += BLOCK;
         }
-        for k in 1995..=2000u64 {
+        for k in 300..2400u64 {
+            st.blocks.insert(k, vec![0u8; BLOCK as usize]);
+            st.mem += BLOCK;
+        }
+        st.total = Some(3000 * BLOCK);
+        for k in 2996..3000u64 {
             st.blocks.insert(k, vec![0u8; BLOCK as usize]);
             st.mem += BLOCK;
         }
         assert!(st.mem > MEM_CAP);
         st.evict();
         assert!(st.mem <= MEM_CAP * 9 / 10);
-        // Every block within ±4 of reader 2's cursor/wait MUST survive eviction
+        // Pinned head (0..4) and tail (last 4 blocks) + reader 2's blocks MUST survive eviction!
+        for k in 0..4u64 {
+            assert!(st.blocks.contains_key(&k), "head block {k} was evicted");
+        }
+        for k in 2996..3000u64 {
+            assert!(st.blocks.contains_key(&k), "tail block {k} was evicted");
+        }
         for k in 1995..=2000u64 {
             assert!(st.blocks.contains_key(&k), "EOF reader block {k} was evicted");
         }
+    }
+
+    #[test]
+    fn hysteresis_prevents_1mb_reconnect_churn_and_full_file_mode_caches_under_cap() {
+        // 1) Large 12 GiB 4K film (~1.5 MB/s): cap_high = 900 MB (600s), cap_low = 450 MB (300s)
+        let mut st = St {
+            total: Some(12_000 * BLOCK),
+            bitrate: 1.5 * BLOCK as f64,
+            refilling: true,
+            ..Default::default()
+        };
+        let cap_hi = st.cap_high();
+        let cap_lo = st.cap_low();
+        assert_eq!(cap_hi, 900 * BLOCK);
+        assert_eq!(cap_lo, 450 * BLOCK);
+        st.readers.insert(1, Reader { pos: 100 * BLOCK, served: 100 * BLOCK, waiting: None });
+
+        // Populate 900 MiB ahead (blocks 100..1000) -> hits cap_high, stops refilling!
+        for k in 100..1000u64 {
+            st.blocks.insert(k, vec![0u8; BLOCK as usize]);
+        }
+        assert_eq!(st.target(), None);
+        assert!(!st.refilling);
+
+        // Advance playhead by 200 MiB (ahead = 700 MiB, still >= cap_low 450 MiB) -> MUST stay idle!
+        st.readers.get_mut(&1).unwrap().pos = 300 * BLOCK;
+        assert_eq!(st.target(), None);
+        assert!(!st.refilling);
+
+        // Advance playhead so ahead = 440 MiB (< cap_low 450 MiB) -> triggers single continuous refill!
+        st.readers.get_mut(&1).unwrap().pos = 560 * BLOCK;
+        assert_eq!(st.target(), Some(1000 * BLOCK));
+        assert!(st.refilling);
+
+        // 2) Normal 1.2 GiB episode (<= MEM_CAP): cap_high == total -> downloads entire file to EOF!
+        let mut ep = St {
+            total: Some(1200 * BLOCK),
+            bitrate: 0.5 * BLOCK as f64,
+            refilling: true,
+            ..Default::default()
+        };
+        assert_eq!(ep.cap_high(), 1200 * BLOCK);
+        ep.readers.insert(1, Reader { pos: 0, served: 1024, waiting: None });
+        assert_eq!(ep.target(), Some(0));
     }
 }

@@ -2988,8 +2988,9 @@ const Player = (() => {
   let pro = null; let proPoll; let statsTimer; let shiftTimer; let saverTimer; let lastBytes = null;
   // live TV: TS ring buffer pause/rewind + now/next banner
   let liveBack = 0; let liveBufSecs = 0; let liveBehind = 0; let livePausedAt = 0; let livePollTimer; let liveEpgTimer; let liveBannerTimer;
-  // MSE engine state (VOD fast seeks + seamless version switching)
+  // MSE engine state (VOD 0ms in-buffer seeks + adaptive 4-min buffer + seamless version switching)
   let mseActive = false; let mseTarget = 0; let mseSessionStart = 0; let mseFailed = false;
+  let mseMaxAhead = 240; let vodPollTimer = null; let spoolAheadSecs = 0; let spoolEof = false; let spinDelayTimer = null;
   const mseEnabled = () => typeof MediaSource !== 'undefined' && localGet('mse', '1') === '1' && !mseFailed;
   // Web player UX state: speed, aspect/zoom, subtitle size, HUDs, drag-scrub, instant seek, wheel volume
   const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -3303,7 +3304,8 @@ const Player = (() => {
   }
   function updateBufferedBar() {
     const bufEl = $('#pSeek .buf', el);
-    if (!bufEl || !video || !o || o.live || !duration) return;
+    const spEl = $('#pSeek .buf-spool', el);
+    if (!video || !o || o.live || !duration) return;
     try {
       const curT = video.currentTime || 0;
       let endT = 0;
@@ -3311,8 +3313,16 @@ const Player = (() => {
         if (video.buffered.start(i) <= curT + 1.5 && video.buffered.end(i) > endT) endT = video.buffered.end(i);
       }
       const absEnd = mseActive ? endT : (endT > 0 ? offset + endT : 0);
-      const pct = Math.max(0, Math.min(100, (absEnd / duration) * 100));
-      bufEl.style.width = pct + '%';
+      if (bufEl) {
+        const pct = Math.max(0, Math.min(100, (absEnd / duration) * 100));
+        bufEl.style.width = pct + '%';
+      }
+      if (spEl) {
+        const p = pos();
+        const spEnd = spoolEof ? duration : (spoolAheadSecs > 0 ? Math.min(duration, Math.max(absEnd, p + spoolAheadSecs)) : absEnd);
+        const spPct = Math.max(0, Math.min(100, (spEnd / duration) * 100));
+        spEl.style.width = spPct + '%';
+      }
     } catch {}
   }
   function renderTimeText(p) {
@@ -3358,6 +3368,17 @@ const Player = (() => {
   const Mse = (() => {
     let ms = null; let sb = null; let url = null; let mime = null;
     let ctrl = null; let fetchGen = 0; let queue = Promise.resolve();
+    let wakeResolver = null;
+    function wakeFetch() {
+      if (wakeResolver) { const r = wakeResolver; wakeResolver = null; r(); }
+    }
+    function sleepBackpressure(msDelay) {
+      return new Promise((resolve) => {
+        const t = setTimeout(() => { if (wakeResolver === done) wakeResolver = null; resolve(); }, msDelay);
+        const done = () => { clearTimeout(t); resolve(); };
+        wakeResolver = done;
+      });
+    }
     const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
     const str4 = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
     const hex2 = (n) => n.toString(16).padStart(2, '0');
@@ -3451,6 +3472,7 @@ const Player = (() => {
     }
     function abortFetch() {
       fetchGen++;
+      wakeFetch();
       if (ctrl) { try { ctrl.abort(); } catch {} ctrl = null; }
     }
     function destroy() {
@@ -3464,7 +3486,7 @@ const Player = (() => {
       if (!video || !mseActive) return false;
       try {
         for (let i = 0; i < video.buffered.length; i++) {
-          if (t >= video.buffered.start(i) + 0.1 && t <= video.buffered.end(i) - 0.5) return true;
+          if (t >= video.buffered.start(i) + 0.02 && t <= video.buffered.end(i) - 0.15) return true;
         }
       } catch {}
       return false;
@@ -3518,7 +3540,24 @@ const Player = (() => {
         if (e?.name === 'QuotaExceededError') {
           try {
             const ct = video.currentTime || 0;
-            if (ct > 35) { sb.remove(0, ct - 30); await waitUpdate(sb); }
+            // First evict everything more than 15s behind playhead + disconnected distant ranges
+            if (video.buffered.length) {
+              if (ct > 20 && video.buffered.start(0) < ct - 15) {
+                sb.remove(0, ct - 15);
+                await waitUpdate(sb);
+              }
+              for (let i = video.buffered.length - 1; i >= 0; i--) {
+                const rs = video.buffered.start(i);
+                const re = video.buffered.end(i);
+                if (rs > ct + 10 && re < rs + 36000 && !(tsOffset != null && tsOffset >= rs - 5 && tsOffset <= re + 5)) {
+                  sb.remove(rs, re + 0.5);
+                  await waitUpdate(sb);
+                }
+              }
+            }
+            // Adaptively step ceiling down to fit Chromium's exact per-tab quota on high-bitrate 4K
+            const curAhead = bufferedAhead();
+            if (curAhead > 35) mseMaxAhead = Math.max(45, Math.min(mseMaxAhead, Math.floor(curAhead - 6)));
             sb.appendBuffer(bytes);
             await waitUpdate(sb);
           } catch {}
@@ -3540,7 +3579,7 @@ const Player = (() => {
       // so auto-skip & seeks land on the exact frame instead of playing 5s of leftover OP music.
       let exactSeekGoal = (!splice && targetSec > 0.5) ? targetSec : null;
       let playbackStarted = false;
-      const exactStartMs = performance.now();
+      let exactStartMs = 0;
       let buf = new Uint8Array(0); let bufLen = 0;
 
       const appendBytes = (chunk) => {
@@ -3564,6 +3603,20 @@ const Player = (() => {
             if (fg !== fetchGen || !sb || !ms || ms.readyState !== 'open') return;
             try { sb.abort(); } catch {}
             await waitUpdate(sb);
+            // When jumping far outside cached ranges, clear fragmented distant ranges so full quota goes forward!
+            try {
+              if (video && video.buffered.length > 0) {
+                let near = false;
+                for (let i = 0; i < video.buffered.length; i++) {
+                  if (targetSec >= video.buffered.start(i) - 30 && targetSec <= video.buffered.end(i) + 30) { near = true; break; }
+                }
+                if (!near || video.buffered.length > 2) {
+                  const endAll = video.buffered.end(video.buffered.length - 1);
+                  sb.remove(0, endAll + 1);
+                  await waitUpdate(sb);
+                }
+              }
+            } catch {}
           });
         }
         const res = await fetch(src({ t: targetSec, mse: true }), { signal: myCtrl.signal });
@@ -3571,9 +3624,10 @@ const Player = (() => {
         const reader = res.body.getReader();
 
         while (fg === fetchGen && o === me) {
-          // Backpressure so browser buffer stays smooth without filling RAM
-          while (fg === fetchGen && started && bufferedAhead() > 75) {
-            await new Promise((r) => setTimeout(r, 400));
+          // Adaptive gigabit MSE buffer: fills up to 240s (4 min) on 1080p or max Chromium quota on 4K!
+          // Wakes instantly via wakeFetch() the microsecond the user clicks forward inside the buffer.
+          while (fg === fetchGen && started && bufferedAhead() > mseMaxAhead) {
+            await sleepBackpressure(200);
           }
           if (fg !== fetchGen || o !== me) break;
           const { value, done } = await reader.read();
@@ -3664,6 +3718,7 @@ const Player = (() => {
               pendingMoof = null;
               const isFirst = !firstMoofDone;
               firstMoofDone = true;
+              if (isFirst) exactStartMs = performance.now();
               const tsOff = isFirst ? startSec : null;
               const spAt = (isFirst && splice) ? Math.max(startSec, (video?.currentTime || 0) + 0.5) : null;
               await enqueue(async () => {
@@ -3690,7 +3745,7 @@ const Player = (() => {
                         }
                       }
                     } catch {}
-                    const reachedExact = exactSeekGoal === null || be >= exactSeekGoal + 0.15 || (performance.now() - exactStartMs > 1400);
+                    const reachedExact = exactSeekGoal === null || be >= exactSeekGoal + 0.1 || (performance.now() - exactStartMs > 1200);
                     if (reachedExact) {
                       playbackStarted = true;
                       exactSeekGoal = null;
@@ -3702,13 +3757,14 @@ const Player = (() => {
                     }
                   }
                 }
-                // Evict old buffer behind playhead
+                // Evict old behind-buffer early (keep 25s behind) so maximum Chromium quota goes FORWARD!
                 if (sb && !sb.updating && video && video.buffered.length) {
                   const ct = video.currentTime || 0;
-                  if (ct - video.buffered.start(0) > 100) {
-                    try { sb.remove(0, ct - 45); await waitUpdate(sb); } catch {}
+                  if (ct - video.buffered.start(0) > 45) {
+                    try { sb.remove(0, ct - 25); await waitUpdate(sb); } catch {}
                   }
                 }
+                updateBufferedBar();
               });
             }
           }
@@ -3727,7 +3783,7 @@ const Player = (() => {
         if (!resumeHere('Stream hiccup, reconnecting…')) fail('mse');
       }
     }
-    return { startFetch, destroy, isBuffered, abortFetch };
+    return { startFetch, destroy, isBuffered, abortFetch, wakeFetch };
   })();
 
   function loadDirect(why) {
@@ -3743,9 +3799,20 @@ const Player = (() => {
       const target = opts.target ?? offset;
       const keepPaused = !!opts.keepPaused;
       const splice = !!opts.splice;
-      if (!splice) { started = false; spin(true, opts.why || (target > 5 ? `Loading ${fmtTime(target)}…` : 'Loading…')); }
+      if (!splice) {
+        const wasStarted = started;
+        started = false;
+        if (wasStarted && opts.delaySpin) {
+          clearTimeout(spinDelayTimer);
+          const myLg = loadGen + 1;
+          spinDelayTimer = setTimeout(() => { if (loadGen === myLg && !started) spin(true, opts.why || 'Seeking…'); }, 180);
+        } else {
+          spin(true, opts.why || (target > 5 ? `Loading ${fmtTime(target)}…` : 'Loading…'));
+        }
+      }
       showMsg(null); loadT = performance.now(); reportedStart = false; stallAt = 0; clearTimeout(stallTimer2); loadGen++;
-      resetSubs(); base = 0; baseKnown = false; restoreSync();
+      if (subSel !== -3) resetSubs();
+      base = 0; baseKnown = false; restoreSync();
       clearTimeout(stallTimer);
       stallTimer = setTimeout(() => { if (!started && !(video.paused && video.readyState >= 2)) fail('timeout'); }, 30000);
       Mse.startFetch(target, { splice, keepPaused });
@@ -3854,6 +3921,7 @@ const Player = (() => {
     $('#pClose').onclick = () => close();
   }
   function spin(on, label) {
+    clearTimeout(spinDelayTimer); spinDelayTimer = null;
     const w = $('.spin-wrap', el);
     if (w) {
       w.hidden = !on;
@@ -4207,8 +4275,8 @@ const Player = (() => {
         ['Screen', `${sw}×${sh}${disp ? ` · ${disp.hz} Hz` : ''} · ${matchMedia('(dynamic-range: high)').matches ? 'HDR on' : 'SDR'}`],
         ['Scaling', vw && vw < sw * 0.95 ? `${(sw / vw).toFixed(1)}× up to the screen (RTX Super Resolution sharpens this when it's on)` : 'native'],
         ['Bitrate', `${rate ? (rate / 1000).toFixed(1) + ' Mb/s now' : '…'}${pic.kbps ? ` · ${(pic.kbps / 1000).toFixed(1)} Mb/s average` : ''}`],
-        ['Buffer', `${ahead.toFixed(1)} s in the player`],
-        ['Read-ahead', st?.spool ? `${st.spool.aheadSecs >= 0 ? st.spool.aheadSecs + ' s' : st.spool.aheadMB + ' MB'} cached on this PC · ${st.spool.connected ? 'downloading' : 'provider idle (cache full)'}${st.spool.reconnects ? ` · ${st.spool.reconnects} reconnects absorbed` : ''}` : st?.livebuf ? `${st.livebuf.bufferedSecs} s live ring (${st.livebuf.behindSecs > 3 ? `${fmtTime(st.livebuf.behindSecs)} behind live` : 'at live edge'}) · ${st.livebuf.memMB} MB${st.livebuf.reconnects ? ` · ${st.livebuf.reconnects} reconnects absorbed` : ''}` : o.live ? 'live (direct)' : 'direct'],
+        ['Buffer', `${ahead.toFixed(1)} s instant in player (cap ${mseMaxAhead}s)`],
+        ['Read-ahead', st?.spool ? `${st.spool.eof ? '100% cached in PC RAM' : (st.spool.aheadSecs >= 0 ? st.spool.aheadSecs + ' s' : st.spool.aheadMB + ' MB') + ' ahead in PC RAM'} (${st.spool.memMB} MB${st.spool.totalMB ? ` / ${st.spool.totalMB} MB` : ''}) · ${st.spool.connected ? 'downloading (gigabit)' : 'provider idle'}${st.spool.reconnects ? ` · ${st.spool.reconnects} reconnects` : ''}` : st?.livebuf ? `${st.livebuf.bufferedSecs} s live ring (${st.livebuf.behindSecs > 3 ? `${fmtTime(st.livebuf.behindSecs)} behind live` : 'at live edge'}) · ${st.livebuf.memMB} MB${st.livebuf.reconnects ? ` · ${st.livebuf.reconnects} reconnects absorbed` : ''}` : o.live ? 'live (direct)' : 'direct'],
         ['Dropped frames', q.totalVideoFrames ? `${q.droppedVideoFrames} of ${q.totalVideoFrames}` : '…'],
         ['Sound', a ? (ch >= 6 && SURROUND_OUT ? `5.1 surround (from ${(a.codec || '').toUpperCase()} ${ch >= 8 ? '7.1' : '5.1'})` : ch >= 6 ? `Stereo mix of ${(a.codec || '').toUpperCase()} ${ch >= 8 ? '7.1' : '5.1'} (your output is stereo)` : `Stereo (from ${(a.codec || '').toUpperCase()}${ch === 1 ? ' mono' : ''})`) : o.live ? 'Stereo' : '…'],
         ['Delivery', `${cur().tx ? 'Converted (compatibility mode)' : 'Original stream, untouched'}${mseActive ? ' · MSE' : ''}${cur().label || o.label ? ` · ${esc(cur().label || o.label)}` : ''}`],
@@ -4436,7 +4504,8 @@ const Player = (() => {
     if (my !== openGen) return;
     o = opts; credits = null; creditsEnd = null; creditsMixed = false; hasPostCredits = false; skipped = new Set(); userDismissed = new Set(); creditsDismissed = false; clearUndoSkip(); stalls = []; watchedSecs = 0; watchedAt = 0; offset = opts.resume > 5 ? opts.resume : 0; duration = opts.duration || 0; audio = 0; probe = null; historySent = false; nextShown = false; prespoolSent = false;
     subSel = -1; subTrack = null; clearInterval(subTimer); clearAiSubJob(); clearDvrTimer(); dvrRec = null;
-    mseFailed = false; mseActive = false; mseTarget = offset; mseSessionStart = offset;
+    mseFailed = false; mseActive = false; mseTarget = offset; mseSessionStart = offset; mseMaxAhead = 240;
+    spoolAheadSecs = 0; spoolEof = false; clearInterval(vodPollTimer); clearTimeout(spinDelayTimer); spinDelayTimer = null;
     playRate = 1; zoomMode = 'fit'; draggingSeek = false; hoveringCtrl = false;
     clearTimeout(pendingSeekTimer); pendingSeekTimer = null; pendingSeekTarget = null; pendingLiveBack = null;
     clearTimeout(hudSeekTimer); hudSeekDir = 0; hudSeekAccum = 0; clearTimeout(clickTimer); clickTimer = null; lastPosStateAt = 0;
@@ -4460,7 +4529,7 @@ const Player = (() => {
           <div style="min-width:0;flex:1"><div class="pt">${esc(o.title)}</div><div class="ps" id="pSub">${o.live ? '<span class="live-badge"><span class="live-dot"></span>LIVE</span> ' : ''}${esc(o.sub || '')}</div></div>
           <button class="pbtn" id="pHelp" title="Keyboard shortcuts (?)">${I.help}</button></div>
         <div class="pc-bottom">
-          <div class="seek" id="pSeek" tabindex="0" role="slider" aria-label="Seek"><div class="track"><div class="buf"></div><div class="segs"></div><div class="fill"></div><div class="knob"></div></div><div class="hover-t"></div></div>
+          <div class="seek" id="pSeek" tabindex="0" role="slider" aria-label="Seek"><div class="track"><div class="buf-spool"></div><div class="buf"></div><div class="segs"></div><div class="fill"></div><div class="knob"></div></div><div class="hover-t"></div></div>
           <div class="pc-row">
             <button class="pbtn" id="pPlay" title="Play/Pause (Space / K)">${I.pause}</button>
             <button class="pbtn" id="pRew" title="Back 10s (← / J · Shift: 30s)">${I.rew}</button><button class="pbtn" id="pFwd" title="Forward 10s (→ / L · Shift: 30s)">${I.fwd}</button>
@@ -4620,6 +4689,19 @@ const Player = (() => {
     renderSources(); setMediaSession();
     load({ target: offset });
     saveTimer = setInterval(save, 10000);
+    if (!o.live && !o.catchup) {
+      const pollVodSpool = () => {
+        if (!o || o.live || pro || casting) return;
+        api('/api/streamstats').then((st) => {
+          if (!o || !st?.spool) return;
+          spoolEof = !!st.spool.eof;
+          spoolAheadSecs = st.spool.aheadSecs >= 0 ? st.spool.aheadSecs : 0;
+          updateBufferedBar();
+        }).catch(() => {});
+      };
+      setTimeout(pollVodSpool, 1500);
+      vodPollTimer = setInterval(pollVodSpool, 4000);
+    }
   }
 
   function videoBufAhead() {
@@ -4775,12 +4857,13 @@ const Player = (() => {
     // MSE instant in-buffer seek (0ms, zero ffmpeg restart, zero subtitle reset!)
     if (mseActive && Mse.isBuffered(clamped)) {
       video.currentTime = clamped;
+      Mse.wakeFetch();
       tick();
       return;
     }
     const keepPaused = started && video.paused;
     offset = clamped;
-    load({ target: clamped, keepPaused, why: `Seeking to ${fmtTime(clamped)}…` });
+    load({ target: clamped, keepPaused, delaySpin: mseActive, why: `Seeking to ${fmtTime(clamped)}…` });
     tick();
     if (keepPaused && !mseActive) video.addEventListener('playing', () => video.pause(), { once: true });
   }
@@ -4822,19 +4905,20 @@ const Player = (() => {
       return;
     }
 
-    // 0ms instant in-buffer MSE seek!
-    if (mseActive && pendingSeekTimer === null && Mse.isBuffered(target)) {
+    // 0ms instant in-buffer MSE seek! Works even if a previous rapid tap queued a pending seek.
+    if (mseActive && Mse.isBuffered(target)) {
+      clearTimeout(pendingSeekTimer); pendingSeekTimer = null; pendingSeekTarget = null;
       seekTo(target, { byUser: true });
       return;
     }
 
-    // Out-of-buffer seek: batch rapid taps over 220ms into one clean server seek
+    // Out-of-buffer seek: batch rapid taps over 120ms into one clean server seek
     pendingSeekTarget = target;
     clearTimeout(pendingSeekTimer);
     pendingSeekTimer = setTimeout(() => {
       const t = pendingSeekTarget; pendingSeekTarget = null; pendingSeekTimer = null;
       if (o && t !== null) seekTo(t, { byUser: true });
-    }, 220);
+    }, 120);
   }
 
   function skipLabelFor(s) {
@@ -4954,9 +5038,17 @@ const Player = (() => {
       if (!o?.live && playRate !== 1) { try { video.playbackRate = playRate; } catch {} }
       updateBufferedBar();
     });
+    video.addEventListener('canplay', () => { if (video.readyState >= 3) spin(false); });
+    video.addEventListener('seeked', () => { if (video.readyState >= 3) spin(false); });
     video.addEventListener('progress', updateBufferedBar);
     video.addEventListener('waiting', () => {
-      spin(true, started ? 'Buffering…' : 'Loading…');
+      // Avoid 1-frame spinner flash on 0ms in-buffer MSE seeks or brief GPU keyframe decodes
+      if (started && (mseActive || video.seeking)) {
+        clearTimeout(spinDelayTimer);
+        spinDelayTimer = setTimeout(() => { if (video && video.readyState < 3 && !video.paused && o) spin(true, 'Buffering…'); }, 220);
+      } else {
+        spin(true, started ? 'Buffering…' : 'Loading…');
+      }
       // only a real stall of THIS session's stream counts (not a teardown, a reload or a seek)
       if (started && !video.seeking && video.currentSrc && (mseActive || video.currentSrc === video.src) && o) {
         hitches++;
@@ -5296,7 +5388,7 @@ const Player = (() => {
     if (!o) return;
     Mse.destroy();
     clearAiSubJob(); clearDvrTimer(); dvrRec = null; clearTimeout(castVolTimer);
-    clearInterval(livePollTimer); clearTimeout(liveEpgTimer); clearTimeout(liveBannerTimer);
+    clearInterval(livePollTimer); clearInterval(vodPollTimer); vodPollTimer = null; clearTimeout(spinDelayTimer); spinDelayTimer = null; clearTimeout(liveEpgTimer); clearTimeout(liveBannerTimer);
     if (casting) { casting = null; clearInterval(castPoll); post('/api/cast/control', { action: 'stop' }).catch(() => {}); }
     if (pro) { pro = null; clearInterval(proPoll); post('/api/mpv/stop', {}).catch(() => {}); }
     clearInterval(statsTimer); clearInterval(shiftTimer); clearTimeout(saverTimer); clearTimeout(replaySubTimer); replayPrevSub = null; lastBytes = null; el.style.removeProperty('--shift');

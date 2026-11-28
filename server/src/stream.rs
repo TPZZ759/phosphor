@@ -754,6 +754,12 @@ impl Streamer {
             ua.into(),
         ];
 
+        let local_src = local_override
+            .map(String::from)
+            .or_else(|| crate::spool::local_for(url));
+        let via_local = local_src.is_some();
+        let src = local_src.unwrap_or_else(|| url.to_string());
+
         // Live: short probe so channels start fast; drop +igndts on live fMP4 so B-frame DTS stays intact
         if live {
             for x in [
@@ -778,6 +784,20 @@ impl Streamer {
             ] {
                 a.push(x.into());
             }
+        } else if via_local && info.is_some() {
+            // Reading from localhost gigabit RAM spool with streams already probed: fast analysis & fastseek!
+            for x in [
+                "-analyzeduration",
+                "1000000",
+                "-probesize",
+                "1000000",
+                "-rw_timeout",
+                "15000000",
+                "-fflags",
+                "+fastseek",
+            ] {
+                a.push(x.into());
+            }
         } else {
             for x in [
                 "-analyzeduration",
@@ -786,6 +806,8 @@ impl Streamer {
                 "3000000",
                 "-rw_timeout",
                 "15000000",
+                "-fflags",
+                "+fastseek",
                 "-reconnect",
                 "1",
                 "-reconnect_streamed",
@@ -813,12 +835,6 @@ impl Streamer {
         if !live {
             a.push("-copyts".into());
         }
-
-        let local_src = local_override
-            .map(String::from)
-            .or_else(|| crate::spool::local_for(url));
-        let via_local = local_src.is_some();
-        let src = local_src.unwrap_or_else(|| url.to_string());
 
         for x in ["-i", src.as_str(), "-map", "0:v:0?", "-map"] {
             a.push(x.into());
@@ -967,7 +983,7 @@ impl Streamer {
                 "-movflags",
                 "frag_keyframe+empty_moov+default_base_moof",
                 "-frag_duration",
-                if live { "500000" } else { "1000000" },
+                "500000",
                 "-f",
                 "mp4",
                 "pipe:1",
@@ -1038,13 +1054,19 @@ impl Streamer {
                 }
             }
             // Low-rate mono copy of the audio: subtitle sync + intro/credits fingerprints.
+            // Keep lightweight (skip heavy dynaudnorm/5.1 pan filters on 8 kHz VAD tap).
             if !live && has_a {
                 for x in ["-map".to_string(), format!("0:a:{audio}?")] {
                     a.push(x);
                 }
-                if let Some(f) = &af {
+                if audio_delay_ms > 0 {
                     a.push("-af".into());
-                    a.push(f.clone());
+                    a.push(format!("adelay=delays={audio_delay_ms}:all=1"));
+                } else if audio_delay_ms < 0 {
+                    let shift = (-audio_delay_ms) as f64 / 1000.0;
+                    let samples = ((-audio_delay_ms) as u64).saturating_mul(8).max(1);
+                    a.push("-af".into());
+                    a.push(format!("aresample=8000,atrim=start_sample={samples},asetpts=PTS-{shift:.3}/TB"));
                 }
                 for x in ["-ac", "1", "-ar", "8000", "-c:a", "pcm_s16le", "-f", "s16le"] {
                     a.push(x.into());
