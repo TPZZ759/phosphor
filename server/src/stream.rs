@@ -784,21 +784,9 @@ impl Streamer {
             ] {
                 a.push(x.into());
             }
-        } else if via_local && info.is_some() {
-            // Reading from localhost gigabit RAM spool with streams already probed: fast analysis & fastseek!
-            for x in [
-                "-analyzeduration",
-                "1000000",
-                "-probesize",
-                "1000000",
-                "-rw_timeout",
-                "15000000",
-                "-fflags",
-                "+fastseek",
-            ] {
-                a.push(x.into());
-            }
         } else {
+            // VOD (both local RAM spool & direct): full 3 MB / 3 s analysis ensures 4K HEVC + 5.1 + multi-sub MKVs
+            // open reliably on deep seeks without +fastseek cluster stalls.
             for x in [
                 "-analyzeduration",
                 "3000000",
@@ -806,8 +794,6 @@ impl Streamer {
                 "3000000",
                 "-rw_timeout",
                 "15000000",
-                "-fflags",
-                "+fastseek",
                 "-reconnect",
                 "1",
                 "-reconnect_streamed",
@@ -902,6 +888,10 @@ impl Streamer {
                 "60M",
                 "-bf",
                 "0",
+                "-profile:v",
+                "high",
+                "-level:v",
+                "5.1",
                 "-pix_fmt",
                 "yuv420p",
             ] {

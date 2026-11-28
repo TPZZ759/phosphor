@@ -30,8 +30,8 @@ use tokio::sync::Notify;
 const BLOCK: u64 = 1 << 20;
 const MEM_CAP: u64 = 2048 << 20; // 2 GiB gigabit RAM cache (whole episodes/1080p films fit 100% in RAM)
 const BEHIND: u64 = 256 << 20; // 256 MiB kept behind playhead for instant rewinds
-const PRIME_BYTES: u64 = 8 << 20; // fast 8 MiB header prime before first reader attaches
-const REUSE_GAP: u64 = 32 << 20; // stream through up to 32 MiB on gigabit rather than reconnecting
+const PRIME_BYTES: u64 = 4 << 20; // fast 4 MiB header prime before first reader attaches
+const REUSE_GAP: u64 = 8 << 20; // stream through up to 8 MiB rather than reconnecting; jump directly on larger seeks
 const PIN_EDGE_BLOCKS: u64 = 4; // pin first 4 MiB + last 4 MiB (MKV Cues / MP4 moov-at-EOF never evicted)
 const READER_GAP_GRACE_MS: i64 = 5_000; // keep warm TCP socket across ffprobe -> mpv HDR settle
 const AHEAD_SECS: f64 = 600.0; // 10 minutes read-ahead on large 4K films
@@ -528,7 +528,7 @@ impl Spool {
             grace_since = None;
 
             let at = self.st.lock().unwrap().upstream_pos;
-            // On gigabit, streaming through up to 32 MiB beats tearing down & reconnecting (0 ms cooldown, 0% 509 risk)
+            // Keep reading through a small gap (up to 8 MiB) rather than reconnecting; jump directly on larger seeks
             let reuse = body.is_some() && t >= at && t - at < REUSE_GAP;
             if !reuse {
                 if body.take().is_some() {

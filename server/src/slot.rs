@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Notify;
 
 pub const CROSS_URL_COOLDOWN_MS: i64 = 1500;
-pub const SAME_URL_COOLDOWN_MS: i64 = 750;
+pub const SAME_URL_COOLDOWN_MS: i64 = 250;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
@@ -444,10 +444,10 @@ mod tests {
         assert_eq!(a.current_url().as_deref(), Some("http://p/movie/1.mkv"));
         assert!(!l1.is_cancelled());
 
-        // Same-URL re-acquire while active: cancels l1 immediately, 750 ms cooldown (prevents 509 storms)
+        // Same-URL re-acquire while active: cancels l1 immediately, 250 ms cooldown
         let l2 = a.acquire_at(Owner::Spool, "http://p/movie/1.mkv", 10_500);
         assert!(l1.is_cancelled());
-        assert_eq!(l2.wait_ms(), 750);
+        assert_eq!(l2.wait_ms(), 250);
         assert_eq!(a.last_released_ms(), 10_500);
 
         // Dropping superseded l1 must NOT clear l2's active ownership
@@ -468,14 +468,14 @@ mod tests {
         assert_eq!(a.owner(), Owner::None);
         assert_eq!(a.last_released_ms(), 12_000);
 
-        // Same-URL after 100 ms idle -> 650 ms remaining
+        // Same-URL after 100 ms idle -> 150 ms remaining
         assert_eq!(
             a.cooldown_remaining_ms_at(Some("http://p/live/99.ts"), 12_100),
-            650
+            150
         );
-        // Same-URL after 750 ms idle -> 0 ms remaining
+        // Same-URL after 250 ms idle -> 0 ms remaining
         assert_eq!(
-            a.cooldown_remaining_ms_at(Some("http://p/live/99.ts"), 12_750),
+            a.cooldown_remaining_ms_at(Some("http://p/live/99.ts"), 12_250),
             0
         );
         // Cross-URL after 500 ms idle -> 1000 ms remaining

@@ -2925,6 +2925,7 @@ function playMovie(d, id, resume) {
     progressKey: `m:${d.id}`, tmdb: d.tmdb, imdb: d.imdb || '', extSub: d.extSub || null, historyKind: 'm', historyTitle: d.title,
     item: { k: 'm', id: d.id, title: d.title, year: d.year, poster: d.poster, backdrop: d.backdrop },
     label: v.label, cat: v.cat || '', catId: v.catId || '', subMarket: !!v.subMarket,
+    uhd: !!v.uhd, dv: !!v.dv, hdr: !!v.hdr,
     alternates: (d.variants || []).filter((x) => x.id !== id),
   });
 }
@@ -3820,10 +3821,50 @@ const Player = (() => {
     }
     loadDirect(opts.why);
   }
+  function is4kVariant(x) {
+    if (!x) return false;
+    return !!(
+      x.uhd || x.dv || x.hdr
+      || /\b4K\b|\bUHD\b|2160p|3840p/i.test(x.label || '')
+      || /\b4K\b|\bUHD\b|2160p|3840p/i.test(x.cat || '')
+      || (x.q && (x.q.h >= 1800 || x.q.w >= 3600))
+    );
+  }
+  function is4kLocked() {
+    if (!o || o.live || o.catchup) return false;
+    const c = cur();
+    if (is4kVariant(c)) return true;
+    if (o.manualOverride) return false;
+    return is4kVariant(o) || !!(probe?.pic && (probe.pic.h >= 1800 || probe.pic.w >= 3600));
+  }
+  function isBlockedDowngrade(a) {
+    if (!a || !is4kLocked()) return false;
+    if (a.tx || a.alt) return false;
+    if (a.id === cur()?.id || a.id === o?.id) return false;
+    return !!(a.manualOnly || !is4kVariant(a));
+  }
   function buildAttempts() {
-    const list = [{ id: o.id, label: o.label, ext: o.ext, cat: o.cat, catId: o.catId, subMarket: !!o.subMarket }, { id: o.id, tx: true, label: o.label, ext: o.ext, subMarket: !!o.subMarket }];
-    for (const v of o.alternates || []) if (v.id !== o.id) list.push({ id: v.id, label: v.label || v.channel, ext: v.ext, cat: v.cat, catId: v.catId, subMarket: !!v.subMarket });
-    list.push({ id: o.id, alt: true, label: o.label, ext: o.ext, subMarket: !!o.subMarket });
+    const primary4k = !o.live && !o.catchup && is4kVariant(o);
+    const base = {
+      id: o.id, label: o.label, ext: o.ext, cat: o.cat, catId: o.catId,
+      subMarket: !!o.subMarket, uhd: !!o.uhd || primary4k, dv: !!o.dv, hdr: !!o.hdr,
+    };
+    // Try direct 4K/original copy on primary, then backup server (still direct copy), then native-res compatibility mode.
+    const list = [
+      base,
+      { ...base, alt: true },
+      { ...base, tx: true },
+    ];
+    for (const v of o.alternates || []) {
+      if (v.id === o.id) continue;
+      const v4k = is4kVariant(v);
+      list.push({
+        id: v.id, label: v.label || v.channel, ext: v.ext, cat: v.cat, catId: v.catId,
+        subMarket: !!v.subMarket, uhd: !!v.uhd || v4k, dv: !!v.dv, hdr: !!v.hdr, q: v.q || null,
+        // Never auto-downgrade a 4K title to 1080p/HD; keep non-4K versions manual-only in the Version dropdown.
+        manualOnly: primary4k && !v4k,
+      });
+    }
     return list;
   }
   function report(ev, extra = {}, beacon = false) {
@@ -3850,9 +3891,11 @@ const Player = (() => {
     load({ target: offset });
     return true;
   }
-  // Mid-playback: a long freeze or repeated stutters move to the next version/feed of the same title.
+  // Mid-playback: a long freeze or repeated stutters move to the next version/feed of the same title
+  // (never silently downgrading a 4K stream to 1080p/HD).
   function switchSource(why) {
-    const here = cur().id; const nx = attempts.findIndex((a, i) => i > ai && !a.tx && !a.alt && a.id !== here);
+    const here = cur().id;
+    const nx = attempts.findIndex((a, i) => i > ai && !a.tx && !a.alt && a.id !== here && !isBlockedDowngrade(a));
     if (nx < 0) { if (why) toast('This stream is struggling. It may be your connection or the provider'); return false; }
     toast(`${o?.live ? 'Switching backup feed' : 'Playback was stuttering, switched'} to ${cur(nx).label || 'another source'}`); useAttempt(nx); return true;
   }
@@ -3895,7 +3938,10 @@ const Player = (() => {
       sel.blur(); focusPlayer();
       const id = +sel.value;
       const i = attempts.findIndex((a) => a.id === id && !a.tx && !a.alt);
-      if (i >= 0) useAttempt(i);
+      if (i >= 0) {
+        o.manualOverride = !is4kVariant(attempts[i]);
+        useAttempt(i);
+      }
       if (!o.live && !o.catchup) {
         const v = list.find((x) => x.id === id);
         if (o.kind === 'series' && o.sid) {
@@ -3909,15 +3955,20 @@ const Player = (() => {
   function fail() {
     if (!o) return;
     report('fail');
-    if (ai < attempts.length - 1) {
-      const a = cur(ai + 1);
-      toast(a.tx ? 'Switching to compatibility mode…' : a.alt ? 'Trying the backup server…' : `Trying another source${a.label ? `: ${a.label}` : ''}…`);
-      return useAttempt(ai + 1);
+    const ni = attempts.findIndex((a, idx) => idx > ai && !isBlockedDowngrade(a));
+    if (ni >= 0) {
+      const a = cur(ni);
+      toast(a.tx ? (is4kLocked() ? 'Switching to compatibility mode (4K)…' : 'Switching to compatibility mode…') : a.alt ? 'Trying the backup server…' : `Trying another source${a.label ? `: ${a.label}` : ''}…`);
+      return useAttempt(ni);
     }
     spin(false);
-    showMsg(`<h4>This stream won't play right now</h4><p>${o.live ? 'The channel may be offline or the event hasn’t started.' : 'None of the sources responded.'} If another device is using your account, it blocks this one.</p>
-      <div class="btns" style="justify-content:center"><button class="btn btn-primary btn-sm" id="pRetry">Try again</button><button class="btn btn-ghost btn-sm" id="pClose">Close</button></div>`);
+    const lock4k = is4kLocked();
+    const hdIdx = lock4k ? attempts.findIndex((a) => !a.tx && !a.alt && isBlockedDowngrade(a)) : -1;
+    const hdAlt = hdIdx >= 0 ? attempts[hdIdx] : null;
+    showMsg(`<h4>${lock4k ? 'This 4K stream won’t play right now' : 'This stream won\'t play right now'}</h4><p>${o.live ? 'The channel may be offline or the event hasn’t started.' : lock4k ? 'Staying on 4K (auto-downgrade to 1080p is disabled).' : 'None of the sources responded.'} If another device is using your account, it blocks this one.</p>
+      <div class="btns" style="justify-content:center"><button class="btn btn-primary btn-sm" id="pRetry">${lock4k ? 'Try 4K again' : 'Try again'}</button>${hdAlt ? `<button class="btn btn-ghost btn-sm" id="pManualHd">Switch to ${esc(hdAlt.label || '1080p')} manually</button>` : ''}<button class="btn btn-ghost btn-sm" id="pClose">Close</button></div>`);
     $('#pRetry').onclick = () => { ai = 0; load(); };
+    if (hdAlt && $('#pManualHd')) $('#pManualHd').onclick = () => { o.manualOverride = true; showMsg(null); useAttempt(hdIdx); };
     $('#pClose').onclick = () => close();
   }
   function spin(on, label) {
@@ -4591,6 +4642,7 @@ const Player = (() => {
         if (Array.isArray(list) && list.length) {
           const best = list[0];
           o.id = best.id; o.ext = best.ext || o.ext; o.label = best.label; o.cat = best.cat; o.catId = best.catId || ''; o.subMarket = !!best.subMarket;
+          o.uhd = !!best.uhd; o.dv = !!best.dv; o.hdr = !!best.hdr;
           o.alternates = list.slice(1);
           attempts = buildAttempts(); ai = 0;
         }
@@ -4607,9 +4659,10 @@ const Player = (() => {
       const p0 = await api(`/api/probe/${o.kind}/${o.id}?${pq}`).catch(() => null);
       if (!o || o !== opts) return;
       probe = p0;
-      // English-audio safety gate: if a cross-market 4K copy ever lacks English audio, fall back automatically to native EN
+      // English-audio safety gate: if a cross-market 4K copy ever lacks English audio, prefer native-EN 4K first
       if (!o.isAnime && cur().subMarket && probe?.audio?.length > 0 && probe?.hasEnAudio === false) {
-        const nx = attempts.findIndex((a, idx) => idx > ai && !a.tx && !a.alt && !a.subMarket);
+        let nx = attempts.findIndex((a, idx) => idx > ai && !a.tx && !a.alt && !a.subMarket && is4kVariant(a));
+        if (nx < 0) nx = attempts.findIndex((a, idx) => idx > ai && !a.tx && !a.alt && !a.subMarket);
         if (nx >= 0) {
           toast('No English audio on international 4K copy — switching to English version');
           renderSources(); setMediaSession();

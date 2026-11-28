@@ -2005,13 +2005,18 @@ fn source_health_inner(h: &Value, now: i64) -> f64 {
     };
     if decay <= 0.0 { return 0.0; }
     // A single isolated transient failure (e.g. VPN hiccup / 460 slot busy) shouldn't permanently
-    // downgrade a 4K DV copy below 1080p: cap single-blip fail score at 2.5 (penalty -7.5 vs +10+ 4K lead).
+    // downgrade a 4K DV copy below 1080p: cap single-blip fail score at 2.5 (penalty -7.5 vs +15 4K lead).
     let fail_score = if f <= 1.0 && ok == 0.0 && stalls == 0.0 {
         f * 2.5
     } else {
         (f / (f + ok).max(1.0)) * 10.0
     };
-    let raw = fail_score + (stalls / hrs).min(10.0) + (ms / 10_000.0).min(2.0);
+    let mut raw = fail_score + (stalls / hrs).min(10.0) + (ms / 10_000.0).min(1.0);
+    // Proven-working sources (more successes than transient blips, >=2 successful plays) are capped
+    // so occasional provider hiccups or 4K cold-start time never demote a working 4K film below 1080p.
+    if ok >= 2.0 && ok > f {
+        raw = raw.min(2.2);
+    }
     raw * decay
 }
 pub(crate) fn source_health(app: &App, id: i64) -> f64 {
@@ -2030,9 +2035,10 @@ fn quality_score(v: &Value, pref4k: bool, pro: bool, hdr_pref: bool) -> f64 {
     let is_br = v["bluray"].as_bool().unwrap_or(false) || cat.contains("BLURAY") || cat.contains("BLU-RAY") || cat.contains("REMUX");
     let is_sub_mkt = v["subMarket"].as_bool().unwrap_or(false);
     let h = q["h"].as_f64().map(|h| h.max(q["w"].as_f64().unwrap_or(0.0) * 9.0 / 16.0)).unwrap_or(if is_uhd { 2160.0 } else { 1080.0 });
-    // When prefer4k is OFF, prefer 1080p > 4K > 720p > SD (never invert SD/720p above 1080p Blu-Ray!).
+    // When prefer4k is ON, give 4K a decisive +15 pt lead over 1080p so healthy/working 4K streams
+    // never silently lose to 1080p; when OFF, prefer 1080p > 4K > 720p > SD.
     let tier = if pref4k {
-        if h >= 2000.0 { 3.0 } else if h >= 1000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 }
+        if h >= 2000.0 { 3.5 } else if h >= 1000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 }
     } else {
         if h >= 1000.0 && h < 2000.0 { 3.5 } else if h >= 2000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 }
     };
@@ -2435,6 +2441,23 @@ mod quality_tests {
         rank_sources_with(&mut v, false, true, false);
         let ids: Vec<i64> = v.iter().map(|x| x["id"].as_i64().unwrap()).collect();
         assert_eq!(ids, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn proven_4k_never_demoted_below_1080p_by_transient_failures() {
+        let now = now_ms();
+        let h4k = source_health_inner(
+            &json!({ "f": 4, "s": 13, "st": 1, "w": 10177, "ms": 8774, "t": now }),
+            now,
+        );
+        assert!(h4k <= 2.21, "proven working 4K health penalty must stay capped, got {h4k}");
+        let mut v = vec![
+            json!({ "id": 1904847, "uhd": false, "cam": false, "subMarket": false, "cat": "EN - NEW RELEASE", "health": 0.0, "q": { "w": 1920, "h": 1080, "codec": "h264", "ch": 2, "kbps": 2640 } }),
+            json!({ "id": 1904899, "uhd": false, "bluray": true, "cam": false, "subMarket": false, "cat": "TOP MOVIES BLURAY", "health": 0.0, "q": { "w": 1920, "h": 1080, "codec": "hevc", "ch": 6, "kbps": 14000 } }),
+            json!({ "id": 1904708, "uhd": true, "cam": false, "subMarket": true, "cat": "NORDIC FILM 4K 3840P DOLBY AUDIO", "health": h4k, "q": { "w": 3840, "h": 2160, "codec": "hevc", "ch": 6, "kbps": 10650 } }),
+        ];
+        rank_sources_with(&mut v, true, true, false);
+        assert_eq!(v[0]["id"].as_i64(), Some(1904708), "proven 4K must stay #1 ahead of 1080p & Blu-Ray");
     }
 
     #[test]
