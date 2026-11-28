@@ -465,6 +465,7 @@ struct TitleRecord {
     liked: bool,
     disliked: bool,
     has_real_progress: bool,
+    real_progress_secs: f64,
     completed_eps: usize,
     max_progress_secs: f64,
     last_t: i64,
@@ -663,6 +664,7 @@ fn collect_dna_snapshot(app: &App) -> DnaSnapshot {
                 liked: false,
                 disliked: false,
                 has_real_progress: false,
+                real_progress_secs: 0.0,
                 completed_eps: 0,
                 max_progress_secs: 0.0,
                 last_t: 0,
@@ -858,23 +860,13 @@ fn collect_dna_snapshot(app: &App) -> DnaSnapshot {
             );
 
             let finished = dur > 0.0 && pct >= COMPLETE_PCT;
-            if dur > 60.0 {
-                total_secs += pos.min(36_000.0);
-            } else if finished {
-                let rt_mins = records
-                    .get(&mkey)
-                    .map(|r| r.runtime_mins())
-                    .filter(|&rt| rt > 0)
-                    .map(|rt| rt as f64)
-                    .unwrap_or(DEFAULT_MOVIE_MINS);
-                total_secs += rt_mins * 60.0;
-            }
 
             if let Some(rec) = records.get_mut(&mkey) {
                 rec.started = true;
                 rec.last_t = rec.last_t.max(t);
                 if dur > 60.0 {
                     rec.has_real_progress = true;
+                    rec.real_progress_secs = rec.real_progress_secs.max(pos.min(36_000.0));
                     rec.max_progress_secs = rec.max_progress_secs.max(pos);
                 }
                 if finished {
@@ -888,7 +880,8 @@ fn collect_dna_snapshot(app: &App) -> DnaSnapshot {
     }
 
     // 4) History entries (run after progress/watched/ratings so title-only rows merge cleanly!)
-    // Sort history so entries WITH a tmdb id are processed before entries with tmdb: null.
+    // History records when a title was opened/played, NOT completion — never force 5-second clicks
+    // to `completed = true` without explicit `watched` or >=88% playback progress.
     let mut hist_ordered = history_entries;
     hist_ordered.sort_by_key(|h| s(&h["tmdb"]).is_empty());
     for h in &hist_ordered {
@@ -912,24 +905,28 @@ fn collect_dna_snapshot(app: &App) -> DnaSnapshot {
         if let Some(rec) = records.get_mut(&key) {
             rec.started = true;
             rec.last_t = rec.last_t.max(t);
-            if mt == "movie" {
-                rec.completed = true;
-            }
-            if let Some(x) = &rec.tmdb {
-                watched_keys.insert(format!("{mt}:{x}"));
+            if rec.completed {
+                if let Some(x) = &rec.tmdb {
+                    watched_keys.insert(format!("{mt}:{x}"));
+                }
             }
         }
     }
 
-    // 5) Add estimated duration for watched/history titles that did not have real playback progress.
+    // 5) Sum movie runtime ONCE per deduplicated movie record (real progress or estimated runtime
+    //    for watched / `continue_done` movies with dur <= 60 — eliminates double-counting!).
     for rec in records.values() {
-        if rec.mt == "movie" && rec.completed && !rec.has_real_progress {
-            let mins = if rec.runtime_mins() > 0 {
-                rec.runtime_mins() as f64
-            } else {
-                DEFAULT_MOVIE_MINS
-            };
-            total_secs += mins * 60.0;
+        if rec.mt == "movie" {
+            if rec.has_real_progress {
+                total_secs += rec.real_progress_secs;
+            } else if rec.completed {
+                let mins = if rec.runtime_mins() > 0 {
+                    rec.runtime_mins() as f64
+                } else {
+                    DEFAULT_MOVIE_MINS
+                };
+                total_secs += mins * 60.0;
+            }
         }
     }
     for tv_key in watched_tv_keys {
@@ -1167,16 +1164,26 @@ pub async fn profile(app: Arc<App>) -> Value {
         .map(|(code, count)| json!({ "code": code, "count": count }))
         .collect();
 
-    // Fetch TMDB credits for up to MAX_CREDIT_FETCH top watched/liked titles (movies first,
-    // 30-day persistent cache, bounded concurrency = 5).
-    credit_targets.sort_by(|a, b| {
-        (b.mt == "movie")
-            .cmp(&(a.mt == "movie"))
-            .then(b.liked.cmp(&a.liked))
+    // Fetch TMDB credits for up to MAX_CREDIT_FETCH top watched/liked titles, balancing Movies + TV
+    // (reserving up to 4 slots for TV shows when present so watching 12 movies never starves TV
+    // showrunners/actors; 30-day persistent cache, bounded concurrency = 5).
+    let (mut movie_targets, mut tv_targets): (Vec<CreditTarget>, Vec<CreditTarget>) =
+        credit_targets.into_iter().partition(|c| c.mt == "movie");
+    let cmp_target = |a: &CreditTarget, b: &CreditTarget| {
+        b.liked
+            .cmp(&a.liked)
             .then(b.weight.total_cmp(&a.weight))
             .then(b.last_t.cmp(&a.last_t))
-    });
-    credit_targets.truncate(MAX_CREDIT_FETCH);
+    };
+    movie_targets.sort_by(cmp_target);
+    tv_targets.sort_by(cmp_target);
+
+    let tv_reserved = tv_targets.len().min(4);
+    let movie_take = movie_targets.len().min(MAX_CREDIT_FETCH - tv_reserved);
+    let tv_take = tv_targets.len().min(MAX_CREDIT_FETCH - movie_take);
+    let mut credit_targets: Vec<CreditTarget> = Vec::with_capacity(MAX_CREDIT_FETCH);
+    credit_targets.extend(movie_targets.into_iter().take(movie_take));
+    credit_targets.extend(tv_targets.into_iter().take(tv_take));
 
     let mut dir_map: HashMap<i64, PersonAgg> = HashMap::new();
     let mut act_map: HashMap<i64, PersonAgg> = HashMap::new();
@@ -2682,7 +2689,7 @@ mod tests {
     fn standup_and_concert_category_and_meta_detection() {
         let su_kws: HashSet<i64> = [TMDB_STANDUP_KW].into_iter().collect();
 
-        // provider Stand-Up categories (movies + series)
+        // Provider Stand-Up categories (movies + series)
         let chappelle = mk_item("m", "Dave Chappelle: The Closer", "");
         assert!(is_standup_match(
             &chappelle,

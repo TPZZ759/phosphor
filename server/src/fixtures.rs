@@ -4,8 +4,9 @@ use crate::sports::Event;
 use crate::util::{norm, now_ms, s};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub struct League { pub id: &'static str, pub path: &'static str, pub name: &'static str, pub sport: Option<&'static str>, pub solo: bool }
 pub const LEAGUES: &[League] = &[
@@ -28,6 +29,12 @@ pub const LEAGUES: &[League] = &[
     League { id: "f1", path: "racing/f1", name: "F1", sport: None, solo: true },
 ];
 const BASE: &str = "https://site.api.espn.com/apis/site/v2/sports/";
+const MAX_ESPN_CONCURRENT: usize = 10;
+
+static ESPN_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+fn espn_sem() -> Arc<Semaphore> {
+    ESPN_SEM.get_or_init(|| Arc::new(Semaphore::new(MAX_ESPN_CONCURRENT))).clone()
+}
 
 #[derive(Default)]
 pub struct Fixtures { cache: Mutex<HashMap<String, (i64, Arc<Vec<Value>>)>>, teams: Mutex<HashMap<String, (i64, Arc<Vec<Value>>)>> }
@@ -36,23 +43,36 @@ fn et_date(ts: i64) -> String { chrono::DateTime::from_timestamp_millis(ts).unwr
 
 fn normalize(lg: &'static League, e: &Value) -> Option<Value> {
     let comp = e["competitions"].get(0)?; let st = &e["status"]["type"];
-    let team = |c: &Value| json!({ "id": c["team"]["id"].as_str().or(c["athlete"]["id"].as_str()).or(c["id"].as_str()).unwrap_or(""),
+    let team = |c: &Value| json!({
+        "id": c["team"]["id"].as_str().or(c["athlete"]["id"].as_str()).or(c["id"].as_str()).unwrap_or(""),
         "name": c["team"]["displayName"].as_str().or(c["athlete"]["displayName"].as_str()).unwrap_or(""),
-        "short": c["team"]["shortDisplayName"].as_str().or(c["athlete"]["shortName"].as_str()).unwrap_or(""), "abbr": s(&c["team"]["abbreviation"]),
-        "location": s(&c["team"]["location"]), "nick": s(&c["team"]["name"]), "logo": c["team"]["logo"].as_str().or(c["athlete"]["flag"]["href"].as_str()).unwrap_or(""),
-        "score": c["score"].as_str().unwrap_or(""), "winner": c["winner"].as_bool().unwrap_or(false) });
+        "short": c["team"]["shortDisplayName"].as_str().or(c["athlete"]["shortName"].as_str()).unwrap_or(""),
+        "abbr": s(&c["team"]["abbreviation"]),
+        "location": s(&c["team"]["location"]), "nick": s(&c["team"]["name"]),
+        "logo": c["team"]["logo"].as_str().or(c["athlete"]["flag"]["href"].as_str()).unwrap_or(""),
+        "score": c["score"].as_str().unwrap_or(""), "winner": c["winner"].as_bool().unwrap_or(false)
+    });
     let comps = comp["competitors"].as_array()?;
     let home = comps.iter().find(|c| c["homeAway"] == "home").map(team).unwrap_or(json!({}));
     let away = comps.iter().find(|c| c["homeAway"] == "away").map(team).unwrap_or(json!({}));
     let pick = |t: &Value| { let a = s(&t["short"]); if a.is_empty() { s(&t["name"]) } else { a } };
     let ds = s(&e["date"]);
-    let start = chrono::NaiveDateTime::parse_from_str(&ds, "%Y-%m-%dT%H:%MZ").or_else(|_| chrono::NaiveDateTime::parse_from_str(&ds, "%Y-%m-%dT%H:%M:%SZ")).map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-    Some(json!({ "id": format!("{}:{}", lg.id, s(&e["id"])), "league": lg.id, "leagueName": lg.name, "sport": lg.sport.unwrap_or(lg.name), "solo": lg.solo,
-        "title": if lg.solo { s(&e["name"]) } else { format!("{} vs {}", pick(&away), pick(&home)) }, "name": e["name"], "start": start,
-        "state": st["state"], "completed": st["completed"].as_bool().unwrap_or(false), "detail": st["shortDetail"].as_str().or(st["detail"].as_str()).unwrap_or(""),
-        "home": if lg.solo { Value::Null } else { home }, "away": if lg.solo { Value::Null } else { away },
+    let start = chrono::NaiveDateTime::parse_from_str(&ds, "%Y-%m-%dT%H:%MZ")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&ds, "%Y-%m-%dT%H:%M:%SZ"))
+        .map(|d| d.and_utc().timestamp_millis())
+        .unwrap_or(0);
+    Some(json!({
+        "id": format!("{}:{}", lg.id, s(&e["id"])), "league": lg.id, "leagueName": lg.name,
+        "sport": lg.sport.unwrap_or(lg.name), "solo": lg.solo,
+        "title": if lg.solo { s(&e["name"]) } else { format!("{} vs {}", pick(&away), pick(&home)) },
+        "name": e["name"], "start": start,
+        "state": st["state"], "completed": st["completed"].as_bool().unwrap_or(false),
+        "detail": st["shortDetail"].as_str().or(st["detail"].as_str()).unwrap_or(""),
+        "home": if lg.solo { Value::Null } else { home },
+        "away": if lg.solo { Value::Null } else { away },
         "broadcasts": comp["broadcasts"].as_array().into_iter().flatten().flat_map(|b| b["names"].as_array().cloned().unwrap_or_default()).collect::<Vec<_>>(),
-        "venue": s(&comp["venue"]["fullName"]) }))
+        "venue": s(&comp["venue"]["fullName"])
+    }))
 }
 
 async fn fetch_day(app: &Arc<App>, lg: &'static League, date: &str, fresh: bool) -> Arc<Vec<Value>> {
@@ -60,10 +80,20 @@ async fn fetch_day(app: &Arc<App>, lg: &'static League, date: &str, fresh: bool)
     let hit = app.fixtures.cache.lock().unwrap().get(&key).cloned();
     let ttl = if fresh { 60_000 } else { 30 * 60_000 };
     if let Some((t, v)) = &hit { if now_ms() - t < ttl { return v.clone(); } }
+    let sem = espn_sem();
+    let Ok(_permit) = sem.acquire_owned().await else { return hit.map(|h| h.1).unwrap_or_default(); };
+    // Re-check cache after acquiring permit in case another task just populated it
+    if let Some((t, v)) = app.fixtures.cache.lock().unwrap().get(&key).cloned() {
+        if now_ms() - t < ttl { return v; }
+    }
     let url = format!("{BASE}{}/scoreboard?dates={date}&limit=200", lg.path);
     match app.http.get(&url).timeout(Duration::from_secs(12)).send().await.ok().and_then(|r| r.status().is_success().then_some(r)) {
         Some(r) => match r.json::<Value>().await {
-            Ok(j) => { let v = Arc::new(j["events"].as_array().into_iter().flatten().filter_map(|e| normalize(lg, e)).collect::<Vec<_>>()); app.fixtures.cache.lock().unwrap().insert(key, (now_ms(), v.clone())); v }
+            Ok(j) => {
+                let v = Arc::new(j["events"].as_array().into_iter().flatten().filter_map(|e| normalize(lg, e)).collect::<Vec<_>>());
+                app.fixtures.cache.lock().unwrap().insert(key, (now_ms(), v.clone()));
+                v
+            }
             Err(_) => hit.map(|h| h.1).unwrap_or_default(),
         },
         None => hit.map(|h| h.1).unwrap_or_default(),
@@ -74,7 +104,11 @@ pub async fn all(app: &Arc<App>) -> Vec<Value> {
     let now = now_ms(); let today = et_date(now); let yday = et_date(now - 86_400_000);
     let mut jobs: Vec<(usize, String)> = vec![];
     for li in 0..LEAGUES.len() { for k in -1..=6i64 { jobs.push((li, et_date(now + k * 86_400_000))); } }
-    let futs: Vec<_> = jobs.into_iter().map(|(li, d)| { let app = app.clone(); let fresh = d == today || d == yday; tokio::spawn(async move { fetch_day(&app, &LEAGUES[li], &d, fresh).await }) }).collect();
+    let futs: Vec<_> = jobs.into_iter().map(|(li, d)| {
+        let app = app.clone();
+        let fresh = d == today || d == yday;
+        tokio::spawn(async move { fetch_day(&app, &LEAGUES[li], &d, fresh).await })
+    }).collect();
     let res: Vec<Arc<Vec<Value>>> = futures_util::future::join_all(futs).await.into_iter().map(|r| r.unwrap_or_default()).collect();
     let mut by_id: HashMap<String, Value> = HashMap::new();
     let state_rank = |s: &str| match s { "in" => 2, "post" => 1, _ => 0 };
@@ -87,13 +121,16 @@ pub async fn all(app: &Arc<App>) -> Vec<Value> {
     out.sort_by_key(|f| f["start"].as_i64().unwrap_or(0));
     out
 }
-use futures_util::StreamExt;
 
 fn team_tokens(t: &Value) -> Vec<String> {
     let stop: HashSet<&str> = ["fc", "cf", "sc", "afc", "the", "city", "united", "state", "university", "de", "club"].into_iter().collect();
     let mut out: Vec<String> = vec![];
-    for k in ["short", "name", "location", "nick"] { let n = norm(&s(&t[k])); if n.len() >= 3 && !stop.contains(n.as_str()) && !out.contains(&n) { out.push(n); } }
-    let a = s(&t["abbr"]); if a.len() >= 3 { let n = norm(&a); if !out.contains(&n) { out.push(n); } }
+    for k in ["short", "name", "location", "nick"] {
+        let n = norm(&s(&t[k]));
+        if n.len() >= 3 && !stop.contains(n.as_str()) && !out.contains(&n) { out.push(n); }
+    }
+    let a = s(&t["abbr"]);
+    if a.len() >= 3 { let n = norm(&a); if !out.contains(&n) { out.push(n); } }
     out
 }
 fn has_tok(hay: &str, toks: &[String]) -> bool { let h = format!(" {hay} "); toks.iter().any(|t| h.contains(&format!(" {t} "))) }
@@ -164,22 +201,52 @@ fn feeds(app: &App, f: &Value, evs: &[Event]) -> Vec<Value> {
     list.into_iter().take(8).map(|x| json!({ "id": x.0, "channel": x.1, "en": x.2, "kind": if x.3 { "network" } else { "event" } })).collect()
 }
 
+pub fn is_fav_fixture(f: &Value, favs: &HashSet<String>, fav_teams: &[Value]) -> bool {
+    let lg = s(&f["league"]);
+    if f["solo"].as_bool().unwrap_or(false) {
+        if favs.contains(&format!("{lg}:all")) || favs.contains(&format!("{lg}:*")) || favs.contains(&format!("{lg}:{lg}")) {
+            return true;
+        }
+        let hay = norm(&format!("{} {}", s(&f["title"]), s(&f["name"])));
+        return fav_teams.iter().any(|t| {
+            if s(&t["league"]) != lg { return false; }
+            let tid = s(&t["id"]).to_lowercase();
+            if tid.is_empty() || tid == "all" || tid == "*" || tid == lg { return true; }
+            let name = norm(&s(&t["name"]));
+            let short = norm(&s(&t["short"]));
+            (!name.is_empty() && hay.contains(&name)) || (!short.is_empty() && hay.contains(&short))
+        });
+    }
+    !f["home"].is_null() && (favs.contains(&format!("{lg}:{}", s(&f["home"]["id"]))) || favs.contains(&format!("{lg}:{}", s(&f["away"]["id"]))))
+}
+
 pub async fn with_feeds(app: &Arc<App>) -> Vec<Value> {
     let list = all(app).await;
     let evs = crate::sports::events(app, true);
-    let favs: HashSet<String> = app.state.read(|st| st["teams"].as_array().into_iter().flatten().map(|t| format!("{}:{}", s(&t["league"]), s(&t["id"]))).collect());
+    let fav_teams: Vec<Value> = app.state.read(|st| st["teams"].as_array().cloned().unwrap_or_default());
+    let favs: HashSet<String> = fav_teams.iter().map(|t| format!("{}:{}", s(&t["league"]), s(&t["id"]))).collect();
     list.into_iter().map(|mut f| {
         f["feeds"] = Value::Array(feeds(app, &f, &evs));
-        let lg = s(&f["league"]);
-        f["fav"] = json!(!f["home"].is_null() && (favs.contains(&format!("{lg}:{}", s(&f["home"]["id"]))) || favs.contains(&format!("{lg}:{}", s(&f["away"]["id"])))));
+        f["fav"] = json!(is_fav_fixture(&f, &favs, &fav_teams));
         f
     }).collect()
 }
 
 pub async fn teams(app: &Arc<App>, league: &str) -> Arc<Vec<Value>> {
-    let Some(lg) = LEAGUES.iter().find(|l| l.id == league && !l.solo) else { return Arc::new(vec![]) };
+    let Some(lg) = LEAGUES.iter().find(|l| l.id == league) else { return Arc::new(vec![]) };
+    if lg.solo {
+        return Arc::new(vec![json!({
+            "league": lg.id,
+            "id": "all",
+            "name": format!("All {} Events", lg.name),
+            "short": lg.name,
+            "logo": ""
+        })]);
+    }
     let hit = app.fixtures.teams.lock().unwrap().get(league).cloned();
     if let Some((t, v)) = &hit { if now_ms() - t < 86_400_000 { return v.clone(); } }
+    let sem = espn_sem();
+    let Ok(_permit) = sem.acquire_owned().await else { return hit.map(|h| h.1).unwrap_or_default(); };
     let url = format!("{BASE}{}/teams?limit=500", lg.path);
     let Ok(j) = (async { app.http.get(&url).timeout(Duration::from_secs(12)).send().await?.json::<Value>().await }).await else { return hit.map(|h| h.1).unwrap_or_default() };
     let mut v: Vec<Value> = j["sports"][0]["leagues"][0]["teams"].as_array().into_iter().flatten().map(|x| &x["team"])
@@ -188,11 +255,13 @@ pub async fn teams(app: &Arc<App>, league: &str) -> Arc<Vec<Value>> {
     let v = Arc::new(v); app.fixtures.teams.lock().unwrap().insert(league.into(), (now_ms(), v.clone())); v
 }
 
-/// Kick-off alerts for favourite teams (10 minutes before).
+/// Kick-off alerts for favourite teams AND solo sports (UFC / F1), 10 minutes before start.
 pub async fn alerts(app: &Arc<App>) {
     let has = app.state.read(|st| st["teams"].as_array().map_or(false, |a| !a.is_empty()));
     if !has { return; }
-    let list = with_feeds(app).await; let now = now_ms();
+    let list = with_feeds(app).await;
+    let now = now_ms();
+    let sports_url = format!("http://localhost:{}/#/sports", app.port());
     for f in list {
         if !f["fav"].as_bool().unwrap_or(false) || f["state"] != "pre" { continue; }
         let id = s(&f["id"]);
@@ -206,8 +275,14 @@ pub async fn alerts(app: &Arc<App>) {
                 Some(fid) => json!({ "k": "l", "id": fid, "title": s(&f["title"]), "feeds": f["feeds"], "label": "Watch now" }),
                 None => json!({ "route": "#/sports", "label": "Sports" }),
             };
-            crate::notify_all(app, "kickoff", &format!("{} starts {}", s(&f["title"]), if mins > 1.0 { format!("in {} min", mins.round()) } else { "now".into() }),
-                &format!("{} · {feed_name}", s(&f["leagueName"])), "http://localhost:7878/#/sports", action);
+            crate::notify_all(
+                app,
+                "kickoff",
+                &format!("{} starts {}", s(&f["title"]), if mins > 1.0 { format!("in {} min", mins.round()) } else { "now".into() }),
+                &format!("{} · {feed_name}", s(&f["leagueName"])),
+                &sports_url,
+                action,
+            );
         }
     }
     app.state.with(|st| if let Some(m) = st["notified"].as_object_mut() { m.retain(|_, t| now - t.as_i64().unwrap_or(0) < 3 * 86_400_000); });

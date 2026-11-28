@@ -12,6 +12,11 @@ use std::sync::Arc;
 
 fn year() -> i32 { chrono::Datelike::year(&chrono::Utc::now()) }
 
+fn app_port(app: &App) -> u16 {
+    std::env::var("TV_PORT").ok().and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| app.cfg.get("port").as_u64().unwrap_or(7878) as u16)
+}
+
 // ---------- content hiding
 pub fn hide_prefs(app: &App) -> Vec<String> { app.state.read(|st| st["prefs"]["hide"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default()) }
 pub fn hidden_by(hide: &[String], g: &[i64], l: &str, cat: &str, kw: &[i64], standup: &HashSet<i64>) -> bool {
@@ -26,7 +31,14 @@ pub fn hidden_by(hide: &[String], g: &[i64], l: &str, cat: &str, kw: &[i64], sta
         _ => false,
     })
 }
-fn standup_kw(app: &App) -> HashSet<i64> { app.kw_cache.lock().unwrap().iter().filter(|(k, _)| k.starts_with("stand")).filter_map(|(_, v)| *v).collect() }
+pub(crate) fn standup_kw(app: &App) -> HashSet<i64> {
+    let mut set: HashSet<i64> = app.kw_cache.lock().unwrap().iter()
+        .filter(|(k, _)| k.starts_with("stand"))
+        .filter_map(|(_, v)| *v)
+        .collect();
+    set.insert(9716); // TMDB "stand-up comedy"
+    set
+}
 pub fn hide_cams_enabled(app: &App) -> bool { app.state.read(|st| st["prefs"]["hideCams"].as_bool().unwrap_or(true)) }
 pub fn hidden_item(app: &App, it: &Item) -> bool {
     if hide_cams_enabled(app) && crate::showcase::is_cam_only(app, it) { return true; }
@@ -43,7 +55,7 @@ pub fn watched_set(app: &App) -> HashSet<String> {
         for h in st["history"].as_array().into_iter().flatten() { let id = s(&h["tmdb"]); if !id.is_empty() { set.insert(format!("{}:{id}", if h["kind"] == "s" { "tv" } else { "movie" })); } }
         for p in st["progress"].as_object().into_iter().flat_map(|m| m.values()) {
             if p["item"]["k"] == "m" { let d = p["dur"].as_f64().unwrap_or(0.0); if d > 0.0 && p["pos"].as_f64().unwrap_or(0.0) / d > 0.9 {
-                if let Some(t) = p["item"]["id"].as_i64().and_then(|id| cat.movie_raw.get(&id)).and_then(|it| it.tmdb.clone()) { set.insert(format!("movie:{t}")); } } }
+                if let Some(t) = p["item"]["id"].as_i64().and_then(|id| cat.movie(id)).and_then(|it| it.tmdb.clone()) { set.insert(format!("movie:{t}")); } } }
         }
         set
     })
@@ -113,6 +125,12 @@ fn contains_ci(hay: &str, needle_lc: &str, whole_word: bool) -> bool {
     false
 }
 
+fn matches_folded(hay: &str, term_norm: &str) -> bool {
+    if hay.is_empty() || term_norm.is_empty() { return false; }
+    if contains_ci(hay, term_norm, false) { return true; }
+    !hay.is_ascii() && norm(hay).contains(term_norm)
+}
+
 fn item_matches_text(cat: &Catalog, it: &Item, m: Option<&Meta>, terms: &[String], word_short: bool) -> bool {
     let is_tv = it.k == "s";
     let mut plats_opt: Option<Vec<&'static str>> = None;
@@ -121,6 +139,9 @@ fn item_matches_text(cat: &Catalog, it: &Item, m: Option<&Meta>, terms: &[String
         let ws_lbl = word_short && w.len() <= 2;
         if contains_ci(&it.title, w, ws) { continue; }
         if let Some(m) = m {
+            if !m.ot.is_empty() && matches_folded(&m.ot, w) { continue; }
+            if m.dir.iter().any(|d| matches_folded(d, w)) { continue; }
+            if m.cast.iter().any(|c| matches_folded(c, w)) { continue; }
             if contains_ci(&m.ov, w, ws) { continue; }
             if m.g.iter().filter_map(|g| crate::meta::genre_name(is_tv, *g)).any(|gn| contains_ci(gn, w, ws_lbl)) { continue; }
             if !word_short && m.oc.iter().any(|co| co.eq_ignore_ascii_case(w)) { continue; }
@@ -145,7 +166,7 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
 
     let genres: Vec<i64> = get("g").split(',').filter_map(|x| x.trim().parse().ok()).collect();
     let gmode = get("gmode").trim().to_lowercase();
-    let terms: Vec<String> = get("q").trim().to_lowercase().split_whitespace().map(String::from).collect();
+    let terms: Vec<String> = norm(&get("q")).split_whitespace().map(String::from).collect();
     let num = |k: &str| get(k).parse::<f64>().unwrap_or(0.0);
     let y1 = num("y1") as i32;
     let y2 = { let v = num("y2") as i32; if v == 0 { 9999 } else { v } };
@@ -161,6 +182,8 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
     let kws: Vec<i64> = get("kw").split(',').filter_map(|x| x.trim().parse().ok()).collect();
     let langs: Vec<&str> = if lang == "nordic" { vec!["sv", "da", "no", "nb", "fi", "is"] } else { vec![lang.as_str()] };
     let seen = if get("unwatched") == "1" { Some(watched_set(app)) } else { None };
+    let hide_cams = hide_cams_enabled(app);
+    let disliked = crate::rec::hidden_ratings(app);
 
     let mut hide = hide_prefs(app);
     if genres.contains(&99) { hide.retain(|h| h != "docs"); }
@@ -181,10 +204,13 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
     };
     for pool in pools {
         for it in pool.iter().filter(|x| x.tmdb.is_some() && x.en) {
+            if hide_cams && crate::showcase::is_cam_only(app, it) { continue; }
             let is_tv = it.k == "s";
             let mt = if is_tv { "tv" } else { "movie" };
             let tmdb_id = it.tmdb.as_ref().unwrap();
-            let Some(m) = db.get(&format!("{mt}:{tmdb_id}")) else { continue };
+            let tkey = format!("{mt}:{tmdb_id}");
+            if disliked.contains(&tkey) { continue; }
+            let Some(m) = db.get(&tkey) else { continue };
             if m.missing { continue; }
             let yr = if m.year() > 0 { m.year() } else { it.year.unwrap_or(0) };
             if y1 > 0 && yr < y1 { continue; }
@@ -221,9 +247,10 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
                     _ => {}
                 }
             }
-            if uhd_only && !(it.uhd || it.variants.iter().any(|v| v.uhd)) { continue; }
+            let has_uhd = (!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd);
+            if uhd_only && !has_uhd { continue; }
             if !kws.is_empty() && !kws.iter().any(|k| m.kw.contains(k)) { continue; }
-            if let Some(seen) = &seen { if seen.contains(&format!("{mt}:{tmdb_id}")) { continue; } }
+            if let Some(seen) = &seen { if seen.contains(&tkey) { continue; } }
             if !hide.is_empty() && hidden_by(&hide, &m.g, &m.l, &cat.cat_name(if is_tv { "series" } else { "movie" }, &it.cat), &m.kw, &su) { continue; }
             if !terms.is_empty() && !item_matches_text(&cat, it, Some(m), &terms, false) { continue; }
             list.push((it, m));
@@ -237,7 +264,7 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
     let (mut mv_count, mut tv_count, mut uhd_count) = (0usize, 0usize, 0usize);
     for (it, m) in &list {
         if it.k == "s" { tv_count += 1; } else { mv_count += 1; }
-        if it.uhd || it.variants.iter().any(|v| v.uhd) { uhd_count += 1; }
+        if (!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd) { uhd_count += 1; }
         for &g in &m.g { *g_counts.entry(g).or_default() += 1; }
         for p in cat.item_platforms(it) { *p_counts.entry(p).or_default() += 1; }
         for co in &m.oc { if !co.is_empty() { *c_counts.entry(co.as_str()).or_default() += 1; } }
@@ -304,11 +331,17 @@ fn seeded_shuffle<T>(v: &mut Vec<T>, mut seed: u64) {
 fn rank(app: &App, tv: bool, filter: impl Fn(&Meta) -> bool, score: impl Fn(&Meta) -> f64, n: usize, rotate: bool) -> Vec<Value> {
     let mt = if tv { "tv" } else { "movie" };
     let cat = app.catalog(); let seen = watched_set(app); let hide = hide_prefs(app); let su = standup_kw(app);
+    let hide_cams = hide_cams_enabled(app);
+    let disliked = crate::rec::hidden_ratings(app);
     let db = app.meta.read().unwrap();
     let pool = if tv { &cat.series } else { &cat.movies };
     let mut list: Vec<(&Item, f64)> = pool.iter().filter(|x| x.en && x.tmdb.is_some()).filter_map(|it| {
-        let t = it.tmdb.as_ref().unwrap(); let m = db.get(&format!("{mt}:{t}"))?;
-        if m.missing || seen.contains(&format!("{mt}:{t}")) || !filter(m) { return None; }
+        if hide_cams && crate::showcase::is_cam_only(app, it) { return None; }
+        let t = it.tmdb.as_ref().unwrap();
+        let tkey = format!("{mt}:{t}");
+        if disliked.contains(&tkey) || seen.contains(&tkey) { return None; }
+        let m = db.get(&tkey)?;
+        if m.missing || !filter(m) { return None; }
         if !hide.is_empty() && hidden_by(&hide, &m.g, &m.l, &cat.cat_name(if tv { "series" } else { "movie" }, &it.cat), &m.kw, &su) { return None; }
         Some((it, score(m)))
     }).collect();
@@ -453,12 +486,73 @@ pub async fn missing(app: &Arc<App>, q: &str) -> Vec<Value> {
     }).take(8).map(|x| { let mt = s(&x["media_type"]); external(&mt, x, is_wanted(app, &mt, &x["id"].to_string())) }).collect()
 }
 
+/// Parse decade phrases accurately:
+/// - `1920s` -> `(1920, 1929)`
+/// - `2020s` / `20s` / `the 20s` / `'20s` -> `(2020, 2029)`
+/// - `00s` -> `(2000, 2009)`, `10s` -> `(2010, 2019)`
+/// - `30s`..`90s` -> `(1930..1990)`
+fn parse_decade(q: &str) -> Option<(i32, i32)> {
+    if let Some(c) = crate::re!(r"\b(?:the\s+)?((?:19|20)\d0)'?s\b").captures(q) {
+        let d: i32 = c[1].parse().ok()?;
+        return Some((d, d + 9));
+    }
+    if let Some(c) = crate::re!(r"\b(?:the\s+)?'?([0-9]0)'?s\b").captures(q) {
+        let two: i32 = c[1].parse().ok()?;
+        let d = if two <= 20 { 2000 + two } else { 1900 + two };
+        return Some((d, d + 9));
+    }
+    None
+}
+
+/// Interleave two lists (movies + series) so mixed results alternate evenly instead of burying series at index 30+.
+fn interleave_items(a: Vec<Value>, b: Vec<Value>, limit: usize) -> Vec<Value> {
+    let mut out = Vec::with_capacity((a.len() + b.len()).min(limit));
+    let mut ia = a.into_iter();
+    let mut ib = b.into_iter();
+    loop {
+        if out.len() >= limit { break; }
+        let xa = ia.next();
+        let xb = ib.next();
+        if xa.is_none() && xb.is_none() { break; }
+        if let Some(x) = xa { out.push(x); if out.len() >= limit { break; } }
+        if let Some(x) = xb { out.push(x); }
+    }
+    out
+}
+
+/// True when the query contains unexplained title words outside known NL filter/connector tokens
+/// (e.g. `"War of the Worlds"`, `"Space Jam"`, `"Doc Martin"`, `"Adventure Time"`).
+fn has_leftover_title_words(q: &str) -> bool {
+    let stripped = crate::re!(r"\b(?:the|a|an|of|in|on|for|from|to|with|and|or|at|by|about|me|show|find|some|good|great|best|top|acclaimed|highly|rated|new|recent|latest|classic|old|short|quick|movies?|films?|shows?|series|tv|docuseries|documentar(?:y|ies)|docu\w*|docs?|4k|uhd|ultra|hd|mini|limited|netflix|hbo|max|apple|disney|plus|amazon|prime|video|discovery|paramount|peacock|showtime|crunchyroll|action|comed(?:y|ies)|funny|hilarious|laugh|horror|scary|terrifying|creepy|sci|fi|science|fiction|space|futuristic|thrillers?|suspense|romance|romantic|love|stor(?:y|ies)|dramas?|crime|true|gangsters?|heists?|mafia|animated|animation|cartoons?|family|kids|fantasy|magic|war|westerns?|cowboys?|myster(?:y|ies)|whodunn?it|detective|musicals?|history|historical|period|adventure|wildlife|nature|sports?|music|bio\w*|portrait|profile|food|cooking|culinary|society|culture|politics|korean|japanese|french|spanish|indian|bollywood|hindi|german|italian|scandi\w*|nordic|swedish|danish|norwegian|chinese|british|uk|english|australian|aussie|american|canadian|irish|after|since|before|twist|mind|bending|dark|gritty|feel|uplifting|wholesome|edge|tense|gripping|epic|(?:19|20)?\d0'?s|(?:19|20)\d\d)\b")
+        .replace_all(q, " ");
+    stripped.split(|c: char| !c.is_alphanumeric()).any(|w| w.len() >= 2)
+}
+
+fn exact_title_cards(app: &App, cat: &Catalog, q0: &str) -> Vec<Value> {
+    let qn = norm(q0);
+    if qn.is_empty() { return vec![]; }
+    let mut hits: Vec<(&Item, f64)> = vec![];
+    let db = app.meta.read().unwrap();
+    for it in cat.movies.iter().chain(cat.series.iter()).filter(|x| x.en) {
+        let tn = norm(&it.title);
+        let exact = tn == qn || (qn.contains(' ') && tn.starts_with(&format!("{qn} ")));
+        if !exact { continue; }
+        let pop = db_meta(&db, it).map(|m| m.p).unwrap_or(it.rating);
+        let sc = (if tn == qn { 100.0 } else { 40.0 }) + pop;
+        hits.push((it, sc));
+    }
+    drop(db);
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    hits.into_iter().take(6).map(|(it, _)| app.card_meta(it)).collect()
+}
+
 // Plain-English search.
 pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
     let q = q0.to_lowercase();
     let is_doc_word = crate::re!(r"\b(documentar(y|ies)|docu\w*|docs?)\b").is_match(&q);
     let mut kind = if crate::re!(r"\b(shows?|series|tv|docuseries)\b").is_match(&q) { Some("tv") } else if crate::re!(r"\b(movies?|films?)\b").is_match(&q) { Some("movie") } else { None };
     let (mut gm, mut gt, mut labels): (Vec<i64>, Vec<i64>, Vec<String>) = (vec![], vec![], vec![]);
+    let mut chips: Vec<Value> = vec![];
     let mut f: HashMap<String, String> = HashMap::new();
 
     // Platforms
@@ -481,6 +575,7 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
         if !f.contains_key("platform") && re.is_match(&q) {
             f.insert("platform".into(), slug.into());
             labels.push(disp.into());
+            chips.push(json!({ "key": "platform", "value": slug, "label": disp }));
             if strong { strong_platform = true; }
         }
     }
@@ -490,12 +585,14 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
     if crate::re!(r"\b(4k|uhd|ultra\s*hd)\b").is_match(&q) {
         f.insert("uhd".into(), "1".into());
         labels.push("4K".into());
+        chips.push(json!({ "key": "uhd", "value": "1", "label": "4K" }));
         is_uhd = true;
     }
     let mut is_mini = false;
     if crate::re!(r"\b(mini[- ]?series|limited\s+series)\b").is_match(&q) {
         f.insert("status".into(), "miniseries".into());
         labels.push("Miniseries".into());
+        chips.push(json!({ "key": "status", "value": "miniseries", "label": "Miniseries" }));
         is_mini = true;
         if kind.is_none() { kind = Some("tv"); }
     }
@@ -540,6 +637,9 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
         doc_topic = Some("society");
         labels.push("Society Docs".into());
     }
+    if let Some(topic) = doc_topic {
+        chips.push(json!({ "key": "docTopic", "value": topic, "label": labels.last().cloned().unwrap_or_default() }));
+    }
 
     let nl_genres: &[(&regex::Regex, &[i64], &[i64])] = &[
         (crate::re!(r"\b(action)\b"), &[28], &[10759]), (crate::re!(r"\b(comed(y|ies)|funny|hilarious|laugh)\b"), &[35], &[35]), (crate::re!(r"\b(horror|scary|terrifying|creepy)\b"), &[27], &[9648]),
@@ -552,24 +652,40 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
     let nl_lang: &[(&regex::Regex, &str)] = &[(crate::re!(r"\bkorean\b"), "ko"), (crate::re!(r"\bjapanese\b"), "ja"), (crate::re!(r"\bfrench\b"), "fr"), (crate::re!(r"\bspanish\b"), "es"), (crate::re!(r"\b(indian|bollywood|hindi)\b"), "hi"), (crate::re!(r"\bgerman\b"), "de"), (crate::re!(r"\bitalian\b"), "it"), (crate::re!(r"\b(scandi\w*|nordic|swedish|danish|norwegian)\b"), "nordic"), (crate::re!(r"\bchinese\b"), "zh")];
     let nl_country: &[(&regex::Regex, &str)] = &[(crate::re!(r"\b(british|uk|english)\b"), "GB"), (crate::re!(r"\b(australian|aussie)\b"), "AU"), (crate::re!(r"\bamerican\b"), "US"), (crate::re!(r"\bcanadian\b"), "CA"), (crate::re!(r"\birish\b"), "IE")];
     if doc_topic.is_none() {
-        for (re, m, t) in nl_genres { if let Some(c) = re.find(&q) { gm.extend_from_slice(m); gt.extend_from_slice(t); labels.push(c.as_str().to_string()); } }
+        for (re, m, t) in nl_genres {
+            if let Some(c) = re.find(&q) {
+                gm.extend_from_slice(m);
+                gt.extend_from_slice(t);
+                labels.push(c.as_str().to_string());
+                chips.push(json!({ "key": "g", "value": m.first().copied().unwrap_or(0).to_string(), "label": c.as_str() }));
+            }
+        }
     }
-    if let Some(c) = crate::re!(r"\b(?:the\s+)?(?:19)?([2-9]0)'?s\b").captures(&q) { let d = 1900 + c[1].parse::<i32>().unwrap(); f.insert("y1".into(), d.to_string()); f.insert("y2".into(), (d + 9).to_string()); labels.push(format!("{d}s")); }
-    else if let Some(c) = crate::re!(r"\b(20[0-3]0)'?s\b").captures(&q) { let d: i32 = c[1].parse().unwrap(); f.insert("y1".into(), d.to_string()); f.insert("y2".into(), (d + 9).to_string()); labels.push(format!("{d}s")); }
-    if let Some(c) = crate::re!(r"\b(?:after|since|from)\s+((?:19|20)\d\d)\b").captures(&q) { f.insert("y1".into(), c[1].to_string()); labels.push(format!("since {}", &c[1])); }
-    if let Some(c) = crate::re!(r"\bbefore\s+((?:19|20)\d\d)\b").captures(&q) { f.insert("y2".into(), c[1].to_string()); labels.push(format!("before {}", &c[1])); }
-    if crate::re!(r"\b(new|recent|latest)\b").is_match(&q) { f.insert("y1".into(), (year() - 2).to_string()); labels.push("recent".into()); }
-    if crate::re!(r"\b(classic|old)\b").is_match(&q) { f.insert("y2".into(), "1990".into()); labels.push("classic".into()); }
-    if crate::re!(r"\b(short|quick)\b").is_match(&q) { f.insert("rtmax".into(), "100".into()); labels.push("short".into()); }
-    if crate::re!(r"\b(best|top|great|acclaimed|good)\b").is_match(&q) { f.insert("rmin".into(), "7.2".into()); labels.push("highly rated".into()); }
-    for (re, l) in nl_lang { if let Some(c) = re.find(&q) { f.insert("lang".into(), l.to_string()); labels.push(c.as_str().into()); } }
-    for (re, c2) in nl_country { if let Some(c) = re.find(&q) { f.insert("country".into(), c2.to_string()); labels.push(c.as_str().into()); } }
+    if let Some((y1, y2)) = parse_decade(&q) {
+        f.insert("y1".into(), y1.to_string());
+        f.insert("y2".into(), y2.to_string());
+        let lbl = format!("{y1}s");
+        labels.push(lbl.clone());
+        chips.push(json!({ "key": "decade", "value": lbl, "label": lbl }));
+    }
+    if let Some(c) = crate::re!(r"\b(?:after|since|from)\s+((?:19|20)\d\d)\b").captures(&q) { f.insert("y1".into(), c[1].to_string()); labels.push(format!("since {}", &c[1])); chips.push(json!({ "key": "y1", "value": &c[1], "label": format!("Since {}", &c[1]) })); }
+    if let Some(c) = crate::re!(r"\bbefore\s+((?:19|20)\d\d)\b").captures(&q) { f.insert("y2".into(), c[1].to_string()); labels.push(format!("before {}", &c[1])); chips.push(json!({ "key": "y2", "value": &c[1], "label": format!("Before {}", &c[1]) })); }
+    if crate::re!(r"\b(new|recent|latest)\b").is_match(&q) { f.insert("y1".into(), (year() - 2).to_string()); labels.push("recent".into()); chips.push(json!({ "key": "y1", "value": (year() - 2).to_string(), "label": "Recent" })); }
+    if crate::re!(r"\b(classic|old)\b").is_match(&q) { f.insert("y2".into(), "1990".into()); labels.push("classic".into()); chips.push(json!({ "key": "y2", "value": "1990", "label": "Classic" })); }
+    if crate::re!(r"\b(short|quick)\b").is_match(&q) { f.insert("rtmax".into(), "100".into()); labels.push("short".into()); chips.push(json!({ "key": "rtmax", "value": "100", "label": "Under 100m" })); }
+    if crate::re!(r"\b(best|top|great|acclaimed|good)\b").is_match(&q) { f.insert("rmin".into(), "7.2".into()); labels.push("highly rated".into()); chips.push(json!({ "key": "rmin", "value": "7.2", "label": "7.2+" })); }
+    for (re, l) in nl_lang { if let Some(c) = re.find(&q) { f.insert("lang".into(), l.to_string()); labels.push(c.as_str().into()); chips.push(json!({ "key": "lang", "value": l, "label": c.as_str() })); } }
+    for (re, c2) in nl_country { if let Some(c) = re.find(&q) { f.insert("country".into(), c2.to_string()); labels.push(c.as_str().into()); chips.push(json!({ "key": "country", "value": c2, "label": c.as_str() })); } }
     let mood_hit = |id: &str| match id { "mind" => crate::re!(r"twist|mind").is_match(&q), "true" => q.contains("true stor"), "dark" => crate::re!(r"\b(dark|gritty)\b").is_match(&q), "feel" => crate::re!(r"feel[- ]good|uplifting|wholesome").is_match(&q), "edge" => crate::re!(r"edge of|tense|gripping").is_match(&q), "epic" => crate::re!(r"\bepic\b").is_match(&q), _ => false };
     let hits: Vec<&Mood> = MOODS.iter().filter(|m| mood_hit(m.id)).collect();
     if !hits.is_empty() {
         let names: Vec<&str> = hits.iter().flat_map(|m| m.kws.iter().copied()).collect();
-        f.insert("kw".into(), keyword_ids(app, &names).await.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-        labels.extend(hits.iter().map(|m| m.title.to_string()));
+        let kw_s = keyword_ids(app, &names).await.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+        f.insert("kw".into(), kw_s.clone());
+        for m in &hits {
+            labels.push(m.title.to_string());
+            chips.push(json!({ "key": "mood", "value": m.id, "label": m.title }));
+        }
     }
     // "like X"
     if let Some(c) = crate::re!(r"\b(?:like|similar to)\s+(.+)$").captures(&q) {
@@ -585,7 +701,7 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
             let want: HashSet<i64> = (if mt == "tv" { &gt } else { &gm }).iter().copied().collect();
             if !want.is_empty() { items.retain(|x| app.meta_get(mt, &s(&x["tmdb"])).map_or(false, |m| m.g.iter().any(|g| want.contains(g)))); }
             let extra = if labels.is_empty() { String::new() } else { format!(" · {}", labels.join(" · ")) };
-            return Some(json!({ "label": format!("Like {}{extra}", src.title), "items": items }));
+            return Some(json!({ "label": format!("Like {}{extra}", src.title), "items": items, "chips": chips }));
         }
     }
     // "with <actor>"
@@ -596,7 +712,7 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
                 let mut items: Vec<Value> = p["acting"].as_array().cloned().unwrap_or_default(); items.extend(p["crew"].as_array().cloned().unwrap_or_default());
                 if let Some(k) = kind { items.retain(|x| (k == "tv") == (x["k"] == "s")); }
                 items.truncate(40);
-                return Some(json!({ "label": format!("With {}", s(&p["name"])), "items": items, "person": p0 }));
+                return Some(json!({ "label": format!("With {}", s(&p["name"])), "items": items, "person": p0, "chips": chips }));
             }
         }
     }
@@ -604,13 +720,20 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
     let strong_single = !gm.is_empty() || f.contains_key("kw") || doc_topic.is_some() || is_mini || is_uhd || strong_platform;
     if labels.is_empty() || (labels.len() == 1 && !strong_single) { return None; }
 
+    let cat = app.catalog();
+    let exact_hits = exact_title_cards(app, &cat, q0);
+    let leftover = has_leftover_title_words(&q);
+    // Avoid hijacking literal non-filter titles like `"Doc Holliday"` or `"Space Cowboys"` when only 1 incidental keyword matched!
+    if exact_hits.is_empty() && leftover && labels.len() == 1 {
+        return None;
+    }
+
     let label = labels.iter().map(|l| {
         let mut c = l.chars();
         c.next().map(|ch| ch.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
     }).collect::<Vec<_>>().join(" · ");
 
-    if let Some(topic) = doc_topic {
-        let cat = app.catalog();
+    let nl_items: Vec<Value> = if let Some(topic) = doc_topic {
         let want_tv = kind != Some("movie");
         let want_mv = kind != Some("tv");
         let y1 = f.get("y1").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
@@ -623,11 +746,18 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
         let country_req = f.get("country").cloned().unwrap_or_default();
         let status_req = f.get("status").cloned().unwrap_or_default();
         let langs: Vec<&str> = if lang_req == "nordic" { vec!["sv", "da", "no", "nb", "fi", "is"] } else { vec![lang_req.as_str()] };
+        let hide_cams = hide_cams_enabled(app);
+        let disliked = crate::rec::hidden_ratings(app);
         let mut scored: Vec<(&Item, f64)> = vec![];
         for it in cat.movies.iter().filter(|_| want_mv).chain(cat.series.iter().filter(|_| want_tv)) {
+            if hide_cams && crate::showcase::is_cam_only(app, it) { continue; }
+            if let Some(t) = &it.tmdb {
+                let mt = if it.k == "s" { "tv" } else { "movie" };
+                if disliked.contains(&format!("{mt}:{t}")) { continue; }
+            }
             if !crate::docs::is_doc_item(app, it) { continue; }
             if !crate::docs::doc_topics(app, it).contains(&topic) { continue; }
-            if uhd_req && !(it.uhd || it.variants.iter().any(|v| v.uhd)) { continue; }
+            if uhd_req && !((!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd)) { continue; }
             if !plat_req.is_empty() && !cat.item_has_platform(it, &plat_req) { continue; }
             let m = app.meta_of(it);
             let yr = m.as_ref().map(|m| m.year()).filter(|&y| y > 0).or(it.year).unwrap_or(0);
@@ -654,7 +784,7 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
             scored.push((it, sc));
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let out: Vec<Value> = scored.into_iter().take(40).map(|(it, _)| {
+        scored.into_iter().take(40).map(|(it, _)| {
             let mut c = app.card_meta(it);
             c["isDoc"] = json!(true);
             let slugs = crate::docs::doc_topics(app, it);
@@ -662,18 +792,64 @@ pub async fn smart(app: &Arc<App>, q0: &str) -> Option<Value> {
             if !dt.is_empty() { c["docTopics"] = json!(dt); }
             if !slugs.is_empty() { c["docTopicSlugs"] = json!(slugs); }
             c
-        }).collect();
-        return Some(json!({ "label": label, "items": out }));
+        }).collect()
+    } else if let Some(k) = kind {
+        let mut p = f.clone();
+        p.insert("kind".into(), k.into());
+        p.insert("sort".into(), "rating".into());
+        p.insert("per".into(), "40".into());
+        let g = if k == "tv" { &gt } else { &gm };
+        if !g.is_empty() { p.insert("g".into(), g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); }
+        if k == "tv" { p.remove("rtmax"); }
+        browse(app, &p)["items"].as_array().cloned().unwrap_or_default()
+    } else {
+        // Interleave movies + series when kind == None!
+        let mut pm = f.clone();
+        pm.insert("kind".into(), "movie".into());
+        pm.insert("sort".into(), "rating".into());
+        pm.insert("per".into(), "24".into());
+        if !gm.is_empty() { pm.insert("g".into(), gm.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); }
+        let mv_out = browse(app, &pm)["items"].as_array().cloned().unwrap_or_default();
+
+        let mut pt = f.clone();
+        pt.insert("kind".into(), "tv".into());
+        pt.insert("sort".into(), "rating".into());
+        pt.insert("per".into(), "24".into());
+        if !gt.is_empty() { pt.insert("g".into(), gt.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); }
+        pt.remove("rtmax");
+        let tv_out = browse(app, &pt)["items"].as_array().cloned().unwrap_or_default();
+
+        interleave_items(mv_out, tv_out, 40)
+    };
+
+    // If literal exact title matches exist (e.g. "True Crime", "War of the Worlds", "Love Story", "Space Jam",
+    // "Doc Martin", "Adventure Time"), NEVER let NL filters hijack them: place exact title matches FIRST and
+    // expose the parsed NL filters as optional `chips` + `filteredItems`!
+    if !exact_hits.is_empty() {
+        let mut combined = Vec::with_capacity(exact_hits.len() + nl_items.len());
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for c in &exact_hits {
+            let ck = format!("{}:{}", s(&c["k"]), s(&c["id"]));
+            if seen_keys.insert(ck) { combined.push(c.clone()); }
+        }
+        for c in &nl_items {
+            if combined.len() >= 40 { break; }
+            let ck = format!("{}:{}", s(&c["k"]), s(&c["id"]));
+            if seen_keys.insert(ck) { combined.push(c.clone()); }
+        }
+        return Some(json!({
+            "label": label,
+            "items": combined,
+            "exactFirst": true,
+            "optional": true,
+            "exactMatches": exact_hits,
+            "filteredItems": nl_items,
+            "chips": chips,
+            "filters": f
+        }));
     }
 
-    let mut out = vec![];
-    for mt in kind.map(|k| vec![k]).unwrap_or(vec!["movie", "tv"]) {
-        let mut p = f.clone(); p.insert("kind".into(), mt.into()); p.insert("sort".into(), "rating".into()); p.insert("per".into(), "30".into());
-        let g = if mt == "tv" { &gt } else { &gm }; if !g.is_empty() { p.insert("g".into(), g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); }
-        if mt == "tv" { p.remove("rtmax"); }
-        out.extend(browse(app, &p)["items"].as_array().cloned().unwrap_or_default());
-    }
-    Some(json!({ "label": label, "items": out }))
+    Some(json!({ "label": label, "items": nl_items, "chips": chips, "filters": f }))
 }
 
 fn db_meta<'a>(db: &'a HashMap<String, Meta>, it: &Item) -> Option<&'a Meta> {
@@ -709,8 +885,8 @@ fn sort_search_by<T>(app: &App, list: &mut [T], sort: &str, item_of: impl Fn(&T)
     }
 }
 
-/// Deep multi-bucket search across Movies, Series, Documentaries, Anime, Synopsis/Topic hits,
-/// Live TV (channel + EPG now/next), People, Plain-English Smart search, and Missing/Wanted.
+/// Deep multi-bucket search across Movies, Series, Documentaries, Anime, Synopsis/Cast/Director/Topic hits,
+/// Live TV (channel + full 48h & catch-up EPG), People, Plain-English Smart search, and Missing/Wanted.
 pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
     let get = |k: &str| q.get(k).cloned().unwrap_or_default();
     let qs = get("q").trim().to_string();
@@ -731,11 +907,16 @@ pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
 
     let (movies, series, docs, anime, topic_hits, live, fuzzy, unique_cat) = {
         let cat = app.catalog();
-        let terms: Vec<String> = qs.to_lowercase().split_whitespace().map(String::from).collect();
+        let q_norm = norm(&qs);
+        let terms: Vec<String> = if !q_norm.is_empty() {
+            q_norm.split_whitespace().map(String::from).collect()
+        } else {
+            qs.to_lowercase().split_whitespace().map(String::from).collect()
+        };
         let qq = terms.join(" ");
 
         let check_filters = |it: &Item, m: Option<&Meta>| -> bool {
-            if uhd && !(it.uhd || it.variants.iter().any(|v| v.uhd)) { return false; }
+            if uhd && !((!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd)) { return false; }
             if !platform.is_empty() && !cat.item_has_platform(it, &platform) { return false; }
             if y1 > 0 || y2 < 9999 {
                 let yr = m.map(|m| m.year()).filter(|&y| y > 0).or(it.year).unwrap_or(0);
@@ -749,18 +930,28 @@ pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
             true
         };
 
-        let (mv_raw, sr_raw, lv_raw) = cat.search(&qs, all, 100);
-        let mut title_keys: HashSet<(&'static str, i64)> = HashSet::with_capacity(mv_raw.len() + sr_raw.len());
-        for it in mv_raw.iter().chain(sr_raw.iter()) { title_keys.insert((it.k, it.id)); }
-
-        let (mut mv_items, mut sr_items): (Vec<&Item>, Vec<&Item>) = {
+        // Unified rich search: diacritics, punctuation folding, acronyms, short-word OSA typos, and meta.ot (romaji/orig_title)!
+        let (mut mv_items, mut sr_items, lv_raw, mut title_keys) = {
             let db = app.meta.read().unwrap();
+            let (mv_raw, sr_raw, lv_raw) = cat.search_rich(&qs, all, 100, |it| {
+                db_meta(&db, it).map(|m| m.ot.as_str()).filter(|s| !s.is_empty())
+            });
+            let mut tk: HashSet<(&'static str, i64)> = HashSet::with_capacity(mv_raw.len() + sr_raw.len());
+            for it in mv_raw.iter().chain(sr_raw.iter()) { tk.insert((it.k, it.id)); }
             let mv: Vec<&Item> = mv_raw.into_iter().filter(|it| check_filters(it, db_meta(&db, it))).collect();
             let sr: Vec<&Item> = sr_raw.into_iter().filter(|it| check_filters(it, db_meta(&db, it))).collect();
-            (mv, sr)
+            (mv, sr, lv_raw, tk)
         };
 
-        let mut fuzzy = false;
+        let mut fuzzy = !mv_items.is_empty() || !sr_items.is_empty();
+        if fuzzy && !terms.is_empty() {
+            // Only mark `fuzzy = true` if the top hit wasn't a plain folded substring match
+            let top_exact = mv_items.first().or(sr_items.first()).map_or(false, |it| {
+                let tn = norm(&it.title);
+                terms.iter().all(|w| tn.contains(w.as_str()))
+            });
+            if top_exact { fuzzy = false; }
+        }
         if mv_items.len() + sr_items.len() < 4 && qs.len() >= 4 {
             let fz = fuzzy_items(&app, &cat, &qs, 24);
             let db = app.meta.read().unwrap();
@@ -773,7 +964,7 @@ pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
             }
         }
 
-        // Synopsis / Keyword / Subject matches from meta.json (+ docTopics)
+        // Synopsis / Director / Cast / Keyword / Subject matches from meta.json (+ docTopics)
         let mut topic_cands: Vec<(&Item, f64)> = vec![];
         if !terms.is_empty() && qs.len() >= 2 {
             let doc_hint_cats: HashSet<(&str, &str)> = cat.cats.values().filter(|c| {
@@ -795,7 +986,13 @@ pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
                     if item_matches_text(&cat, it, m, &terms, true) {
                         let ov_txt = m.map(|m| m.ov.as_str()).filter(|s| !s.is_empty()).unwrap_or(it.plot.as_str());
                         let phrase_bonus = if terms.len() > 1 && contains_ci(ov_txt, &qq, false) { 1.2 } else { 0.0 };
-                        let sc = m.map(|m| m.bayes() * 1.3 + (m.p.max(0.0) + 1.0).log10() * 0.9).unwrap_or(it.rating) + phrase_bonus;
+                        // Strong local director / cast credit boost so searching a director/actor works offline too!
+                        let credit_bonus = m.map(|m| {
+                            let dir_hit = m.dir.iter().any(|d| { let dn = norm(d); terms.iter().all(|w| dn.contains(w.as_str())) });
+                            let cast_hit = m.cast.iter().any(|c| { let cn = norm(c); terms.iter().all(|w| cn.contains(w.as_str())) });
+                            (if dir_hit { 2.5 } else { 0.0 }) + (if cast_hit { 1.8 } else { 0.0 })
+                        }).unwrap_or(0.0);
+                        let sc = m.map(|m| m.bayes() * 1.3 + (m.p.max(0.0) + 1.0).log10() * 0.9).unwrap_or(it.rating) + phrase_bonus + credit_bonus;
                         topic_cands.push((it, sc));
                     } else if m.map_or(false, |m| m.g.contains(&99)) || doc_hint_cats.contains(&(it.k, it.cat.as_str())) {
                         doc_extra.push(it);
@@ -886,37 +1083,55 @@ pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
         }).collect();
         let topic_hits: Vec<Value> = topic_items.into_iter().map(|x| app.card_meta(x)).collect();
 
-        // Live TV search: channel name OR currently-airing / next EPG programme title
-        let mut live_items: Vec<&Item> = vec![];
+        // Live TV search: channel name OR full 48h upcoming + live + catch-up EPG programme match!
+        let mut live_cards: Vec<Value> = vec![];
         let mut seen_live: HashSet<i64> = HashSet::new();
         for ch in lv_raw.into_iter().take(60) {
-            if seen_live.insert(ch.id) { live_items.push(ch); }
+            if seen_live.insert(ch.id) {
+                live_cards.push(crate::sports::channel_json(&app, ch));
+            }
         }
-        if live_items.len() < 60 && !terms.is_empty() {
+        if live_cards.len() < 60 && !terms.is_empty() {
             let epg_map = app.epg.read().unwrap().clone();
             let now = now_ms();
-            let mut epg_hits: Vec<(u8, bool, &Item)> = vec![];
+            let horizon = now + 48 * 3_600_000;
+            let matches_prog = |t: &str| terms.iter().all(|w| contains_ci(t, w, w.len() <= 2));
+            let mut epg_hits: Vec<(u8, bool, i64, &Item, Value)> = vec![];
             for ch in cat.live.iter().filter(|ch| (all || ch.en || ch.sport) && !ch.epg.is_empty() && !seen_live.contains(&ch.id)) {
                 let Some(progs) = epg_map.get(&ch.epg) else { continue };
-                let (now_p, next_p) = match progs.iter().position(|p| p.s <= now && p.e > now) {
-                    Some(ix) => (Some(&progs[ix]), progs.get(ix + 1)),
-                    None => (None, progs.iter().find(|p| p.s > now)),
-                };
-                let matches_prog = |t: &str| terms.iter().all(|w| contains_ci(t, w, w.len() <= 2));
-                if now_p.map_or(false, |p| matches_prog(&p.title)) {
-                    epg_hits.push((2, ch.en, ch));
-                } else if next_p.map_or(false, |p| matches_prog(&p.title)) {
-                    epg_hits.push((1, ch.en, ch));
+                let mut best_hit: Option<(u8, i64, Value)> = None;
+                let cu_cutoff = if ch.archive > 0 { now - ch.archive * 86_400_000 } else { i64::MAX };
+                for p in progs {
+                    if !matches_prog(&p.title) { continue; }
+                    let (prio, rank_t, status) = if p.s <= now && p.e > now {
+                        (3u8, 0i64, "live")
+                    } else if p.s > now && p.s <= horizon {
+                        (2u8, -(p.s - now), "upcoming")
+                    } else if p.e <= now && ch.archive > 0 && p.s >= cu_cutoff {
+                        (1u8, p.s, "catchup")
+                    } else {
+                        continue;
+                    };
+                    let better = best_hit.as_ref().map_or(true, |(bp, bt, _)| prio > *bp || (prio == *bp && rank_t > *bt));
+                    if better {
+                        best_hit = Some((prio, rank_t, json!({ "title": p.title, "s": p.s, "e": p.e, "status": status })));
+                    }
+                }
+                if let Some((prio, rank_t, mval)) = best_hit {
+                    epg_hits.push((prio, ch.en, rank_t, ch, mval));
                 }
             }
-            epg_hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-            for (_, _, ch) in epg_hits {
-                if live_items.len() >= 60 { break; }
-                if seen_live.insert(ch.id) { live_items.push(ch); }
+            epg_hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
+            for (_, _, _, ch, mval) in epg_hits {
+                if live_cards.len() >= 60 { break; }
+                if seen_live.insert(ch.id) {
+                    let mut card = crate::sports::channel_json(&app, ch);
+                    card["epgMatch"] = mval;
+                    live_cards.push(card);
+                }
             }
         }
-        let live: Vec<Value> = live_items.into_iter().map(|ch| crate::sports::channel_json(&app, ch)).collect();
-        (movies, series, docs, anime, topic_hits, live, fuzzy, unique_cat)
+        (movies, series, docs, anime, topic_hits, live_cards, fuzzy, unique_cat)
     };
 
     let (people, smart, missing) = tokio::join!(people(&app, &qs), smart(&app, &qs), missing(&app, &qs));
@@ -947,24 +1162,76 @@ pub async fn deep_search(app: Arc<App>, q: &HashMap<String, String>) -> Value {
 }
 
 // ---------- wanted list
+fn wanted_satisfied(target: &str, cam_only: bool, has_4k: bool, has_dub: bool) -> bool {
+    if cam_only { return false; }
+    match target {
+        "4k" => has_4k,
+        "dub" => has_dub,
+        _ => true, // "clean" (default): any non-CAM release satisfies
+    }
+}
+
 pub fn check_wanted(app: &App) {
-    let cat = app.catalog(); let mut alerts = vec![];
+    let cat = app.catalog();
+    let mut alerts: Vec<(&'static str, i64, String, String)> = vec![];
+    let mut dirty = false;
     app.state.with(|st| {
         let keys: Vec<String> = st["wanted"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
         for k in keys {
             let Some((mt, id)) = k.split_once(':') else { continue };
             let Some(it) = cat.by_tmdb(mt, id) else { continue };
+            let target = {
+                let raw = s(&st["wanted"][&k]["target"]).trim().to_lowercase();
+                if raw.is_empty() { "clean".to_string() } else { raw }
+            };
+            let cam_only = crate::showcase::is_cam_only(app, it);
+            if cam_only {
+                // Keep in Wanted! Flag `camOnly: true` instead of firing a bogus "Now available" toast.
+                if st["wanted"][&k]["camOnly"].as_bool() != Some(true) {
+                    st["wanted"][&k]["camOnly"] = json!(true);
+                    dirty = true;
+                }
+                continue;
+            }
+            let has_4k = crate::showcase::best_tier(app, it) >= crate::showcase::QualityTier::Uhd4k;
+            let has_dub = if it.k == "s" {
+                crate::anime::series_dub_summary(app, it.id).0 == "yes"
+            } else {
+                crate::anime::movie_dub_status(app, it) == "yes"
+            };
+            if !wanted_satisfied(&target, false, has_4k, has_dub) {
+                if st["wanted"][&k]["camOnly"].as_bool() == Some(true) {
+                    st["wanted"][&k]["camOnly"] = json!(false);
+                    dirty = true;
+                }
+                if target == "4k" && st["wanted"][&k]["hdAvailable"].as_bool() != Some(true) {
+                    st["wanted"][&k]["hdAvailable"] = json!(true);
+                    dirty = true;
+                }
+                continue;
+            }
             let poster = { let p = s(&st["wanted"][&k]["poster"]); if p.is_empty() { it.poster.clone() } else { p } };
-            st["arrived"][&k] = json!({ "k": it.k, "id": it.id, "title": it.title, "poster": poster, "t": now_ms() });
+            st["arrived"][&k] = json!({ "k": it.k, "id": it.id, "title": it.title, "poster": poster, "target": target, "t": now_ms() });
             st["wanted"].as_object_mut().unwrap().remove(&k);
-            alerts.push((it.k, it.id, it.title.clone()));
+            dirty = true;
+            alerts.push((it.k, it.id, it.title.clone(), target));
         }
         let now = now_ms();
-        if let Some(m) = st["arrived"].as_object_mut() { m.retain(|_, a| now - a["t"].as_i64().unwrap_or(0) < 21 * 86_400_000); }
+        if let Some(m) = st["arrived"].as_object_mut() {
+            let before = m.len();
+            m.retain(|_, a| now - a["t"].as_i64().unwrap_or(0) < 21 * 86_400_000);
+            if m.len() != before { dirty = true; }
+        }
     });
-    if !alerts.is_empty() { app.state.save(); }
-    for (k, id, t) in alerts {
-        crate::notify_all(app, "wanted", &format!("Now available: {t}"), "From your Wanted list", "http://localhost:7878/",
+    if dirty { app.state.save(); }
+    let link = format!("http://localhost:{}/", app_port(app));
+    for (k, id, t, target) in alerts {
+        let heading = match target.as_str() {
+            "4k" => format!("Now in 4K: {t}"),
+            "dub" => format!("English dub ready: {t}"),
+            _ => format!("Now available: {t}"),
+        };
+        crate::notify_all(app, "wanted", &heading, "From your Wanted list", &link,
             json!({ "k": k, "id": id, "title": t, "label": "View title" }));
     }
 }
@@ -1113,6 +1380,7 @@ pub async fn concierge(app: Arc<App>, b: Value) -> Value {
         (HashSet::new(), HashSet::new())
     };
 
+    let hide_cams = hide_cams_enabled(&app);
     let disliked = crate::rec::hidden_ratings(&app);
     let mut hide = hide_prefs(&app);
     if kind == "anime" { hide.retain(|h| h != "anime"); }
@@ -1153,6 +1421,7 @@ pub async fn concierge(app: Arc<App>, b: Value) -> Value {
         let mut cands: Vec<Cand<'_>> = vec![];
 
         for (it, is_an, dub) in pool {
+            if hide_cams && crate::showcase::is_cam_only(&app, it) { continue; }
             let Some(m) = app.meta_of(it) else { continue };
             let tv = it.k == "s";
             let mt = if tv { "tv" } else { "movie" };
@@ -1165,7 +1434,7 @@ pub async fn concierge(app: Arc<App>, b: Value) -> Value {
                 if !tmdb_key.is_empty() && seen_tmdb.contains(&tmdb_key) { continue; }
             }
 
-            let is_uhd = it.uhd || it.variants.iter().any(|v| v.uhd);
+            let is_uhd = (!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd);
             if uhd_only && !is_uhd { continue; }
 
             if max_min > 0 && max_min < 900 {
@@ -1312,7 +1581,7 @@ pub async fn concierge(app: Arc<App>, b: Value) -> Value {
             let gs: Vec<String> = it.genre.split(|ch| ch == ',' || ch == '/').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).take(3).collect();
             c["genres"] = json!(gs);
         }
-        c["uhd"] = json!(it.uhd || it.variants.iter().any(|v| v.uhd));
+        c["uhd"] = json!((!it.cam && it.uhd) || it.variants.iter().any(|v| !v.cam && v.uhd));
         c["trailer"] = json!(it.trailer);
         if it.k == "s" {
             c["seasons"] = json!(m.as_ref().map(|m| m.ns).unwrap_or(0));
@@ -1333,4 +1602,61 @@ pub async fn concierge(app: Arc<App>, b: Value) -> Value {
     }).collect();
 
     json!({ "totalMatches": total_matches, "picks": picks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_decade_distinguishes_2020s_from_1920s() {
+        assert_eq!(parse_decade("best 20s sci-fi movies"), Some((2020, 2029)));
+        assert_eq!(parse_decade("the 20s"), Some((2020, 2029)));
+        assert_eq!(parse_decade("2020s thriller"), Some((2020, 2029)));
+        assert_eq!(parse_decade("1920s silent films"), Some((1920, 1929)));
+        assert_eq!(parse_decade("90s action movies"), Some((1990, 1999)));
+        assert_eq!(parse_decade("00s comedies"), Some((2000, 2009)));
+        assert_eq!(parse_decade("10s sci-fi"), Some((2010, 2019)));
+        assert_eq!(parse_decade("1980s horror"), Some((1980, 1989)));
+    }
+
+    #[test]
+    fn wanted_target_blocks_cam_and_honors_4k_and_dub() {
+        // CAM-only NEVER satisfies any target!
+        assert!(!wanted_satisfied("clean", true, false, false));
+        assert!(!wanted_satisfied("4k", true, true, false));
+        assert!(!wanted_satisfied("dub", true, false, true));
+
+        // Clean HD release satisfies "clean", not "4k" or "dub"
+        assert!(wanted_satisfied("clean", false, false, false));
+        assert!(!wanted_satisfied("4k", false, false, false));
+        assert!(!wanted_satisfied("dub", false, false, false));
+
+        // Clean 4K satisfies "clean" and "4k"
+        assert!(wanted_satisfied("4k", false, true, false));
+        // Clean English dub satisfies "dub"
+        assert!(wanted_satisfied("dub", false, false, true));
+    }
+
+    #[test]
+    fn literal_titles_detected_as_leftover_words_and_interleave_alternates() {
+        assert!(has_leftover_title_words("war of the worlds"));
+        assert!(has_leftover_title_words("space jam"));
+        assert!(has_leftover_title_words("doc martin"));
+        assert!(has_leftover_title_words("adventure time"));
+        assert!(!has_leftover_title_words("best 90s sci-fi movies on netflix"));
+        assert!(!has_leftover_title_words("true crime documentaries"));
+
+        let mv = vec![json!("m1"), json!("m2"), json!("m3")];
+        let tv = vec![json!("s1"), json!("s2")];
+        assert_eq!(interleave_items(mv, tv, 10), vec![json!("m1"), json!("s1"), json!("m2"), json!("s2"), json!("m3")]);
+    }
+
+    #[test]
+    fn hidden_by_catches_standup_keyword_9716() {
+        let mut su = HashSet::new();
+        su.insert(9716);
+        assert!(hidden_by(&["standup".into()], &[35], "en", "EN - COMEDY", &[9716], &su));
+        assert!(!hidden_by(&["standup".into()], &[35], "en", "EN - COMEDY", &[100], &su));
+    }
 }

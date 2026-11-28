@@ -1,5 +1,5 @@
 -- tv_osd.lua — Pure-Black QD-OLED Netflix-Style OSD for Personal Windows 11 TV App
--- Loaded via: --osc=no --script=mpv-scripts/tv_osd.lua
+-- Loaded via: --osc=no --script=mpv-scripts	v_osd.lua
 --
 -- Supported --script-opts (prefix: tv_osd-):
 --   tv_osd-title          (string)   Display title (falls back to media-title / filename)
@@ -21,6 +21,7 @@ local mp = require("mp")
 local msg = require("mp.msg")
 local options = require("mp.options")
 local assdraw = require("mp.assdraw")
+local utils = require("mp.utils")
 
 --------------------------------------------------------------------------------
 -- Constants & Palette (ASS uses &HBBGGRR&, alpha &H00& = opaque .. &HFF& = transparent)
@@ -29,6 +30,9 @@ local FONT = "Segoe UI"
 local NIGHT_FILTER_LABEL = "tv_night"
 local NIGHT_FILTER_GRAPH = "dynaudnorm=f=150:g=15:p=0.90:m=8.0:s=12.0"
 local NIGHT_FILTER_SPEC = "@" .. NIGHT_FILTER_LABEL .. ":lavfi=[" .. NIGHT_FILTER_GRAPH .. "]"
+local DOWNMIX_FILTER_LABEL = "tv_downmix"
+local DOWNMIX_FILTER_GRAPH = "pan=stereo|FL=0.32*FL+0.23*FC+0.20*BL+0.20*SL+0.05*LFE|FR=0.32*FR+0.23*FC+0.20*BR+0.20*SR+0.05*LFE"
+local DOWNMIX_FILTER_SPEC = "@" .. DOWNMIX_FILTER_LABEL .. ":lavfi=[" .. DOWNMIX_FILTER_GRAPH .. "]"
 local CROPDETECT_LABEL = "tv_cropdetect"
 local CROP_LABEL = "tv_crop"
 local HIDE_DELAY = 2.5
@@ -36,6 +40,7 @@ local REPLAY_SEEK_SECS = 8
 local REPLAY_RESTORE_SECS = 10
 local UP_NEXT_COUNTDOWN_SECS = 10
 local UP_NEXT_CREDITS_SKIP_SECS = 3
+local FOCUS_CLICK_GUARD_SECS = 0.35
 
 local C = {
     black        = "&H000000&", -- #000000 Pure OLED pixel-off black
@@ -108,6 +113,7 @@ local SHADER_PRESETS = {
 local raw_opts = {
     title            = "",
     sub              = "",
+    key              = "",
     recap_s          = "-1",
     recap_e          = "-1",
     recap_auto       = "yes",
@@ -132,6 +138,9 @@ local raw_opts = {
     shader_dir       = "",
     shader_preset    = "off",
     night            = "no",
+    surround         = "no",
+    prefer_ext_sub   = "no",
+    smooth_cadence   = "no",
     is_live          = "no",
     api_base         = "http://127.0.0.1:7878",
 }
@@ -139,6 +148,7 @@ local raw_opts = {
 local opts = {
     title            = "",
     sub              = "",
+    key              = "",
     recap_s          = -1,
     recap_e          = -1,
     recap_auto       = true,
@@ -163,6 +173,9 @@ local opts = {
     shader_dir       = "",
     shader_preset    = "off",
     night            = false,
+    surround         = false,
+    prefer_ext_sub   = false,
+    smooth_cadence   = false,
     is_live          = false,
     api_base         = "http://127.0.0.1:7878",
 }
@@ -201,12 +214,13 @@ local function resolve_shader_dir()
             return parent .. "\\mpv-shaders"
         end
     end
-    return "mpv-shaders"
+    return "C:\\Users\\V\\Documents\\tv\\mpv-shaders"
 end
 
 local function sync_parsed_opts()
     opts.title            = tostring(raw_opts.title or "")
     opts.sub              = tostring(raw_opts.sub or "")
+    opts.key              = tostring(raw_opts.key or "")
     opts.recap_s          = parse_num(raw_opts.recap_s, -1)
     opts.recap_e          = parse_num(raw_opts.recap_e, -1)
     opts.recap_auto       = parse_bool(raw_opts.recap_auto, true)
@@ -232,6 +246,9 @@ local function sync_parsed_opts()
     opts.shader_dir       = tostring(raw_opts.shader_dir or "")
     opts.shader_preset    = normalize_preset(raw_opts.shader_preset)
     opts.night            = parse_bool(raw_opts.night, false)
+    opts.surround         = parse_bool(raw_opts.surround, false)
+    opts.prefer_ext_sub   = parse_bool(raw_opts.prefer_ext_sub, false)
+    opts.smooth_cadence   = parse_bool(raw_opts.smooth_cadence, false)
     opts.is_live          = parse_bool(raw_opts.is_live, false)
     opts.api_base         = tostring(raw_opts.api_base or "http://127.0.0.1:7878")
 end
@@ -281,11 +298,18 @@ local state = {
     crop_mode = "off", -- "off" | "detecting" | "active"
     crop_detected = nil,
     crop_samples = 0,
+    focused = true,
+    fullscreen = true,
+    focus_gained_at = 0,
+    ext_sub_selected = false,
+    sub_sync_running = false,
 
     -- Replay ("What did they just say?")
     replay_active = false,
     replay_prev_sid = "no",
     replay_prev_vis = true,
+    replay_remaining = 0,
+    replay_last_tick = nil,
 
     -- Intro, Recap & In-Episode Ending Skip
     intro_visible = false,
@@ -296,6 +320,8 @@ local state = {
     intro_dismissed = false,
     ed_autoskipped = false,
     ed_dismissed = false,
+    initial_pos = nil,
+    initial_pos_checked = false,
     skip_key_bound = false,
     undo_from = nil,
     undo_kind = nil,
@@ -561,6 +587,8 @@ local function cancel_replay_timer(restore_now)
         mp.set_property_bool("sub-visibility", state.replay_prev_vis ~= false)
     end
     state.replay_active = false
+    state.replay_remaining = 0
+    state.replay_last_tick = nil
 end
 
 local function cycle_sub_track()
@@ -671,8 +699,84 @@ local function toggle_night_mode()
 end
 
 --------------------------------------------------------------------------------
--- Feature: GPU Neural Upscaling Shaders
+-- Feature: Dynamic Channel-Aware 5.1->Stereo Downmix & Deterministic Ext Sub
 --------------------------------------------------------------------------------
+local function has_downmix_filter()
+    local af = mp.get_property_native("af") or {}
+    for _, f in ipairs(af) do
+        if f.label == DOWNMIX_FILTER_LABEL then
+            return true
+        end
+    end
+    return false
+end
+
+local function update_dynamic_downmix(ch)
+    if ch == nil or ch <= 0 then
+        ch = mp.get_property_number("audio-params/channel-count", 0) or 0
+    end
+    if ch <= 0 then
+        for _, t in ipairs(state.tracks) do
+            if t.type == "audio" and t.selected and t["audio-channels"] then
+                ch = tonumber(t["audio-channels"]) or 0
+                break
+            end
+        end
+    end
+    local present = has_downmix_filter()
+    if (not opts.surround) and ch >= 6 then
+        if not present then
+            mp.commandv("af", "pre", DOWNMIX_FILTER_SPEC)
+        end
+    elseif present and (opts.surround or (ch > 0 and ch < 6)) then
+        mp.commandv("af", "remove", "@" .. DOWNMIX_FILTER_LABEL)
+    end
+end
+
+local function select_preferred_ext_sub()
+    if not opts.prefer_ext_sub or state.ext_sub_selected then
+        return
+    end
+    local tracks = state.tracks
+    if not tracks or #tracks == 0 then
+        tracks = mp.get_property_native("track-list") or {}
+    end
+    for _, t in ipairs(tracks) do
+        if t.type == "sub" and t.external == true and t.id then
+            mp.set_property_number("sid", t.id)
+            mp.set_property_bool("sub-visibility", true)
+            state.ext_sub_selected = true
+            msg.info("Selected external subtitle track #" .. tostring(t.id))
+            return
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Feature: Focus-Aware 240Hz QD-OLED Frame Pacing
+--------------------------------------------------------------------------------
+local function update_frame_pacing()
+    if not opts.smooth_cadence then return end
+    if (not opts.is_live) and state.focused and state.fullscreen then
+        mp.set_property("video-sync", "display-resample")
+    else
+        mp.set_property("video-sync", "audio")
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Feature: GPU Neural Upscaling Shaders (with 4K + RTX VSR Safety Guard)
+--------------------------------------------------------------------------------
+local function has_vsr_filter()
+    local vf = mp.get_property_native("vf") or {}
+    for _, f in ipairs(vf) do
+        if f.name == "d3d11vpp" then
+            return true
+        end
+    end
+    return false
+end
+
 local function apply_shader_preset(preset_id, announce)
     preset_id = normalize_preset(preset_id)
     local preset = SHADER_PRESETS[preset_id]
@@ -682,6 +786,24 @@ local function apply_shader_preset(preset_id, announce)
         mp.commandv("change-list", "glsl-shaders", "clr", "")
         state.shader_preset = "off"
         if announce then show_toast(preset.toast) end
+        render()
+        return
+    end
+
+    if has_vsr_filter() then
+        mp.commandv("change-list", "glsl-shaders", "clr", "")
+        state.shader_preset = "off"
+        if announce then show_toast("Shaders disabled while RTX VSR is active", 2.8) end
+        render()
+        return
+    end
+
+    local vw = (state.vid_w and state.vid_w > 0) and state.vid_w or (mp.get_property_number("width", 0) or 0)
+    local vh = (state.vid_h and state.vid_h > 0) and state.vid_h or (mp.get_property_number("height", 0) or 0)
+    if vw >= 3600 or vh >= 1800 then
+        mp.commandv("change-list", "glsl-shaders", "clr", "")
+        state.shader_preset = "off"
+        if announce then show_toast("Native 4K — upscaling shaders skipped", 2.8) end
         render()
         return
     end
@@ -723,7 +845,7 @@ local function cycle_shader_preset()
 end
 
 --------------------------------------------------------------------------------
--- Feature: Smart Black-Bar OLED Crop (cropdetect)
+-- Feature: Zero-Copy GPU Black-Bar OLED Crop (cropdetect -> video-crop)
 --------------------------------------------------------------------------------
 local function remove_vf_label(label)
     local vf = mp.get_property_native("vf") or {}
@@ -769,6 +891,7 @@ end
 local function clear_crop(announce)
     stop_cropdetect()
     remove_vf_label(CROP_LABEL)
+    mp.set_property("video-crop", "")
     state.crop_mode = "off"
     state.crop_detected = nil
     state.crop_samples = 0
@@ -792,13 +915,14 @@ local function finish_cropdetect()
     local diff_h = vh - det.h
     local sane_size = (det.w >= vw * 0.45) and (det.h >= vh * 0.45)
     if sane_size and (diff_w >= 8 or diff_h >= 8) then
-        -- Round to even dimensions for clean YUV/GPU sampling
+        -- Round to even dimensions for clean YUV/GPU sampling; use zero-copy GPU video-crop
+        -- so d3d11va hardware decoding and Dolby Vision RPU stay intact!
         local cw = math.floor(det.w / 2) * 2
         local ch = math.floor(det.h / 2) * 2
         local cx = math.floor(det.x / 2) * 2
         local cy = math.floor(det.y / 2) * 2
         remove_vf_label(CROP_LABEL)
-        mp.commandv("vf", "add", string.format("@%s:lavfi=[crop=%d:%d:%d:%d]", CROP_LABEL, cw, ch, cx, cy))
+        mp.set_property("video-crop", string.format("%dx%d+%d+%d", cw, ch, cx, cy))
         state.crop_mode = "active"
         show_toast(string.format("OLED Black-Bar Crop: %dx%d", cw, ch))
     else
@@ -828,8 +952,9 @@ local function toggle_smart_crop()
     state.crop_samples = 0
     remove_vf_label(CROP_LABEL)
     remove_vf_label(CROPDETECT_LABEL)
+    mp.set_property("video-crop", "")
     mp.observe_property("vf-metadata/" .. CROPDETECT_LABEL, "native", on_cropdetect_meta)
-    mp.commandv("vf", "add", "@" .. CROPDETECT_LABEL .. ":lavfi=[cropdetect=limit=24:round=2:reset=0]")
+    mp.commandv("vf", "add", "@" .. CROPDETECT_LABEL .. ":lavfi=[cropdetect=limit=0.06:round=2:reset=0]")
     show_toast("Detecting black bars...", 1.2)
     crop_timer = mp.add_timeout(0.85, finish_cropdetect)
     render()
@@ -860,19 +985,68 @@ local function trigger_replay()
         end
     end
 
-    state.replay_active = true
-    show_toast("Replaying 8s with subtitles", 2.6)
-
     if replay_timer then
         replay_timer:kill()
         replay_timer = nil
     end
-    replay_timer = mp.add_timeout(REPLAY_RESTORE_SECS, function()
-        replay_timer = nil
-        cancel_replay_timer(true)
-        render()
-    end)
+    state.replay_active = true
+    state.replay_remaining = REPLAY_RESTORE_SECS
+    state.replay_last_tick = mp.get_time()
+    show_toast("Replaying 8s with subtitles", 2.6)
     render()
+end
+
+--------------------------------------------------------------------------------
+-- Feature: Async External Subtitle Sync (/api/extsubs/sync-mpv + sub-reload)
+--------------------------------------------------------------------------------
+local function trigger_sub_sync()
+    if opts.is_live then
+        show_toast("Subtitle sync unavailable on Live TV")
+        return
+    end
+    if state.sub_sync_running then
+        show_toast("Subtitle sync already running...", 2.0)
+        return
+    end
+    local base = (opts.api_base ~= "" and opts.api_base or "http://127.0.0.1:7878"):gsub("/+$", "")
+    local payload = utils.format_json({ key = opts.key or "" }) or "{}"
+    state.sub_sync_running = true
+    show_toast("Syncing external subtitles...", 4.0)
+    mp.command_native_async({
+        name = "subprocess",
+        playback_only = false,
+        capture_stdout = true,
+        capture_stderr = true,
+        args = {
+            "curl.exe",
+            "-sS",
+            "-m", "45",
+            "-X", "POST",
+            "-H", "Content-Type: application/json",
+            "-d", payload,
+            base .. "/api/extsubs/sync-mpv",
+        },
+    }, function(success, result, err)
+        state.sub_sync_running = false
+        if not success or not result or result.status ~= 0 then
+            show_toast("Sub sync failed: " .. tostring(err or (result and result.stderr) or "request error"), 3.2)
+            return
+        end
+        local data = utils.parse_json(result.stdout or "")
+        if type(data) ~= "table" then
+            show_toast("Sub sync: invalid server response", 3.0)
+            return
+        end
+        if data.ok and data.improves then
+            mp.commandv("sub-reload")
+            local off_s = (tonumber(data.offsetMs) or 0) / 1000.0
+            show_toast(string.format("Subtitles synced (%+.2fs)", off_s), 3.2)
+        elseif data.ok and not data.improves then
+            show_toast("Subtitles already in sync", 2.4)
+        else
+            show_toast("Sub sync: " .. tostring(data.error or data.reason or "unavailable"), 3.2)
+        end
+    end)
 end
 
 --------------------------------------------------------------------------------
@@ -989,6 +1163,7 @@ end
 local function adopt_chapters(chapters)
     if opts.is_live or type(chapters) ~= "table" or #chapters == 0 then return end
     local dur = state.duration or mp.get_property_number("duration", 0) or 0
+    local init_p = state.initial_pos
     for i, ch in ipairs(chapters) do
         local title = tostring(ch.title or ""):lower()
         local st = tonumber(ch.time)
@@ -1004,21 +1179,32 @@ local function adopt_chapters(chapters)
                 or title:match("^op%s*$")
                 or title:match("^op%W")
             )
-            local is_credits = (
+            local is_ending = (
+                title:find("ending", 1, true)
+                or title:match("^ed%s*$")
+                or title:match("^ed%W")
+            )
+            local is_credits = is_ending or (
                 title:find("end credits", 1, true)
                 or title:find("credits", 1, true)
                 or title:find("outro", 1, true)
-                or title:find("ending", 1, true)
                 or title:find("end titles", 1, true)
-                or title:match("^ed%s*$")
-                or title:match("^ed%W")
             )
             if is_recap and opts.recap_s < 0 and en and (en - st) >= 4 and (en - st) <= 240 and (dur <= 120 or en <= dur * 0.42) then
                 opts.recap_s = st
                 opts.recap_e = en
+                if init_p and init_p >= st and init_p < en then state.recap_autoskipped = true end
             elseif is_intro and opts.intro_s < 0 and en and (en - st) >= 5 and (en - st) <= 210 and (dur <= 120 or en <= dur * 0.50) then
                 opts.intro_s = st
                 opts.intro_e = en
+                if init_p and init_p >= st and init_p < en then state.intro_autoskipped = true end
+            elseif is_ending and nxt and en and dur > 120 and (dur - en) >= 35 and (en - st) >= 25 and (en - st) <= 180 and st >= dur * 0.55 then
+                -- In-episode Ending followed by >= 35s post-credits / C-part chapter: treat as ed_s/ed_e, NOT terminal credits!
+                if opts.ed_s < 0 then
+                    opts.ed_s = st
+                    opts.ed_e = en
+                    if init_p and init_p >= st and init_p < en then state.ed_autoskipped = true end
+                end
             elseif is_credits and opts.credits < 0 and st > 60 and (dur <= 120 or (st >= dur * 0.55 and st < dur - 5)) then
                 opts.credits = st
             end
@@ -1122,7 +1308,7 @@ local function update_intro_and_up_next()
         if trigger ~= nil and pos >= trigger and dur > 0 then
             if not state.up_next_dismissed then
                 if not state.up_next_visible then
-                    local fast_credits = has_known_credits and (not opts.credits_mixed) and opts.autoplay and opts.autoskip_credits
+                    local fast_credits = has_known_credits and (not opts.credits_mixed) and (not opts.has_post_credits) and opts.autoplay and opts.autoskip_credits
                     local cd = fast_credits and UP_NEXT_CREDITS_SKIP_SECS or UP_NEXT_COUNTDOWN_SECS
                     state.up_next_visible = true
                     state.up_next_credits_skip = fast_credits
@@ -1957,8 +2143,12 @@ local function on_mbtn_left(tbl)
         end
     end
 
-    -- 3) Clicking main video canvas wakes HUD and toggles Play/Pause (debounced so double-click fullscreen won't pause)
+    -- 3) Clicking main video canvas wakes HUD and toggles Play/Pause (debounced so double-click
+    --    fullscreen won't pause, and ignored within 350ms of window regaining focus!)
     wake_hud()
+    if mp.get_time() - (state.focus_gained_at or 0) < FOCUS_CLICK_GUARD_SECS then
+        return
+    end
     if click_pause_timer then
         click_pause_timer:kill()
         click_pause_timer = nil
@@ -2000,6 +2190,21 @@ end)
 
 mp.observe_property("time-pos", "number", function(_, val)
     if val ~= nil then
+        -- Initial-position guard: if playback starts/resumes ALREADY inside an intro/recap/ending window,
+        -- suppress auto-skip so we never yank the viewer forward on resume (manual button still shows).
+        if not state.initial_pos_checked then
+            state.initial_pos_checked = true
+            state.initial_pos = val
+            if opts.recap_s >= 0 and opts.recap_e > opts.recap_s and val >= opts.recap_s and val < opts.recap_e then
+                state.recap_autoskipped = true
+            end
+            if opts.intro_s >= 0 and opts.intro_e > opts.intro_s and val >= opts.intro_s and val < opts.intro_e then
+                state.intro_autoskipped = true
+            end
+            if opts.ed_s >= 0 and opts.ed_e > opts.ed_s and val >= opts.ed_s and val < opts.ed_e then
+                state.ed_autoskipped = true
+            end
+        end
         -- Manual scrub-back immunity: if the user seeks backward into/before a skip segment,
         -- disable auto-skip on it so we never yank them forward while rewinding!
         if mp.get_time() > (state.self_seek_until or 0) and state.last_time_pos and val < state.last_time_pos - 2.0 then
@@ -2055,7 +2260,13 @@ end)
 
 mp.observe_property("track-list", "native", function(_, val)
     state.tracks = val or {}
+    select_preferred_ext_sub()
+    update_dynamic_downmix(nil)
     if state.hud_visible or state.paused then render() end
+end)
+
+mp.observe_property("audio-params/channel-count", "number", function(_, val)
+    update_dynamic_downmix(val)
 end)
 
 mp.observe_property("sub-visibility", "bool", function(_, val)
@@ -2065,17 +2276,34 @@ end)
 
 mp.observe_property("width", "number", function(_, val)
     state.vid_w = val or 0
+    if state.shader_preset ~= "off" and state.vid_w >= 3600 then
+        apply_shader_preset("off", false)
+    end
 end)
 
 mp.observe_property("height", "number", function(_, val)
     state.vid_h = val or 0
+    if state.shader_preset ~= "off" and state.vid_h >= 1800 then
+        apply_shader_preset("off", false)
+    end
 end)
 
-mp.observe_property("fullscreen", "bool", function()
+mp.observe_property("focused", "bool", function(_, val)
+    local is_focused = (val == true)
+    if is_focused and not state.focused then
+        state.focus_gained_at = mp.get_time()
+    end
+    state.focused = is_focused
+    update_frame_pacing()
+end)
+
+mp.observe_property("fullscreen", "bool", function(_, val)
+    state.fullscreen = (val == true)
     if click_pause_timer then
         click_pause_timer:kill()
         click_pause_timer = nil
     end
+    update_frame_pacing()
 end)
 
 mp.observe_property("osd-dimensions", "native", function()
@@ -2092,6 +2320,9 @@ mp.register_event("file-loaded", function()
     state.recap_dismissed = false
     state.ed_autoskipped = false
     state.ed_dismissed = false
+    state.initial_pos = nil
+    state.initial_pos_checked = false
+    state.ext_sub_selected = false
     state.undo_from = nil
     state.undo_kind = nil
     state.undo_label = nil
@@ -2106,10 +2337,25 @@ mp.register_event("file-loaded", function()
     state.quitting_for_next = false
     cancel_replay_timer(false)
     stop_cropdetect()
+    mp.set_property("video-crop", "")
     state.crop_mode = "off"
+    state.tracks = mp.get_property_native("track-list") or {}
+    state.vid_w = mp.get_property_number("width", 0) or 0
+    state.vid_h = mp.get_property_number("height", 0) or 0
 
-    -- Adopt native MKV chapter markers for Recap / Intro / Credits when not already provided
+    -- Adopt native MKV chapter markers for Recap / Intro / In-Episode Ending / Credits
     adopt_chapters(mp.get_property_native("chapter-list"))
+
+    -- Deterministic external subtitle selection when requested
+    select_preferred_ext_sub()
+
+    -- Dynamic channel-aware 5.1->stereo downmix (removes automatically on 2.0 stereo tracks)
+    update_dynamic_downmix(mp.get_property_number("audio-params/channel-count", 0))
+
+    -- Focus-aware 240Hz QD-OLED frame pacing
+    state.focused = mp.get_property_bool("focused", true)
+    state.fullscreen = mp.get_property_bool("fullscreen", true)
+    update_frame_pacing()
 
     -- Apply initial Night Mode if requested and not already present
     local night_present = has_night_filter()
@@ -2123,7 +2369,7 @@ mp.register_event("file-loaded", function()
         state.night_active = night_present
     end
 
-    -- Apply initial Shader preset if requested and no shaders already loaded via CLI
+    -- Apply initial Shader preset if requested (with 4K + VSR guard) and no shaders already loaded via CLI
     local existing_shaders = mp.get_property_native("glsl-shaders") or {}
     if opts.shader_preset ~= "off" and #existing_shaders == 0 then
         apply_shader_preset(opts.shader_preset, false)
@@ -2147,8 +2393,24 @@ mp.register_event("shutdown", function()
     end
 end)
 
--- Periodic refresh tick (0.25s) for smooth progress, wall clock, intro/credits & Up Next countdown
+-- Periodic refresh tick (0.25s) for smooth progress, wall clock, pause-aware Replay restore, intro/credits & Up Next countdown
 mp.add_periodic_timer(0.25, function()
+    local now = mp.get_time()
+    -- Pause Replay 8s sub-restore countdown while playback is paused
+    if state.replay_active then
+        if state.paused then
+            state.replay_last_tick = now
+        else
+            local dt = now - (state.replay_last_tick or now)
+            state.replay_last_tick = now
+            state.replay_remaining = (state.replay_remaining or 0) - dt
+            if state.replay_remaining <= 0 then
+                cancel_replay_timer(true)
+                render()
+            end
+        end
+    end
+
     local was_intro = state.intro_visible
     local was_up_next = state.up_next_visible
     local was_cd = state.up_next_remaining
@@ -2162,7 +2424,7 @@ mp.add_periodic_timer(0.25, function()
 end)
 
 --------------------------------------------------------------------------------
--- Key Bindings
+-- Key Bindings & IPC Script Messages
 --------------------------------------------------------------------------------
 mp.add_forced_key_binding("MBTN_LEFT", "tv_osd_mbtn_left", on_mbtn_left, { complex = true })
 
@@ -2170,6 +2432,9 @@ mp.add_forced_key_binding("Ctrl+0", "tv_osd_shader_off", function() apply_shader
 mp.add_forced_key_binding("Ctrl+1", "tv_osd_shader_film", function() apply_shader_preset("film", true) end)
 mp.add_forced_key_binding("Ctrl+2", "tv_osd_shader_anime", function() apply_shader_preset("anime", true) end)
 mp.add_forced_key_binding("Ctrl+3", "tv_osd_shader_anime_hq", function() apply_shader_preset("anime_hq", true) end)
+
+mp.add_forced_key_binding("Ctrl+Shift+s", "tv_osd_sub_sync_lower", trigger_sub_sync)
+mp.add_forced_key_binding("Ctrl+S", "tv_osd_sub_sync_upper", trigger_sub_sync)
 
 mp.add_forced_key_binding("b", "tv_osd_crop_lower", toggle_smart_crop)
 mp.add_forced_key_binding("B", "tv_osd_crop_upper", toggle_smart_crop)
@@ -2179,5 +2444,9 @@ mp.add_forced_key_binding("R", "tv_osd_replay_upper", trigger_replay)
 
 mp.add_forced_key_binding("u", "tv_osd_undo_lower", undo_last_autoskip)
 mp.add_forced_key_binding("U", "tv_osd_undo_upper", undo_last_autoskip)
+
+mp.register_script_message("tv-undo-skip", undo_last_autoskip)
+mp.register_script_message("tv-sub-sync", trigger_sub_sync)
+mp.register_script_message("tv-play-next", trigger_play_next)
 
 msg.info("tv_osd loaded (preset=" .. opts.shader_preset .. ", night=" .. tostring(opts.night) .. ", live=" .. tostring(opts.is_live) .. ")")

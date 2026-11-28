@@ -2,89 +2,217 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Phosphor Remote">
+<link rel="manifest" href="data:application/manifest+json,%7B%22name%22%3A%22TV%20Remote%22%2C%22short_name%22%3A%22TV%22%2C%22start_url%22%3A%22%2F%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23000000%22%2C%22theme_color%22%3A%22%23000000%22%7D">
 <title>Phosphor Remote</title>
 <style>
-  :root { --bg: #000000; --bg2: #0d0f12; --bg3: #16191f; --line: rgba(255,255,255,.10); --fg: #f2f3f5; --muted: #8b93a1; --accent: #ffb547; --accent-ink: #1b1204; }
+  :root {
+    --bg: #000;
+    --bg2: #0d0f12;
+    --bg3: #16191f;
+    --line: rgba(255, 255, 255, .1);
+    --text: #f2f3f5;
+    --muted: #98a0ad;
+    --accent: #ffb547;
+    --accent-ink: #1b1204;
+    --live: #ff4d5e;
+    --ok: #3ddc97;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  body { padding: env(safe-area-inset-top) 16px calc(76px + env(safe-area-inset-bottom)); max-width: 520px; margin: 0 auto; }
-  h1 { font-size: 18px; margin: 18px 0 12px; }
-  button { font: inherit; color: inherit; background: var(--bg3); border: 0; border-radius: 12px; padding: 12px; cursor: pointer; }
-  button:active { transform: scale(.96); background: #232832; }
-  .primary { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { padding: calc(10px + env(safe-area-inset-top)) 16px calc(80px + env(safe-area-inset-bottom)); max-width: 520px; margin: 0 auto; min-height: 100dvh; }
+  h1 { font-size: 19px; font-weight: 800; letter-spacing: -.02em; margin: 14px 0 12px; }
+  h2 { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; margin: 18px 0 9px; }
+  button { font: inherit; color: inherit; background: var(--bg3); border: 1px solid rgba(255,255,255,.06); border-radius: 12px; padding: 12px; cursor: pointer; transition: transform .08s, background .12s, border-color .12s; }
+  button:active { transform: scale(.96); background: #222730; }
+  .primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 700; }
+  .primary:active { background: #ffc76f; }
+  .pill-on { background: rgba(255, 181, 71, .16); color: var(--accent); border-color: rgba(255, 181, 71, .45); font-weight: 700; }
+  .danger-btn { background: rgba(255, 77, 94, .12); color: #ff8a95; border-color: rgba(255, 77, 94, .32); }
   .hidden { display: none !important; }
   .muted { color: var(--muted); font-size: 13px; }
-  .np { background: var(--bg2); border-radius: 16px; overflow: hidden; margin-top: 14px; }
-  .np .art { aspect-ratio: 16/9; background: #000 center/cover no-repeat; }
+
+  .conn-banner {
+    display: flex; align-items: center; gap: 9px; padding: 10px 13px; margin: 4px 0 10px;
+    border-radius: 12px; font-size: 13px; font-weight: 600;
+    background: rgba(255, 181, 71, .12); border: 1px solid rgba(255, 181, 71, .35); color: #ffe0a8;
+  }
+  .conn-banner.offline { background: rgba(255, 77, 94, .14); border-color: rgba(255, 77, 94, .42); color: #ffb3ba; }
+  .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .conn-banner.offline .conn-dot { background: var(--live); }
+
+  .np { background: var(--bg2); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; margin-top: 8px; }
+  .np .art { aspect-ratio: 16/9; background: #050608 center/cover no-repeat; position: relative; }
+  .np .np-badges { position: absolute; top: 10px; left: 10px; display: flex; gap: 6px; }
+  .np .np-badge { padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: .05em; background: rgba(0,0,0,.78); border: 1px solid rgba(255,255,255,.18); }
+  .np .np-badge.live { color: #ff7a86; border-color: rgba(255,77,94,.5); }
+  .np .np-badge.pro { color: var(--accent); border-color: rgba(255,181,71,.5); }
   .np .info { padding: 12px 14px 4px; }
-  .np b { display: block; font-size: 17px; } .np small { color: var(--muted); }
+  .np b { display: block; font-size: 17px; line-height: 1.25; }
+  .np small { color: var(--muted); display: block; margin-top: 2px; }
   .seek { padding: 6px 14px 12px; }
-  input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 30px; touch-action: none; }
   .times { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .ctl { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 10px; margin: 14px 0; }
-  .ctl button { height: 64px; font-size: 22px; }
-  .ctl .pp { font-size: 28px; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
-  .row button { flex: 1 1 30%; font-size: 14px; }
-  .skip { width: 100%; height: 54px; font-weight: 700; margin-top: 4px; }
-  select { width: 100%; background: var(--bg3); color: var(--fg); border: 0; border-radius: 12px; padding: 12px; font: inherit; }
-  .pad { display: grid; grid-template-columns: repeat(3, 72px); grid-template-rows: repeat(3, 64px); gap: 8px; justify-content: center; margin: 14px 0; }
-  .pad button { font-size: 22px; }
-  .pad .ok { background: var(--accent); color: var(--accent-ink); font-weight: 800; font-size: 16px; border-radius: 50%; }
-  .tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: rgba(0,0,0,.96); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); backdrop-filter: blur(10px); }
-  .tabs button { flex: 1; background: none; border-radius: 0; padding: 14px 0; color: var(--muted); font-weight: 600; }
-  .tabs button.on { color: var(--fg); box-shadow: inset 0 2px 0 var(--accent); }
+
+  .ctl { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 10px; margin: 12px 0; }
+  .ctl button { height: 62px; font-size: 20px; font-weight: 700; }
+  .ctl .pp { font-size: 26px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 9px 0; }
+  .row button { flex: 1 1 30%; font-size: 13.5px; padding: 11px 10px; }
+  .skip-wrap { display: flex; gap: 8px; margin-top: 8px; }
+  .skip { flex: 1; height: 48px; font-weight: 800; }
+  select { width: 100%; background: var(--bg3); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 12px; font: inherit; }
+
+  .vol-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; padding: 8px 12px; border-radius: 12px; background: var(--bg2); border: 1px solid var(--line); }
+  .vol-row span { font-size: 13px; color: var(--muted); min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .pad { display: grid; grid-template-columns: repeat(3, 74px); grid-template-rows: repeat(3, 62px); gap: 8px; justify-content: center; margin: 12px 0; }
+  .pad button { font-size: 20px; }
+  .pad .ok { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 800; font-size: 15px; border-radius: 50%; }
+
+  .tabs {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; display: flex;
+    background: rgba(0, 0, 0, .94); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom); backdrop-filter: blur(12px);
+  }
+  .tabs button { flex: 1; background: none; border: 0; border-radius: 0; padding: 14px 0; color: var(--muted); font-weight: 700; font-size: 14px; }
+  .tabs button.on { color: var(--accent); box-shadow: inset 0 2px 0 var(--accent); }
+
   .list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-  .item { background: var(--bg2); border-radius: 12px; overflow: hidden; text-align: left; padding: 0; }
-  .item .img { aspect-ratio: 16/9; background: #000 center/cover no-repeat; position: relative; }
+  .item { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; text-align: left; padding: 0; }
+  .item .img { aspect-ratio: 16/9; background: #07080a center/cover no-repeat; position: relative; }
   .item .bar { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); }
-  .item .t { padding: 8px 10px 10px; font-size: 13px; }
-  .item .t small { display: block; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item .t { padding: 8px 10px 10px; font-size: 13px; font-weight: 600; }
+  .item .t small { display: block; color: var(--muted); font-size: 11.5px; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
   .poster .img { aspect-ratio: 2/3; }
-  input[type=search], input.code { width: 100%; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 14px; font: inherit; font-size: 16px; }
+
+  input[type=search], input.code { width: 100%; background: var(--bg2); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; font: inherit; font-size: 16px; outline: none; }
+  input[type=search]:focus, input.code:focus { border-color: var(--accent); }
   input.code { font-size: 30px; text-align: center; letter-spacing: .3em; font-weight: 800; }
-  .pair { margin-top: 18vh; text-align: center; }
+  .pair { margin-top: 15vh; text-align: center; }
   .pair button { width: 100%; margin-top: 12px; height: 54px; }
-  .err { color: #ff8a8a; min-height: 20px; margin-top: 8px; }
-  .offline { background: var(--bg2); border-radius: 14px; padding: 16px; margin-top: 14px; }
-  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 18px 0 10px; }
+  .err { color: #ff8a95; min-height: 20px; margin-top: 8px; font-size: 13.5px; }
+  .offline { background: var(--bg2); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-top: 10px; }
+
+  .foot-actions { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; justify-content: center; }
+  .foot-actions button { width: 100%; font-size: 13.5px; color: var(--muted); background: var(--bg2); }
+
+  /* Episode picker bottom sheet */
+  .sheet-bg {
+    position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, .82);
+    backdrop-filter: blur(6px); display: flex; align-items: flex-end; justify-content: center;
+  }
+  .sheet {
+    width: 100%; max-width: 520px; max-height: 82dvh; background: var(--bg2);
+    border-top: 1px solid var(--line); border-radius: 20px 20px 0 0;
+    display: flex; flex-direction: column; overflow: hidden; padding-bottom: env(safe-area-inset-bottom);
+  }
+  .sheet-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .sheet-head b { flex: 1; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sheet-head button { padding: 7px 12px; font-size: 13px; }
+  .sheet-ctl { display: flex; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .sheet-ctl select { flex: 1; padding: 9px 12px; }
+  .sheet-body { flex: 1; overflow-y: auto; padding: 10px 14px 18px; display: flex; flex-direction: column; gap: 8px; }
+  .ep-row {
+    width: 100%; display: flex; align-items: center; gap: 11px; text-align: left;
+    padding: 10px 12px; border-radius: 11px; background: var(--bg3); border: 1px solid transparent;
+  }
+  .ep-row .en { min-width: 28px; font-weight: 800; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .ep-row .ei { flex: 1; min-width: 0; }
+  .ep-row .ei b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ep-row .ei small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .ep-bar { height: 3px; border-radius: 3px; background: rgba(255,255,255,.12); margin-top: 5px; overflow: hidden; }
+  .ep-bar i { display: block; height: 100%; background: var(--accent); }
 </style>
 </head>
 <body>
+<div id="connBanner" class="conn-banner hidden"><span class="conn-dot"></span><span id="connText"></span></div>
+
 <section id="pairView" class="pair hidden">
   <h1>Pair this phone</h1>
   <p class="muted">On the PC, open <b>Settings → Phone remote</b> and type the 6-digit code shown there.</p>
-  <input class="code" id="code" inputmode="numeric" maxlength="7" autocomplete="one-time-code" placeholder="000000">
+  <input class="code" id="code" inputmode="numeric" maxlength="7" autocomplete="one-time-code" placeholder="000000" aria-label="6-digit pairing code">
   <button class="primary" id="pairBtn">Pair</button>
   <div class="err" id="pairErr"></div>
 </section>
 
 <section id="remoteView" class="hidden">
-  <div id="idle" class="offline"><b>Nothing playing</b><div class="muted" id="idleMsg">Pick something from Continue or Search, or move around the TV with the pad below.</div></div>
+  <div id="idle" class="offline">
+    <b>Nothing playing</b>
+    <div class="muted" id="idleMsg">Pick something from Continue or Search, or navigate the TV with the pad below.</div>
+  </div>
+
   <div id="np" class="np hidden">
-    <div class="art" id="art"></div>
+    <div class="art" id="art">
+      <div class="np-badges">
+        <span class="np-badge live hidden" id="badgeLive">● LIVE</span>
+        <span class="np-badge pro hidden" id="badgePro">PRO · MPV</span>
+      </div>
+    </div>
     <div class="info"><b id="title"></b><small id="sub"></small></div>
-    <div class="seek" id="seekBox"><input type="range" id="seek" min="0" max="1000" value="0"><div class="times"><span id="tPos">0:00</span><span id="tDur">0:00</span></div></div>
+    <div class="seek" id="seekBox">
+      <input type="range" id="seek" min="0" max="1000" value="0" aria-label="Seek position">
+      <div class="times"><span id="tPos">0:00</span><span id="tDur">0:00</span></div>
+    </div>
   </div>
-  <button class="skip primary hidden" id="skip"></button>
-  <div class="ctl" id="ctl"><button data-c="seek" data-v="-10">⟲ 10</button><button class="pp primary" data-c="toggle" id="pp">▶</button><button data-c="seek" data-v="10">10 ⟳</button></div>
-  <div class="row" id="row2">
-    <button data-c="subs" id="subsBtn">Subtitles</button><button data-c="audio" id="audBtn" class="hidden">Audio</button><button data-c="next" id="nextBtn">Next ep</button><button data-c="last" id="lastBtn" class="hidden">Last ch</button><button data-c="mute" id="muteBtn">Mute</button>
-    <button data-c="full">Fullscreen</button><button data-c="close">Stop</button>
+
+  <div class="skip-wrap hidden" id="skipWrap">
+    <button class="skip primary hidden" id="skip"></button>
+    <button class="skip hidden" id="undoSkip">⟲ Undo skip</button>
   </div>
-  <div class="row"><span class="muted" style="align-self:center">Volume</span><input type="range" id="vol" min="0" max="100" value="100" style="flex:1"></div>
-  <div id="audBox" class="hidden"><h2>Audio</h2><select id="aud"></select></div>
-  <div id="srcBox" class="hidden"><h2 id="srcLabel">Version</h2><select id="src"></select></div>
-  <h2>Navigate</h2>
+
+  <div class="ctl hidden" id="ctl">
+    <button data-c="seek" data-v="-10" aria-label="Back 10 seconds">⟲ 10</button>
+    <button class="pp primary" data-c="toggle" id="pp" aria-label="Play or pause">▶</button>
+    <button data-c="seek" data-v="10" aria-label="Forward 10 seconds">10 ⟳</button>
+  </div>
+
+  <div class="row hidden" id="rowLive">
+    <button data-k="PageUp" id="chPrevBtn">Ch −</button>
+    <button data-c="last" id="lastBtn">⇄ Last ch</button>
+    <button data-k="PageDown" id="chNextBtn">Ch +</button>
+  </div>
+
+  <div class="row hidden" id="row2">
+    <button data-c="subs" id="subsBtn">Subtitles</button>
+    <button data-c="audio" id="audBtn" class="hidden">Audio</button>
+    <button data-k="v" id="nightBtn">Voice</button>
+    <button data-k="p" id="proBtn">Pro Player</button>
+    <button data-c="next" id="nextBtn" class="hidden">Next ep</button>
+    <button data-c="mute" id="muteBtn">Mute</button>
+    <button data-c="full">Fullscreen</button>
+    <button data-c="close" class="danger-btn">Stop</button>
+  </div>
+
+  <div class="vol-row hidden" id="volRow">
+    <span style="text-align:left;min-width:auto">Vol</span>
+    <input type="range" id="vol" min="0" max="100" value="100" style="flex:1" aria-label="Volume">
+    <span id="volPct">100%</span>
+  </div>
+
+  <div id="audBox" class="hidden"><h2>Audio track</h2><select id="aud" aria-label="Audio track"></select></div>
+  <div id="srcBox" class="hidden"><h2 id="srcLabel">Version</h2><select id="src" aria-label="Version or feed"></select></div>
+
+  <h2>Navigate TV</h2>
   <div class="pad">
-    <span></span><button data-k="ArrowUp">▲</button><span></span>
-    <button data-k="ArrowLeft">◀</button><button class="ok" data-k="Enter">OK</button><button data-k="ArrowRight">▶</button>
-    <span></span><button data-k="ArrowDown">▼</button><span></span>
+    <span></span><button data-k="ArrowUp" aria-label="Up">▲</button><span></span>
+    <button data-k="ArrowLeft" aria-label="Left">◀</button><button class="ok" data-k="Enter">OK</button><button data-k="ArrowRight" aria-label="Right">▶</button>
+    <span></span><button data-k="ArrowDown" aria-label="Down">▼</button><span></span>
   </div>
-  <div class="row"><button data-k="Back">Back</button><button data-c="tvmode">TV mode</button></div>
+  <div class="row">
+    <button data-k="Back">Back</button>
+    <button data-c="tvmode" id="tvModeBtn">TV mode</button>
+  </div>
+
+  <div class="foot-actions">
+    <button id="unpairBtn" type="button">Unpair / Forget TV</button>
+  </div>
 </section>
 
 <section id="contView" class="hidden">
@@ -94,102 +222,464 @@
 </section>
 
 <section id="searchView" class="hidden">
-  <h1>Search</h1>
-  <input type="search" id="q" placeholder="Movies, shows and live channels" autocomplete="off">
+  <h1>Search TV</h1>
+  <input type="search" id="q" placeholder="Movies, shows and live channels" autocomplete="off" aria-label="Search library">
+  <div id="searchMsg" class="muted" style="margin-top:10px"></div>
   <h2 id="hl" class="hidden">Live channels</h2><div class="list" id="rl"></div>
   <h2 id="hm" class="hidden">Movies</h2><div class="list" id="rm"></div>
   <h2 id="hs" class="hidden">Shows</h2><div class="list" id="rs"></div>
 </section>
 
-<nav class="tabs hidden" id="tabs"><button data-tab="remote" class="on">Remote</button><button data-tab="cont">Continue</button><button data-tab="search">Search</button></nav>
+<div id="epSheet" class="sheet-bg hidden">
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="Choose episode">
+    <div class="sheet-head"><b id="epTitle">Episodes</b><button type="button" id="epClose">Close</button></div>
+    <div class="sheet-ctl">
+      <select id="epSeason" aria-label="Season"></select>
+      <button type="button" class="primary" id="epResume">▶ Next Up</button>
+    </div>
+    <div class="sheet-body" id="epList"></div>
+  </div>
+</div>
+
+<nav class="tabs hidden" id="tabs">
+  <button data-tab="remote" class="on">Remote</button>
+  <button data-tab="cont">Continue</button>
+  <button data-tab="search">Search</button>
+</nav>
 
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
   let token = ''; try { token = localStorage.getItem('remoteToken') || ''; } catch {}
-  let tab = 'remote'; let st = null; let dragging = false;
+  let tab = 'remote';
+  let st = null;
+  let draggingSeek = false;
+  let draggingVol = false;
+  let sse = null;
+  let sseActive = false;
+  let sseSupported = true;
+  let sseRetryT = null;
+  let pollT = null;
+  let failCount = 0;
+  let searchCtrl = null;
+  let unpairArmT = null;
+  let unpairArmed = false;
+
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmt = (t) => { t = Math.max(0, Math.floor(t || 0)); const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60; return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0'); };
-  async function call(path, body) {
-    const r = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'x-remote': token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+
+  function setBanner(mode, msg) {
+    const b = $('#connBanner');
+    if (!mode || !msg) { b.classList.add('hidden'); b.classList.remove('offline'); return; }
+    $('#connText').textContent = msg;
+    b.classList.remove('hidden');
+    b.classList.toggle('offline', mode === 'offline');
+  }
+
+  async function call(path, body, signal) {
+    const r = await fetch(path, {
+      method: body ? 'POST' : 'GET',
+      signal,
+      headers: { 'x-remote': token, ...(body ? { 'content-type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
     if (r.status === 401) { showPair(); throw new Error('pair'); }
-    const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || 'Error'); return j;
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { const err = new Error(j.error || `HTTP ${r.status}`); err.status = r.status; throw err; }
+    return j;
   }
-  const cmd = (c, v) => { if (navigator.vibrate) navigator.vibrate(12); return call('/r/cmd', { cmd: c, v }).catch(() => {}); };
-  function showPair() { ['remoteView', 'contView', 'searchView', 'tabs'].forEach((id) => $('#' + id).classList.add('hidden')); $('#pairView').classList.remove('hidden'); }
+
+  const cmd = (c, v) => {
+    if (navigator.vibrate) navigator.vibrate(12);
+    return call('/r/cmd', { cmd: c, v }).catch((e) => {
+      if (e.message !== 'pair') setBanner('offline', 'TV Offline — command could not reach the PC');
+    });
+  };
+
+  function stopLiveSync() {
+    clearTimeout(pollT); clearTimeout(sseRetryT);
+    if (sse) { try { sse.close(); } catch {} sse = null; }
+    sseActive = false;
+  }
+
+  function showPair() {
+    stopLiveSync();
+    setBanner(null);
+    closeEpSheet();
+    ['remoteView', 'contView', 'searchView', 'tabs'].forEach((id) => $('#' + id).classList.add('hidden'));
+    $('#pairView').classList.remove('hidden');
+  }
+
   function show(t) {
-    tab = t; $('#pairView').classList.add('hidden'); $('#tabs').classList.remove('hidden');
-    $('#remoteView').classList.toggle('hidden', t !== 'remote'); $('#contView').classList.toggle('hidden', t !== 'cont'); $('#searchView').classList.toggle('hidden', t !== 'search');
+    tab = t;
+    $('#pairView').classList.add('hidden');
+    $('#tabs').classList.remove('hidden');
+    $('#remoteView').classList.toggle('hidden', t !== 'remote');
+    $('#contView').classList.toggle('hidden', t !== 'cont');
+    $('#searchView').classList.toggle('hidden', t !== 'search');
     document.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('on', b.dataset.tab === t));
-    if (t === 'cont') loadHome(); if (t === 'search') setTimeout(() => $('#q').focus(), 50);
+    if (t === 'cont') loadHome();
+    if (t === 'search') setTimeout(() => $('#q').focus(), 50);
   }
+
   $('#pairBtn').onclick = async () => {
     $('#pairErr').textContent = '';
-    try { const r = await fetch('/r/pair', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: $('#code').value.replace(/\D/g, '') }) }); const j = await r.json();
-      if (!r.ok) throw new Error(j.error || 'Pairing failed'); token = j.token; try { localStorage.setItem('remoteToken', token); } catch {} show('remote'); poll(); }
-    catch (e) { $('#pairErr').textContent = e.message; }
+    try {
+      const r = await fetch('/r/pair', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: $('#code').value.replace(/\D/g, '') }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || 'Pairing failed');
+      token = j.token;
+      try { localStorage.setItem('remoteToken', token); } catch {}
+      sseSupported = true;
+      show('remote');
+      startSync();
+    } catch (e) { $('#pairErr').textContent = e.message; }
   };
   $('#code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pairBtn').click(); });
+
+  $('#unpairBtn').onclick = () => {
+    if (!unpairArmed) {
+      unpairArmed = true;
+      $('#unpairBtn').textContent = 'Tap again to forget this TV';
+      $('#unpairBtn').classList.add('danger-btn');
+      clearTimeout(unpairArmT);
+      unpairArmT = setTimeout(() => {
+        unpairArmed = false;
+        $('#unpairBtn').textContent = 'Unpair / Forget TV';
+        $('#unpairBtn').classList.remove('danger-btn');
+      }, 4000);
+      return;
+    }
+    clearTimeout(unpairArmT);
+    unpairArmed = false;
+    $('#unpairBtn').textContent = 'Unpair / Forget TV';
+    $('#unpairBtn').classList.remove('danger-btn');
+    token = '';
+    try { localStorage.removeItem('remoteToken'); } catch {}
+    showPair();
+  };
+
   document.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => show(b.dataset.tab)));
-  document.querySelectorAll('[data-c]').forEach((b) => (b.onclick = () => cmd(b.dataset.c, b.dataset.v !== undefined ? +b.dataset.v : undefined).then(poll)));
-  document.querySelectorAll('[data-k]').forEach((b) => (b.onclick = () => cmd('key', b.dataset.k)));
-  $('#skip').onclick = () => cmd('skip').then(poll);
+  document.querySelectorAll('[data-c]').forEach((b) => (b.onclick = () => cmd(b.dataset.c, b.dataset.v !== undefined ? +b.dataset.v : undefined).then(() => { if (!sseActive) pollOnce(); })));
+  document.querySelectorAll('[data-k]').forEach((b) => (b.onclick = () => cmd('key', b.dataset.k).then(() => { if (!sseActive) setTimeout(pollOnce, 250); })));
+  $('#skip').onclick = () => cmd('skip').then(() => { if (!sseActive) pollOnce(); });
+  $('#undoSkip').onclick = () => cmd('key', 'u').then(() => { if (!sseActive) pollOnce(); });
+
+  // Seek bar with pointercancel safety
   const seek = $('#seek');
-  seek.addEventListener('input', () => { dragging = true; if (st?.dur) $('#tPos').textContent = fmt(seek.value / 1000 * st.dur); });
-  seek.addEventListener('change', () => { dragging = false; if (st?.dur) cmd('seekto', seek.value / 1000 * st.dur); });
-  $('#vol').addEventListener('change', (e) => cmd('vol', e.target.value / 100));
+  const endSeek = (commit) => {
+    if (!draggingSeek) return;
+    draggingSeek = false;
+    if (commit && st?.dur) cmd('seekto', (seek.value / 1000) * st.dur);
+  };
+  seek.addEventListener('pointerdown', () => { draggingSeek = true; });
+  seek.addEventListener('input', () => { draggingSeek = true; if (st?.dur) $('#tPos').textContent = fmt((seek.value / 1000) * st.dur); });
+  seek.addEventListener('change', () => endSeek(true));
+  seek.addEventListener('pointercancel', () => endSeek(false));
+
+  // Smooth live throttled volume drag + pointercancel safety
+  const vol = $('#vol');
+  let lastVolSent = 0; let volTimer = null;
+  const sendVol = (v, immediate) => {
+    const now = Date.now();
+    clearTimeout(volTimer);
+    if (immediate || now - lastVolSent >= 120) {
+      lastVolSent = now;
+      cmd('vol', v / 100);
+    } else {
+      volTimer = setTimeout(() => { lastVolSent = Date.now(); cmd('vol', +vol.value / 100); }, 120 - (now - lastVolSent));
+    }
+  };
+  vol.addEventListener('pointerdown', () => { draggingVol = true; });
+  vol.addEventListener('input', () => {
+    draggingVol = true;
+    $('#volPct').textContent = vol.value + '%';
+    sendVol(+vol.value, false);
+  });
+  vol.addEventListener('change', () => {
+    draggingVol = false;
+    $('#volPct').textContent = vol.value + '%';
+    sendVol(+vol.value, true);
+  });
+  vol.addEventListener('pointerup', () => { draggingVol = false; });
+  vol.addEventListener('pointercancel', () => { draggingVol = false; });
+
   $('#aud').onchange = (e) => cmd('audio', +e.target.value);
   $('#src').onchange = (e) => cmd('source', +e.target.value);
 
   function render(r) {
-    const p = r.s?.player; st = p;
-    if (!r.tv) { $('#idle').classList.remove('hidden'); $('#idleMsg').textContent = 'Phosphor isn’t open on the PC. Picking something to play will open it.'; }
-    else $('#idleMsg').textContent = 'Pick something from Continue or Search, or navigate Phosphor with the pad below.';
-    $('#idle').classList.toggle('hidden', !!p); $('#np').classList.toggle('hidden', !p);
-    ['ctl', 'row2'].forEach((id) => $('#' + id).classList.toggle('hidden', !p));
-    if (!p) { $('#skip').classList.add('hidden'); $('#srcBox').classList.add('hidden'); $('#audBox').classList.add('hidden'); return; }
-    $('#title').textContent = p.title; $('#sub').textContent = p.sub + (p.casting ? ` · on ${p.casting}` : ''); $('#art').style.backgroundImage = p.img ? `url("${p.img.replace(/"/g, '')}")` : '';
+    failCount = 0;
+    const p = r.s?.player || (r.s && (r.s.open || r.s.playing) ? r.s : null);
+    st = p;
+    const tvOpen = r.tv !== false || !!p?.pro;
+    if (!tvOpen) {
+      setBanner('warn', 'TV app isn’t open on the PC — picking something to play will wake it.');
+      $('#idleMsg').textContent = 'The TV app isn’t open on the PC. Picking something to play will open it.';
+    } else {
+      setBanner(null);
+      $('#idleMsg').textContent = 'Pick something from Continue or Search, or navigate the TV with the pad below.';
+    }
+    $('#tvModeBtn').classList.toggle('pill-on', !!r.s?.tv);
+
+    const playing = !!p;
+    $('#idle').classList.toggle('hidden', playing);
+    $('#np').classList.toggle('hidden', !playing);
+    ['ctl', 'row2', 'volRow'].forEach((id) => $('#' + id).classList.toggle('hidden', !playing));
+    $('#rowLive').classList.toggle('hidden', !playing || !p.live);
+
+    if (!playing) {
+      $('#skipWrap').classList.add('hidden');
+      $('#skip').classList.add('hidden');
+      $('#undoSkip').classList.add('hidden');
+      $('#srcBox').classList.add('hidden');
+      $('#audBox').classList.add('hidden');
+      return;
+    }
+
+    $('#title').textContent = p.title || 'Playing';
+    $('#sub').textContent = (p.sub || '') + (p.casting ? ` · on ${p.casting}` : p.pro ? ' · Pro Player (mpv)' : '');
+    $('#art').style.backgroundImage = p.img ? `url("${String(p.img).replace(/"/g, '')}")` : '';
+    $('#badgeLive').classList.toggle('hidden', !p.live);
+    $('#badgePro').classList.toggle('hidden', !p.pro);
     $('#pp').textContent = p.paused ? '▶' : '❚❚';
-    $('#seekBox').classList.toggle('hidden', p.live || !p.dur);
-    if (!dragging && p.dur) { seek.value = Math.round(p.pos / p.dur * 1000); $('#tPos').textContent = fmt(p.pos); $('#tDur').textContent = fmt(p.dur); }
-    $('#skip').classList.toggle('hidden', !p.skip); $('#skip').textContent = p.skip || '';
+
+    $('#seekBox').classList.toggle('hidden', !!p.live || !p.dur);
+    if (!draggingSeek && p.dur) {
+      seek.value = Math.round(((p.pos || 0) / p.dur) * 1000);
+      $('#tPos').textContent = fmt(p.pos || 0);
+      $('#tDur').textContent = fmt(p.dur);
+    }
+
+    const hasSkip = !!p.skip;
+    const hasUndo = !!p.undoSkip;
+    $('#skipWrap').classList.toggle('hidden', !hasSkip && !hasUndo);
+    $('#skip').classList.toggle('hidden', !hasSkip);
+    if (hasSkip) $('#skip').textContent = p.skip;
+    $('#undoSkip').classList.toggle('hidden', !hasUndo);
+
     $('#nextBtn').classList.toggle('hidden', !p.next);
-    $('#lastBtn').classList.toggle('hidden', !p.live);
-    $('#subsBtn').classList.toggle('hidden', !p.hasSubs); $('#subsBtn').textContent = p.subs ? 'Subtitles: on' : 'Subtitles: off';
+    const hasSubs = p.hasSubs !== undefined ? !!p.hasSubs : !!p.pro;
+    $('#subsBtn').classList.toggle('hidden', !hasSubs || !!p.live);
+    $('#subsBtn').textContent = p.subs ? 'Subs: ON' : 'Subs: off';
+    $('#subsBtn').classList.toggle('pill-on', !!p.subs);
+    $('#nightBtn').classList.toggle('pill-on', !!p.night);
+    $('#proBtn').classList.toggle('pill-on', !!p.pro);
+    $('#proBtn').textContent = p.pro ? 'Pro: ON' : 'Pro Player';
+
     const manyAud = (p.audios || []).length > 1;
-    $('#audBtn').classList.toggle('hidden', !manyAud);
+    $('#audBtn').classList.toggle('hidden', !manyAud && !p.pro);
     $('#audBox').classList.toggle('hidden', !manyAud);
     if (manyAud && document.activeElement !== $('#aud')) {
       $('#aud').innerHTML = p.audios.map((a) => `<option value="${a.i}">${esc(a.label)}</option>`).join('');
       $('#aud').value = p.audio ?? 0;
     }
+
     $('#muteBtn').textContent = p.muted ? 'Unmute' : 'Mute';
-    if (document.activeElement !== $('#vol')) $('#vol').value = Math.round((p.vol ?? 1) * 100);
-    const many = (p.sources || []).length > 1; $('#srcBox').classList.toggle('hidden', !many);
+    $('#muteBtn').classList.toggle('pill-on', !!p.muted);
+    if (!draggingVol && document.activeElement !== vol) {
+      const vp = Math.round((p.muted ? 0 : (p.vol ?? 1)) * 100);
+      vol.value = vp;
+      $('#volPct').textContent = vp + '%';
+    }
+
+    const manySrc = (p.sources || []).length > 1;
+    $('#srcBox').classList.toggle('hidden', !manySrc);
     $('#srcLabel').textContent = p.live ? 'Backup feed' : 'Version';
-    if (many && document.activeElement !== $('#src')) { $('#src').innerHTML = p.sources.map((s) => `<option value="${s.id}">${esc(s.label)}</option>`).join(''); $('#src').value = p.src; }
+    if (manySrc && document.activeElement !== $('#src')) {
+      $('#src').innerHTML = p.sources.map((s) => `<option value="${s.id}">${esc(s.label)}</option>`).join('');
+      $('#src').value = p.src;
+    }
   }
-  let pollT;
-  async function poll() { clearTimeout(pollT); if (tab === 'remote' && !document.hidden) { try { render(await call('/r/state')); } catch (e) { if (e.message === 'pair') return; } } pollT = setTimeout(poll, 1000); }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 
-  const card = (x, poster) => `<button class="item ${poster ? 'poster' : ''}" data-k="${x.k}" data-id="${x.id}" data-sid="${x.sid ?? ''}"><div class="img" style="background-image:url('${esc((x.img || '').replace(/'/g, ''))}')">${x.pct ? `<div class="bar" style="width:${Math.round(x.pct * 100)}%"></div>` : ''}</div><div class="t">${esc(x.title)}${x.sub || x.year ? `<small>${esc(x.sub || x.year)}</small>` : ''}</div></button>`;
-  function wirePlay(root) { root.querySelectorAll('.item').forEach((b) => (b.onclick = async () => { await call('/r/play', { k: b.dataset.k, id: +b.dataset.id, sid: b.dataset.sid ? +b.dataset.sid : null }).catch(() => {}); show('remote'); poll(); })); }
+  async function pollOnce() {
+    if (!token || document.hidden) return;
+    try {
+      render(await call('/r/state'));
+    } catch (e) {
+      if (e.message === 'pair') return;
+      failCount++;
+      setBanner('offline', failCount >= 2 ? 'TV Offline — check that the PC is awake & on the same Wi-Fi' : 'Reconnecting to TV…');
+    }
+  }
+
+  function schedulePoll() {
+    clearTimeout(pollT);
+    if (!token || sseActive) return;
+    pollT = setTimeout(async () => {
+      if (!sseActive && !document.hidden) await pollOnce();
+      schedulePoll();
+    }, 2000);
+  }
+
+  function connectSse() {
+    if (!token || !sseSupported || typeof EventSource === 'undefined') {
+      pollOnce();
+      schedulePoll();
+      return;
+    }
+    if (sse) { try { sse.close(); } catch {} sse = null; }
+    let opened = false;
+    try {
+      sse = new EventSource('/r/events?token=' + encodeURIComponent(token));
+    } catch {
+      sseSupported = false;
+      pollOnce(); schedulePoll();
+      return;
+    }
+    sse.onopen = () => {
+      opened = true;
+      sseActive = true;
+      failCount = 0;
+      clearTimeout(pollT);
+      setBanner(null);
+    };
+    sse.onmessage = (ev) => {
+      try { render(JSON.parse(ev.data)); } catch {}
+    };
+    sse.onerror = async () => {
+      const wasOpen = opened;
+      if (sse) { try { sse.close(); } catch {} sse = null; }
+      sseActive = false;
+      if (!wasOpen) {
+        // Check if /r/events is 404 (not yet supported) or 401 (unpaired) vs network down
+        try {
+          const probe = await fetch('/r/state', { headers: { 'x-remote': token } });
+          if (probe.status === 401) { showPair(); return; }
+          if (probe.ok) {
+            sseSupported = false; // Server is online but /r/events isn't available yet -> 2s polling
+            render(await probe.json());
+            schedulePoll();
+            return;
+          }
+        } catch {}
+      }
+      setBanner('offline', 'Reconnecting to TV…');
+      pollOnce();
+      schedulePoll();
+      clearTimeout(sseRetryT);
+      if (sseSupported && token) sseRetryT = setTimeout(() => { if (!document.hidden && !sseActive) connectSse(); }, 8000);
+    };
+  }
+
+  function startSync() {
+    stopLiveSync();
+    pollOnce();
+    connectSse();
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && token) {
+      if (!sseActive) startSync();
+      else pollOnce();
+    }
+  });
+  window.addEventListener('online', () => { if (token) startSync(); });
+  window.addEventListener('offline', () => { if (token) setBanner('offline', 'Phone is offline — waiting for Wi-Fi…'); });
+
+  // Episode picker modal for Series
+  function closeEpSheet() { $('#epSheet').classList.add('hidden'); $('#epList').innerHTML = ''; }
+  $('#epClose').onclick = closeEpSheet;
+  $('#epSheet').onclick = (e) => { if (e.target === $('#epSheet')) closeEpSheet(); };
+
+  async function openSeriesPicker(id, title) {
+    try {
+      const d = await call(`/r/series/${encodeURIComponent(id)}`);
+      if (!d || !Array.isArray(d.seasons) || !d.seasons.length) throw new Error('fallback');
+      $('#epTitle').textContent = d.title || title || 'Series';
+      $('#epSeason').innerHTML = d.seasons.map((s) => `<option value="${s.n}">${esc(s.name || `Season ${s.n}`)}</option>`).join('');
+      const startSn = d.nextUp?.season ?? d.seasons[0].n;
+      $('#epSeason').value = String(startSn);
+      const drawSeason = (sn) => {
+        const s = d.seasons.find((x) => String(x.n) === String(sn)) || d.seasons[0];
+        $('#epList').innerHTML = (s.episodes || []).map((e) => `<button type="button" class="ep-row" data-eid="${e.id}">
+          <span class="en">E${e.n}</span>
+          <span class="ei"><b>${esc(e.title || `Episode ${e.n}`)}</b>${e.duration ? `<small>${Math.round(e.duration / 60)}m</small>` : ''}
+          ${e.progress > 0.02 ? `<div class="ep-bar"><i style="width:${Math.min(100, Math.round(e.progress * 100))}%"></i></div>` : ''}</span>
+        </button>`).join('') || '<p class="muted">No episodes in this season.</p>';
+        document.querySelectorAll('[data-eid]').forEach((b) => (b.onclick = async () => {
+          closeEpSheet();
+          await call('/r/play', { k: 'e', id: +b.dataset.eid, sid: +id }).catch(() => {});
+          show('remote'); pollOnce();
+        }));
+      };
+      $('#epSeason').onchange = (e) => drawSeason(e.target.value);
+      $('#epResume').onclick = async () => {
+        closeEpSheet();
+        await call('/r/play', { k: 's', id: +id }).catch(() => {});
+        show('remote'); pollOnce();
+      };
+      drawSeason(startSn);
+      $('#epSheet').classList.remove('hidden');
+    } catch (e) {
+      if (e.message === 'pair') return;
+      // Graceful fallback when /r/series/:id isn't available yet: play/resume show directly
+      await call('/r/play', { k: 's', id: +id }).catch(() => {});
+      show('remote'); pollOnce();
+    }
+  }
+
+  const card = (x, poster) => `<button class="item ${poster ? 'poster' : ''}" data-k="${x.k}" data-id="${x.id}" data-sid="${x.sid ?? ''}" data-title="${esc(x.title || '')}"><div class="img" style="background-image:url('${esc((x.img || '').replace(/'/g, ''))}')">${x.pct ? `<div class="bar" style="width:${Math.min(100, Math.round(x.pct * 100))}%"></div>` : ''}</div><div class="t">${esc(x.title)}${x.sub || x.year ? `<small>${esc(x.sub || x.year)}</small>` : ''}</div></button>`;
+  function wirePlay(root) {
+    root.querySelectorAll('.item').forEach((b) => (b.onclick = async () => {
+      if (navigator.vibrate) navigator.vibrate(12);
+      if (b.dataset.k === 's') return openSeriesPicker(+b.dataset.id, b.dataset.title);
+      await call('/r/play', { k: b.dataset.k, id: +b.dataset.id, sid: b.dataset.sid ? +b.dataset.sid : null }).catch(() => {});
+      show('remote'); pollOnce();
+    }));
+  }
+
   async function loadHome() {
-    try { const h = await call('/r/home'); $('#cont').innerHTML = h.cont.length ? h.cont.map((x) => card(x)).join('') : '<p class="muted">Nothing in progress.</p>';
-      const favs = h.favs || []; $('#hf').classList.toggle('hidden', !favs.length); $('#favs').innerHTML = favs.map((x) => card(x)).join('');
-      $('#mine').innerHTML = h.list.length ? h.list.map((x) => card(x, true)).join('') : '<p class="muted">Your list is empty.</p>'; wirePlay($('#contView')); } catch {}
+    try {
+      const h = await call('/r/home');
+      $('#cont').innerHTML = (h.cont || []).length ? h.cont.map((x) => card(x)).join('') : '<p class="muted">Nothing in progress.</p>';
+      const favs = h.favs || [];
+      $('#hf').classList.toggle('hidden', !favs.length);
+      $('#favs').innerHTML = favs.map((x) => card(x)).join('');
+      $('#mine').innerHTML = (h.list || []).length ? h.list.map((x) => card(x, true)).join('') : '<p class="muted">Your list is empty.</p>';
+      wirePlay($('#contView'));
+    } catch (e) {
+      if (e.message !== 'pair') $('#cont').innerHTML = '<p class="muted">Could not reach TV right now.</p>';
+    }
   }
-  let qt; $('#q').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(async () => {
-    const q = $('#q').value.trim(); if (q.length < 2) { $('#rm').innerHTML = $('#rs').innerHTML = $('#rl').innerHTML = ''; $('#hm').classList.add('hidden'); $('#hs').classList.add('hidden'); $('#hl').classList.add('hidden'); return; }
-    try { const r = await call('/r/search?q=' + encodeURIComponent(q));
-      const lv = r.live || [];
-      $('#rl').innerHTML = lv.map((x) => card(x)).join('');
-      $('#rm').innerHTML = r.movies.map((x) => card(x, true)).join(''); $('#rs').innerHTML = r.series.map((x) => card(x, true)).join('');
-      $('#hl').classList.toggle('hidden', !lv.length); $('#hm').classList.toggle('hidden', !r.movies.length); $('#hs').classList.toggle('hidden', !r.series.length); wirePlay($('#searchView')); } catch {}
-  }, 300); });
 
-  if (!token) showPair(); else { show('remote'); poll(); }
+  let qt;
+  $('#q').addEventListener('input', () => {
+    clearTimeout(qt);
+    const q = $('#q').value.trim();
+    if (searchCtrl) { try { searchCtrl.abort(); } catch {} searchCtrl = null; }
+    if (q.length < 2) {
+      $('#searchMsg').textContent = '';
+      $('#rm').innerHTML = $('#rs').innerHTML = $('#rl').innerHTML = '';
+      $('#hm').classList.add('hidden'); $('#hs').classList.add('hidden'); $('#hl').classList.add('hidden');
+      return;
+    }
+    $('#searchMsg').textContent = 'Searching…';
+    qt = setTimeout(async () => {
+      const ctrl = new AbortController();
+      searchCtrl = ctrl;
+      try {
+        const r = await call('/r/search?q=' + encodeURIComponent(q), null, ctrl.signal);
+        if (searchCtrl !== ctrl) return;
+        const lv = r.live || [];
+        const mv = r.movies || [];
+        const sr = r.series || [];
+        $('#rl').innerHTML = lv.map((x) => card(x)).join('');
+        $('#rm').innerHTML = mv.map((x) => card(x, true)).join('');
+        $('#rs').innerHTML = sr.map((x) => card(x, true)).join('');
+        $('#hl').classList.toggle('hidden', !lv.length);
+        $('#hm').classList.toggle('hidden', !mv.length);
+        $('#hs').classList.toggle('hidden', !sr.length);
+        $('#searchMsg').textContent = (lv.length + mv.length + sr.length) ? '' : 'No matches found.';
+        wirePlay($('#searchView'));
+      } catch (e) {
+        if (e.name === 'AbortError' || e.message === 'pair') return;
+        $('#searchMsg').textContent = 'Search failed — check PC connection.';
+      }
+    }, 240);
+  });
+
+  if (!token) showPair();
+  else { show('remote'); startSync(); }
 })();
 </script>
 </body>

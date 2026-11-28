@@ -55,12 +55,27 @@ pub struct App {
 impl App {
     pub fn catalog(&self) -> Arc<Catalog> { self.cat.read().unwrap().clone() }
     pub fn ready(&self) -> bool { self.catalog().loaded_at > 0 }
+    pub fn port(&self) -> u16 {
+        std::env::var("TV_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or_else(|| self.cfg.get("port").as_u64().unwrap_or(7878) as u16)
+    }
+    pub fn clear_sports_cache(&self) {
+        crate::sports::clear_events_cache(self);
+        self.net_idx.lock().unwrap().clear();
+    }
     pub fn meta_get(&self, mt: &str, id: &str) -> Option<Meta> { self.meta.read().unwrap().get(&format!("{mt}:{id}")).cloned() }
     pub fn meta_of(&self, it: &Item) -> Option<Meta> { it.tmdb.as_ref().and_then(|t| self.meta_get(if it.k == "s" { "tv" } else { "movie" }, t)).filter(|m| !m.missing) }
-    pub fn save_meta(&self) {
+    pub fn save_meta_blocking(&self) {
         let body = { serde_json::to_vec(&*self.meta.read().unwrap()).unwrap() };
-        let f = self.data.join("meta.json"); let tmp = f.with_extension("json.tmp");
-        if std::fs::write(&tmp, body).is_ok() { let _ = std::fs::rename(&tmp, &f); }
+        let f = self.data.join("meta.json");
+        if let Err(e) = crate::store::atomic_write(&f, &body) {
+            eprintln!("[meta] failed to save {}: {e}", f.display());
+        }
+    }
+    pub fn save_meta(&self) {
+        self.save_meta_blocking();
     }
 
     /// Card JSON for a catalogue item, optionally enriched with a TMDB result object.

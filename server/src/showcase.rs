@@ -185,7 +185,7 @@ pub fn is_hdr_tag(raw_name: &str, raw_cat: &str) -> bool {
     }
     let name = fold_superscripts(raw_name);
     !name.is_empty()
-        && crate::re!(r"(?i)(?:[\(\[]\s*hdr10\+?\s*[\)\]]|\bhdr10\+?\b|^[A-Z0-9+]+-[A-Z]{2}-HDR\s*-)")
+        && crate::re!(r"(?i)(?:[\(\[]\s*hdr(?:10\+?)?\s*[\)\]]|\bhdr10\+?\b|\b(?:4k|uhd|2160p?|3840p?)\s*hdr\b|\bhlg\b|^[A-Z0-9+]+-[A-Z]{2}-HDR\s*-)")
             .is_match(&name)
 }
 
@@ -329,6 +329,19 @@ struct ItemQuality {
     probe: ProbeSummary,
 }
 
+fn resolve_source_tier(tag_tier: QualityTier, is_bluray: bool, probe: Option<&ProbeSummary>) -> (QualityTier, bool) {
+    if let Some(ps) = probe {
+        if ps.w > 0 || ps.h > 0 {
+            let tier = match ps.tier {
+                Some(pt) => pt,
+                None => if is_bluray { QualityTier::Bluray } else { QualityTier::Hd },
+            };
+            return (tier, tier == QualityTier::Dv4k);
+        }
+    }
+    (tag_tier, tag_tier == QualityTier::Dv4k)
+}
+
 fn assess_quality(app: &App, it: &Item, check_probes: bool) -> ItemQuality {
     let cam_only = is_cam_only_item(it);
     if cam_only {
@@ -342,61 +355,54 @@ fn assess_quality(app: &App, it: &Item, check_probes: bool) -> ItemQuality {
         };
     }
 
-    let mut best = flag_tier(it.cam, it.uhd, it.hdr, it.dv, it.bluray);
-    let mut is_dv = !it.cam && it.dv;
-    let mut is_bluray = !it.cam && it.bluray;
-    let mut has_dolby_audio = !it.cam && it.dolby_audio;
+    let probe_enabled = check_probes && it.k == "m" && app.stream.probe_count() > 0;
+    let mut best = QualityTier::Hd;
+    let mut any_source = false;
+    let mut is_dv = false;
+    let mut is_bluray = false;
+    let mut has_dolby_audio = false;
+    let mut best_probe = ProbeSummary::default();
 
-    for v in &it.variants {
-        if v.cam {
-            continue;
+    let mut eval_source = |sid: i64, uhd: bool, hdr: bool, dv: bool, bluray: bool, dolby_audio: bool| {
+        let tag_tier = flag_tier(false, uhd, hdr, dv, bluray);
+        let ps_opt = if probe_enabled {
+            app.stream.quality_of(sid).map(|pic| probe_to_summary(&pic))
+        } else {
+            None
+        };
+        let (eff_tier, eff_dv) = resolve_source_tier(tag_tier, bluray, ps_opt.as_ref());
+        if !any_source || eff_tier > best {
+            best = eff_tier;
+            any_source = true;
         }
-        let vt = flag_tier(false, v.uhd, v.hdr, v.dv, v.bluray);
-        if vt > best {
-            best = vt;
-        }
-        if v.dv {
+        if eff_dv {
             is_dv = true;
         }
-        if v.bluray {
+        if bluray {
             is_bluray = true;
         }
-        if v.dolby_audio {
+        if dolby_audio {
             has_dolby_audio = true;
         }
-    }
-
-    let mut best_probe = ProbeSummary::default();
-    if check_probes && it.k == "m" && app.stream.probe_count() > 0 {
-        let mut consider_probe = |sid: i64| {
-            if let Some(pic) = app.stream.quality_of(sid) {
-                let ps = probe_to_summary(&pic);
-                if let Some(pt) = ps.tier {
-                    if pt > best {
-                        best = pt;
-                    }
-                    if pt == QualityTier::Dv4k {
-                        is_dv = true;
-                    }
-                }
-                let better = match (ps.tier, best_probe.tier) {
-                    (Some(a), Some(b)) if a != b => a > b,
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    _ => ps.kbps.unwrap_or(0) > best_probe.kbps.unwrap_or(0),
-                };
-                if better || (best_probe.kbps.is_none() && ps.kbps.is_some()) {
-                    best_probe = ps;
-                }
+        if let Some(ps) = ps_opt {
+            let better = match (ps.tier, best_probe.tier) {
+                (Some(a), Some(b)) if a != b => a > b,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                _ => ps.kbps.unwrap_or(0) > best_probe.kbps.unwrap_or(0),
+            };
+            if better || (best_probe.w == 0 && ps.w > 0) || (best_probe.kbps.is_none() && ps.kbps.is_some()) {
+                best_probe = ps;
             }
-        };
-        if !it.cam {
-            consider_probe(it.id);
         }
-        for v in &it.variants {
-            if !v.cam {
-                consider_probe(v.id);
-            }
+    };
+
+    if !it.cam {
+        eval_source(it.id, it.uhd, it.hdr, it.dv, it.bluray, it.dolby_audio);
+    }
+    for v in &it.variants {
+        if !v.cam {
+            eval_source(v.id, v.uhd, v.hdr, v.dv, v.bluray, v.dolby_audio);
         }
     }
 
@@ -410,39 +416,10 @@ fn assess_quality(app: &App, it: &Item, check_probes: bool) -> ItemQuality {
     }
 }
 
-/// Best available quality tier across an item, all its variants, and cached stream probes.
+/// Best available quality tier across an item, all its variants, and cached stream probes
+/// (downgrading fake-4K streams when ffprobe reports <4K, and upgrading unlabelled 4K/HDR/DV streams).
 pub fn best_tier(app: &App, it: &Item) -> QualityTier {
-    if is_cam_only_item(it) {
-        return QualityTier::Cam;
-    }
-    let mut best = flag_tier(it.cam, it.uhd, it.hdr, it.dv, it.bluray);
-    for v in &it.variants {
-        if !v.cam {
-            best = best.max(flag_tier(false, v.uhd, v.hdr, v.dv, v.bluray));
-        }
-    }
-    if best < QualityTier::Dv4k && it.k == "m" && app.stream.probe_count() > 0 {
-        if !it.cam {
-            if let Some(pic) = app.stream.quality_of(it.id) {
-                if let Some(pt) = probe_to_summary(&pic).tier {
-                    best = best.max(pt);
-                }
-            }
-        }
-        for v in &it.variants {
-            if best == QualityTier::Dv4k {
-                break;
-            }
-            if !v.cam {
-                if let Some(pic) = app.stream.quality_of(v.id) {
-                    if let Some(pt) = probe_to_summary(&pic).tier {
-                        best = best.max(pt);
-                    }
-                }
-            }
-        }
-    }
-    best
+    assess_quality(app, it, true).tier
 }
 
 // ---------------------------------------------------------------------------
@@ -700,13 +677,26 @@ fn push_row(rows: &mut Vec<Value>, id: &str, title: &str, sub: Option<&str>, ite
 /// GET /api/showcase: CAM-free 4K / Dolby Vision / HDR / Blu-Ray OLED Showcase hub.
 pub fn hub(app: &App) -> Value {
     let (showcase, dolby_hd, cam_only) = build_pool(app);
+    let cat = app.catalog();
     let hide = hidden_ratings(app);
+    let hide_p = crate::discover::hide_prefs(app);
+    let standup = crate::discover::standup_kw(app);
     let cy = current_year();
+
+    let hidden_pref = |e: &ShowcaseEntry| -> bool {
+        if hide_p.is_empty() { return false; }
+        let kind = if e.item.k == "s" { "series" } else { "movie" };
+        let cname = cat.cat_name(kind, &e.item.cat);
+        match &e.meta {
+            Some(m) => crate::discover::hidden_by(&hide_p, &m.g, &m.l, &cname, &m.kw, &standup),
+            None => crate::discover::hidden_by(&hide_p, &[], "", &cname, &[], &standup),
+        }
+    };
 
     let visible: Vec<usize> = showcase
         .iter()
         .enumerate()
-        .filter(|(_, e)| !e.hidden(&hide))
+        .filter(|(_, e)| !e.hidden(&hide) && !hidden_pref(e))
         .map(|(i, _)| i)
         .collect();
 
@@ -1031,7 +1021,7 @@ pub fn hub(app: &App) -> Value {
         }
     }
     for e in &dolby_hd {
-        if !e.hidden(&hide) && e.qual.has_dolby_audio {
+        if !e.hidden(&hide) && !hidden_pref(e) && e.qual.has_dolby_audio {
             br_cands.push((e.showcase_score(cy) + 0.6, e));
         }
     }
@@ -1081,7 +1071,7 @@ pub fn hub(app: &App) -> Value {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default()
         });
-        let mut cam_sorted: Vec<&ShowcaseEntry> = cam_only.iter().filter(|e| !e.hidden(&hide)).collect();
+        let mut cam_sorted: Vec<&ShowcaseEntry> = cam_only.iter().filter(|e| !e.hidden(&hide) && !hidden_pref(e)).collect();
         cam_sorted.sort_by(|a, b| {
             b.year()
                 .cmp(&a.year())
@@ -1306,12 +1296,44 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
         .clamp(1, 120);
 
     let seen = if unwatched { Some(watched_set(app)) } else { None };
+    let disliked = hidden_ratings(app);
+    let mut hide_p = crate::discover::hide_prefs(app);
+    if matches!(kind.as_str(), "docs" | "doc" | "documentary") || req_genres.iter().any(|g| g == "99" || g.eq_ignore_ascii_case("documentary")) {
+        hide_p.retain(|h| h != "docs");
+    }
+    if req_genres.iter().any(|g| g == "27" || g.eq_ignore_ascii_case("horror")) {
+        hide_p.retain(|h| h != "horror");
+    }
+    if req_genres.iter().any(|g| g == "16" || g.eq_ignore_ascii_case("animation")) {
+        hide_p.retain(|h| h != "anime");
+    }
+    if req_genres.iter().any(|g| g == "10762" || g.eq_ignore_ascii_case("kids")) {
+        hide_p.retain(|h| h != "kids");
+    }
+    if req_genres.iter().any(|g| g == "10764" || g.eq_ignore_ascii_case("reality")) {
+        hide_p.retain(|h| h != "reality");
+    }
+    let standup = crate::discover::standup_kw(app);
     let (showcase, dolby_hd, cam_only) = build_pool(app);
     let cat = app.catalog();
     let cy = current_year();
 
     // Base attribute filter (everything except tier, kind, platform — used to compute sibling facet counts)
     let pass_common = |e: &ShowcaseEntry| -> bool {
+        if e.hidden(&disliked) {
+            return false;
+        }
+        if !hide_p.is_empty() {
+            let ck = if e.item.k == "s" { "series" } else { "movie" };
+            let cname = cat.cat_name(ck, &e.item.cat);
+            let blocked = match &e.meta {
+                Some(m) => crate::discover::hidden_by(&hide_p, &m.g, &m.l, &cname, &m.kw, &standup),
+                None => crate::discover::hidden_by(&hide_p, &[], "", &cname, &[], &standup),
+            };
+            if blocked {
+                return false;
+            }
+        }
         if !matches_genre_filter(e, &req_genres) {
             return false;
         }
@@ -1543,12 +1565,14 @@ fn track_key(it: &Item) -> String {
 /// Notable upgrade transitions:
 /// - `Cam -> >=Hd` (clean release dropped!)
 /// - `Hd / Bluray -> >=Uhd4k` (true 4K / 4K HDR / 4K DV upgrade dropped!)
+/// - `Uhd4k -> Dv4k` (SDR 4K upgraded to 4K Dolby Vision!)
 fn is_notable_upgrade(from: QualityTier, to: QualityTier) -> bool {
     if to <= from {
         return false;
     }
     (from == QualityTier::Cam && to >= QualityTier::Hd)
         || (matches!(from, QualityTier::Hd | QualityTier::Bluray) && to >= QualityTier::Uhd4k)
+        || (from == QualityTier::Uhd4k && to == QualityTier::Dv4k)
 }
 
 fn upgrade_alert_copy(title: &str, from: QualityTier, to: QualityTier) -> (String, String) {
@@ -2045,7 +2069,17 @@ mod tests {
         assert_eq!(probe_to_summary(&sdr4k_pic).tier, Some(QualityTier::Uhd4k));
 
         let hd_pic = json!({ "w": 1920, "h": 1080, "hdr": "", "dv": null, "kbps": 5000.0, "codec": "h264" });
-        assert_eq!(probe_to_summary(&hd_pic).tier, None);
+        let hd = probe_to_summary(&hd_pic);
+        assert_eq!(hd.tier, None);
+
+        // Probe results can DOWNGRADE fake-4K / fake-DV streams, preserve 1080p Blu-Ray, and upgrade real 4K!
+        assert_eq!(resolve_source_tier(QualityTier::Uhd4k, false, Some(&hd)), (QualityTier::Hd, false));
+        assert_eq!(resolve_source_tier(QualityTier::Dv4k, false, Some(&hd)), (QualityTier::Hd, false));
+        let sdr4k = probe_to_summary(&sdr4k_pic);
+        assert_eq!(resolve_source_tier(QualityTier::Dv4k, false, Some(&sdr4k)), (QualityTier::Uhd4k, false));
+        assert_eq!(resolve_source_tier(QualityTier::Bluray, true, Some(&hd)), (QualityTier::Bluray, false));
+        assert_eq!(resolve_source_tier(QualityTier::Hd, false, Some(&hdr)), (QualityTier::Hdr4k, false));
+        assert_eq!(resolve_source_tier(QualityTier::Hd, false, Some(&dv)), (QualityTier::Dv4k, true));
     }
 
     #[test]
@@ -2055,6 +2089,7 @@ mod tests {
         assert!(is_notable_upgrade(QualityTier::Hd, QualityTier::Uhd4k));
         assert!(is_notable_upgrade(QualityTier::Hd, QualityTier::Dv4k));
         assert!(is_notable_upgrade(QualityTier::Bluray, QualityTier::Hdr4k));
+        assert!(is_notable_upgrade(QualityTier::Uhd4k, QualityTier::Dv4k));
         // Same, lower, or non-notable transitions must NOT trigger
         assert!(!is_notable_upgrade(QualityTier::Hd, QualityTier::Hd));
         assert!(!is_notable_upgrade(QualityTier::Dv4k, QualityTier::Hd));

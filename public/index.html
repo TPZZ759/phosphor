@@ -6,14 +6,15 @@
   <title>Phosphor</title>
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
-  <link rel="stylesheet" href="app.css?v=17">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" media="print" onload="this.media='all'">
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"></noscript>
+  <link rel="stylesheet" href="app.css?v=18">
 </head>
 <body>
   <header id="nav">
-    <a class="brand" href="#/home" aria-label="Phosphor Home">
-      <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="7" width="26" height="18" rx="4" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M13 12.5v7l6-3.5z" fill="currentColor"/><circle cx="24" cy="11.2" r="1.3" fill="currentColor"/></svg>
-      <span>Phosphor</span>
+    <a class="brand" href="#/home" aria-label="Home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="7" width="26" height="18" rx="4" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M13 12.5v7l6-3.5z" fill="currentColor"/></svg>
     </a>
     <nav class="tabs">
       <a href="#/home" data-tab="home">Home</a>
@@ -43,6 +44,7 @@
       <label class="search" id="searchBox">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M20 20l-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <input id="searchInput" type="search" placeholder="Titles, topics, people, channels" autocomplete="off" aria-label="Search">
+        <kbd class="search-kbd" title="Command Palette (Ctrl+K)" aria-hidden="true">Ctrl K</kbd>
       </label>
       <button class="icon-btn dice" data-surprise="" title="Pick for me (Watch-Night Concierge)" aria-label="Pick for me">🎲</button>
       <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Settings">
@@ -54,9 +56,10 @@
   <main id="view" tabindex="-1"></main>
 
   <div id="modal" class="modal" hidden></div>
+  <div id="cmdk" class="cmdk" hidden></div>
   <div id="player" class="player" hidden></div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="app.js?v=33"></script>
+  <script src="app.js?v=34"></script>
 </body>
 </html>

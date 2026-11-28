@@ -8,6 +8,10 @@ use crate::util::{norm, s, tmdb_img};
 use chrono::{Datelike, NaiveDate};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+
+type FightsCacheKey = (usize, i64, usize, usize, Option<(usize, usize)>);
+static FIGHTS_CACHE: OnceLock<Mutex<Option<(FightsCacheKey, Arc<Vec<CanonicalFight>>)>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct FightEntry {
@@ -301,7 +305,7 @@ fn clean_fighter_piece(raw: &str) -> String {
 }
 
 fn parse_vs_matchup(body: &str) -> Option<(String, Vec<String>)> {
-    let sep = re!(r"(?i)\s+(?:vs\.?|v\.)\s+");
+    let sep = re!(r"(?i)\s+(?:vs\.?|v\.?)\s+");
     let m = sep.find(body)?;
     let left = clean_fighter_piece(&body[..m.start()]);
     let right_raw = clean_fighter_piece(&body[m.end()..]);
@@ -364,15 +368,16 @@ fn compute_sort_ts(
     added: i64,
 ) -> i64 {
     let prelim_adj = if is_prelims { -3600 } else { 0 };
+    // Prefer real calendar dates whenever available (over synthetic PPV/FN date formulas).
+    if let Some(ts) = date_ts {
+        return ts + prelim_adj;
+    }
     if sport_key == "ufc" && event_kind == "ppv" {
         if let Some(n) = event_num {
             // Anchor UFC 300 = 2024-04-13 (1713009600), ~28 days per PPV -> strictly monotonic in PPV number
-            // and aligned to real Unix time so PPVs interleave naturally with Fight Nights & other sports.
+            // when no explicit calendar date is present.
             return 1_713_009_600i64 + (n as i64 - 300) * 2_419_200i64 + prelim_adj;
         }
-    }
-    if let Some(ts) = date_ts {
-        return ts + prelim_adj;
     }
     if sport_key == "ufc" && event_kind == "fn" {
         if let Some(n) = event_num {
@@ -576,23 +581,37 @@ fn fighter_canon_key(name: &str) -> String {
     let n = norm(name);
     let n = n.strip_prefix("the ").unwrap_or(&n);
     // Preserve known multi-word surnames & monikers intact.
-    if re!(r"^(della maddalena|du plessis|de ridder|dos anjos|saint denis|bueno silva|machado garry|korean zombie|kara france|rountree jr|rosas jr|van \w+|da silva|de oliveira|de andrade|del valle|o malley|roy jones jr)$")
+    if re!(r"^(della maddalena|du plessis|de ridder|dos anjos|dos santos|saint denis|st pierre|st preux|bueno silva|machado garry|korean zombie|kara france|rountree jr|rosas jr|van \w+|da silva|de oliveira|de andrade|del valle|o malley|roy jones jr)$")
         .is_match(n)
     {
         return n.to_string();
     }
-    // Strip trailing "jr"/"sr" when counting tokens, handle "Sean O'Malley" -> "o malley",
-    // "Aljamain Sterling" -> "sterling", "Cory Sandhagen" -> "sandhagen".
-    if let Some(m) = re!(r"\b(della maddalena|du plessis|de ridder|dos anjos|saint denis|bueno silva|machado garry|korean zombie|kara france|o malley)$").find(n) {
+    if let Some(m) = re!(r"\b(della maddalena|du plessis|de ridder|dos anjos|dos santos|saint denis|st pierre|st preux|bueno silva|machado garry|korean zombie|kara france|o malley|da silva|de oliveira|de andrade|del valle)$").find(n) {
         return m.as_str().to_string();
     }
-    let toks: Vec<&str> = n.split_whitespace().collect();
-    if toks.len() == 2 && !matches!(toks[1], "jr" | "sr") {
-        // Two-word full name in UFC (e.g. "Aljamain Sterling", "Umar Nurmagomedov") -> surname.
-        toks[1].to_string()
+    let stripped = re!(r"\s+(?:jr|sr|ii|iii|iv)$").replace(n, "").trim().to_string();
+    let base = if stripped.is_empty() { n } else { stripped.as_str() };
+    let toks: Vec<&str> = base.split_whitespace().collect();
+    if toks.len() >= 2 {
+        // Multi-word full name (e.g. "Tyson Fury", "Oleksandr Usyk", "Aljamain Sterling") -> surname.
+        toks[toks.len() - 1].to_string()
     } else {
-        n.to_string()
+        base.to_string()
     }
+}
+
+fn rematch_tag(matchup: &str) -> String {
+    re!(r"\s+([2-9]|II|III|IV)\s*$")
+        .captures(matchup)
+        .map(|c| {
+            match c[1].to_ascii_uppercase().as_str() {
+                "II" => ":2".into(),
+                "III" => ":3".into(),
+                "IV" => ":4".into(),
+                other => format!(":{other}"),
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn dedup_keys(id: i64, e: &FightEntry) -> (String, Option<String>) {
@@ -621,9 +640,10 @@ fn dedup_keys(id: i64, e: &FightEntry) -> (String, Option<String>) {
         return (format!("ufc:sp:{}:{}", norm(&e.clean_title), e.year.unwrap_or(0)), None);
     }
     if e.sport_key == "boxing" && e.fighters.len() == 2 {
-        let mut pair = [norm(&e.fighters[0]), norm(&e.fighters[1])];
+        let mut pair = [fighter_canon_key(&e.fighters[0]), fighter_canon_key(&e.fighters[1])];
         pair.sort();
-        return (format!("boxing:{}|{}:{}", pair[0], pair[1], e.year.unwrap_or(0)), None);
+        let rm = rematch_tag(&e.matchup);
+        return (format!("boxing:{}|{}:{}{rm}", pair[0], pair[1], e.year.unwrap_or(0)), None);
     }
     // Single-category sports (WWE weekly episodes, MLB doubleheaders, etc.) keep unique stream IDs.
     (format!("id:{id}"), None)
@@ -646,8 +666,43 @@ fn norm_poster(url: &str) -> String {
     url.replace("/t/p/w600_and_h900_bestv2/", "/t/p/w342/")
 }
 
-/// Collect, classify, and deduplicate all fight & sports VOD streams in the catalog.
+/// Collect, classify, and deduplicate all fight & sports VOD streams in the catalog,
+/// memoized by catalog pointer/loaded_at/count (and meta pointer/len) for instant repeat reads.
+pub fn collect_fights_cached(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Arc<Vec<CanonicalFight>> {
+    let cache_key: Option<FightsCacheKey> = if cat.loaded_at > 0 {
+        Some((
+            cat as *const Catalog as usize,
+            cat.loaded_at,
+            cat.movie_raw.len(),
+            cat.cats.len(),
+            meta.map(|m| (m as *const HashMap<String, Meta> as usize, m.len())),
+        ))
+    } else {
+        None
+    };
+
+    if let Some(key) = cache_key {
+        let cell = FIGHTS_CACHE.get_or_init(|| Mutex::new(None));
+        if let Some((k, v)) = cell.lock().unwrap().as_ref() {
+            if *k == key {
+                return v.clone();
+            }
+        }
+    }
+
+    let computed = Arc::new(collect_fights_uncached(cat, meta));
+    if let Some(key) = cache_key {
+        let cell = FIGHTS_CACHE.get_or_init(|| Mutex::new(None));
+        *cell.lock().unwrap() = Some((key, computed.clone()));
+    }
+    computed
+}
+
 pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Vec<CanonicalFight> {
+    (*collect_fights_cached(cat, meta)).clone()
+}
+
+fn collect_fights_uncached(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Vec<CanonicalFight> {
     let mut raw: Vec<(&Item, String, FightEntry)> = Vec::new();
     for it in cat.movie_raw.values() {
         if it.k != "m" {
@@ -659,10 +714,16 @@ pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Ve
         }
     }
 
-    // Sort descending by source priority so the best copy is always elected primary first.
+    // Sort descending by quality & source priority so the best clean/4K copy is always elected primary
+    // (matching the displayed `uhd` badge) and CAM copies never outrank clean rips.
     raw.sort_by(|a, b| {
+        let ra = source_rank(&a.1);
+        let rb = source_rank(&b.1);
         let ka = (
-            source_rank(&a.1),
+            !a.0.cam,
+            !a.0.cam && a.0.uhd && ra >= 2,
+            ra,
+            a.0.uhd,
             !a.0.poster.is_empty(),
             a.0.tmdb.is_some(),
             a.2.event_num.is_some(),
@@ -671,7 +732,10 @@ pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Ve
             a.0.id,
         );
         let kb = (
-            source_rank(&b.1),
+            !b.0.cam,
+            !b.0.cam && b.0.uhd && rb >= 2,
+            rb,
+            b.0.uhd,
             !b.0.poster.is_empty(),
             b.0.tmdb.is_some(),
             b.2.event_num.is_some(),
@@ -687,10 +751,37 @@ pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Ve
 
     for (it, cat_name, entry) in raw {
         let (k1, k2) = dedup_keys(it.id, &entry);
-        let existing_idx = key_map
+        let mut existing_idx = key_map
             .get(&k1)
             .copied()
             .or_else(|| k2.as_ref().and_then(|k| key_map.get(k).copied()));
+
+        // Year-boundary Fight Night fallback: Dec 2025 fight uploaded in Jan 2026 shares fighters
+        // within ±1 year and ±60 days.
+        if existing_idx.is_none()
+            && entry.sport_key == "ufc"
+            && entry.event_kind == "fn"
+            && entry.fighters.len() == 2
+        {
+            if let Some(yr) = entry.year {
+                let mut pair = [fighter_canon_key(&entry.fighters[0]), fighter_canon_key(&entry.fighters[1])];
+                pair.sort();
+                let prelim = if entry.is_prelims { ":prelim" } else { "" };
+                for adj_yr in [yr - 1, yr + 1] {
+                    let probe = format!("ufc:fn:{}|{}:{adj_yr}{prelim}", pair[0], pair[1]);
+                    if let Some(&idx) = key_map.get(&probe) {
+                        let ex = &out[idx];
+                        let both_full = ex.entry.date_str.as_deref().map_or(false, |d| d.len() == 10)
+                            && entry.date_str.as_deref().map_or(false, |d| d.len() == 10);
+                        let close_enough = !both_full || (ex.entry.sort_ts - entry.sort_ts).abs() <= 60 * 86_400;
+                        if close_enough {
+                            existing_idx = Some(idx);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(idx) = existing_idx {
             let cf = &mut out[idx];
@@ -717,7 +808,7 @@ pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Ve
             if cf.backdrop.is_empty() && !it.backdrop.is_empty() {
                 cf.backdrop = it.backdrop.clone();
             }
-            cf.uhd = cf.uhd || it.uhd;
+            // Keep `cf.uhd` faithful to the elected primary stream (clean EN 4K copies already win primary above).
             cf.added = cf.added.max(it.added);
 
             // Upgrade date_str if the alternate carries an exact YYYY-MM-DD calendar date.
@@ -728,10 +819,8 @@ pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Ve
                     if cf.entry.year.is_none() {
                         cf.entry.year = entry.year;
                     }
-                    if cf.entry.event_kind != "ppv" {
-                        if let Some(ts) = parse_iso_date_ts(alt_d) {
-                            cf.entry.sort_ts = ts - if cf.entry.is_prelims { 3600 } else { 0 };
-                        }
+                    if let Some(ts) = parse_iso_date_ts(alt_d) {
+                        cf.entry.sort_ts = ts - if cf.entry.is_prelims { 3600 } else { 0 };
                     }
                 }
             }
@@ -799,9 +888,7 @@ pub fn collect_fights(cat: &Catalog, meta: Option<&HashMap<String, Meta>>) -> Ve
                         if cf.entry.year.is_none() {
                             cf.entry.year = m.d.get(0..4).and_then(|y| y.parse().ok());
                         }
-                        if cf.entry.event_kind != "ppv" {
-                            cf.entry.sort_ts = ts - if cf.entry.is_prelims { 3600 } else { 0 };
-                        }
+                        cf.entry.sort_ts = ts - if cf.entry.is_prelims { 3600 } else { 0 };
                     }
                 }
             }
@@ -1051,7 +1138,7 @@ pub fn hub(app: &App) -> Value {
     let cat = app.catalog();
     let pool = {
         let meta = app.meta.read().unwrap();
-        collect_fights(&cat, Some(&meta))
+        collect_fights_cached(&cat, Some(&meta))
     };
     let snap = snapshot_state(app);
 
@@ -1061,7 +1148,7 @@ pub fn hub(app: &App) -> Value {
     let top_fighters = top_fighters_list(&ufc_refs, 24);
 
     let mut year_set: HashSet<i32> = HashSet::new();
-    for cf in &pool {
+    for cf in pool.iter() {
         if let Some(y) = cf.entry.year {
             if (1980..=2100).contains(&y) {
                 year_set.insert(y);
@@ -1343,7 +1430,7 @@ pub fn browse(app: &App, q: &HashMap<String, String>) -> Value {
     let cat = app.catalog();
     let pool = {
         let meta = app.meta.read().unwrap();
-        collect_fights(&cat, Some(&meta))
+        collect_fights_cached(&cat, Some(&meta))
     };
     let snap = snapshot_state(app);
 
@@ -1456,6 +1543,19 @@ fn ufc_seen_key(cf: &CanonicalFight) -> String {
                 return format!("{}:{n}{prelim}", cf.entry.fn_sub);
             }
         }
+        if cf.entry.fighters.len() == 2 {
+            let mut pair = [
+                fighter_canon_key(&cf.entry.fighters[0]),
+                fighter_canon_key(&cf.entry.fighters[1]),
+            ];
+            pair.sort();
+            let yr = cf.entry.year.unwrap_or(0);
+            return format!("fn:{}|{}:{yr}{prelim}", pair[0], pair[1]);
+        }
+    }
+    let nt = norm(&cf.entry.clean_title);
+    if !nt.is_empty() {
+        return format!("sp:{nt}:{}{prelim}", cf.entry.year.unwrap_or(0));
     }
     format!("id:{}", cf.id)
 }
@@ -1464,14 +1564,15 @@ fn ufc_seen_key(cf: &CanonicalFight) -> String {
 /// First run seeds silently and returns an empty Vec (zero notification spam).
 pub fn check_new_ufc(app: &App) -> Vec<Value> {
     let cat = app.catalog();
-    let mut ufc_events: Vec<CanonicalFight> = collect_fights(&cat, None)
-        .into_iter()
+    let all = collect_fights_cached(&cat, None);
+    let mut ufc_events: Vec<&CanonicalFight> = all
+        .iter()
         .filter(|cf| cf.entry.sport_key == "ufc")
         .collect();
     if ufc_events.is_empty() {
         return vec![];
     }
-    ufc_events.sort_by(cmp_latest);
+    ufc_events.sort_by(|a, b| cmp_latest(a, b));
 
     let mut fresh: Vec<Value> = Vec::new();
     let changed = app.state.with(|st| {
@@ -1481,7 +1582,7 @@ pub fn check_new_ufc(app: &App) -> Vec<Value> {
             .unwrap_or_default();
 
         if existing.is_empty() {
-            let mut keys: Vec<String> = ufc_events.iter().map(ufc_seen_key).collect();
+            let mut keys: Vec<String> = ufc_events.iter().map(|cf| ufc_seen_key(cf)).collect();
             keys.sort();
             keys.dedup();
             st["seenUfc"] = json!(keys);
@@ -1492,15 +1593,18 @@ pub fn check_new_ufc(app: &App) -> Vec<Value> {
         let mut added_any = false;
         for cf in &ufc_events {
             let key = ufc_seen_key(cf);
+            let legacy_seen = cf.all_ids.iter().any(|aid| seen.contains(&format!("id:{aid}")));
             if seen.insert(key) {
                 added_any = true;
-                fresh.push(json!({
-                    "id": cf.id,
-                    "title": cf.entry.clean_title,
-                    "matchup": cf.entry.matchup,
-                    "eventNum": cf.entry.event_num,
-                    "eventKind": cf.entry.event_kind
-                }));
+                if !legacy_seen {
+                    fresh.push(json!({
+                        "id": cf.id,
+                        "title": cf.entry.clean_title,
+                        "matchup": cf.entry.matchup,
+                        "eventNum": cf.entry.event_num,
+                        "eventKind": cf.entry.event_kind
+                    }));
+                }
             }
         }
         if added_any {

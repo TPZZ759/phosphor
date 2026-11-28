@@ -3,18 +3,18 @@
 // MMA UFC scoreboard API cached locally). Never touches the IPTV provider.
 use crate::app::App;
 use crate::catalog::Item;
-use crate::fights::{collect_fights, parse_fight, CanonicalFight};
+use crate::fights::{collect_fights_cached, parse_fight, CanonicalFight};
 use crate::rec::{hidden_ratings, sp};
 use crate::showcase::{best_tier, is_cam_only, recent_upgrades, QualityTier};
 use crate::tmdb::{NO, TTL_H};
 use crate::util::{norm, now_ms, s, tmdb_img};
-use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, Days, Local, NaiveDate, NaiveDateTime, Utc};
 use chrono_tz::Australia::Sydney;
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -38,8 +38,8 @@ fn io_lock() -> &'static Mutex<()> {
 // Date, timezone & atomic JSON cache helpers
 // ---------------------------------------------------------------------------
 
-fn sydney_today() -> NaiveDate {
-    Utc::now().with_timezone(&Sydney).date_naive()
+fn local_today() -> NaiveDate {
+    Local::now().date_naive()
 }
 
 fn parse_iso_date(date_str: &str) -> Option<NaiveDate> {
@@ -81,17 +81,16 @@ fn format_sydney_date_time(dt_utc: DateTime<Utc>) -> (String, String, String, Na
     (date_display, date_iso, time_display, syd.date_naive())
 }
 
+fn format_local_date_time(dt_utc: DateTime<Utc>) -> (String, String, String, NaiveDate) {
+    let loc = dt_utc.with_timezone(&Local);
+    let date_display = loc.format("%a, %-d %b %Y").to_string();
+    let date_iso = loc.format("%Y-%m-%d").to_string();
+    let time_display = loc.format("%-I:%M %p").to_string();
+    (date_display, date_iso, time_display, loc.date_naive())
+}
+
 fn atomic_write_json(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp, path)?;
-    }
-    Ok(())
+    crate::store::atomic_write(path, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +300,23 @@ fn collect_tracked_shows(app: &App) -> Vec<TrackedShow> {
         }
     });
 
-    let mut list: Vec<TrackedShow> = by_tmdb.into_values().collect();
+    // Filter out known Ended / Canceled shows BEFORE truncating to MAX_TV_SHOWS so finished
+    // classics never starve active ongoing series.
+    let db = app.meta.read().unwrap();
+    let mut list: Vec<TrackedShow> = by_tmdb
+        .into_values()
+        .filter(|show| {
+            db.get(&format!("tv:{}", show.tmdb))
+                .filter(|m| !m.missing)
+                .map_or(true, |m| {
+                    !matches!(
+                        m.st.trim().to_ascii_lowercase().as_str(),
+                        "ended" | "canceled" | "cancelled"
+                    )
+                })
+        })
+        .collect();
+    drop(db);
     list.sort_by(|a, b| {
         b.activity_t
             .cmp(&a.activity_t)
@@ -391,7 +406,7 @@ pub async fn upcoming_episodes(app: Arc<App>) -> Vec<Value> {
     if shows.is_empty() {
         return vec![];
     }
-    let today = sydney_today();
+    let today = local_today();
 
     let fetched: Vec<Vec<Value>> = stream::iter(shows.into_iter().map(|show| {
         let app = app.clone();
@@ -478,12 +493,89 @@ pub(crate) fn movie_radar_status(library_state: &str, days: Option<i64>) -> Stri
     }
 }
 
+pub(crate) fn movie_radar_status_with_digital(
+    library_state: &str,
+    days: Option<i64>,
+    digital_days: Option<i64>,
+) -> String {
+    if let Some(dd) = digital_days {
+        match library_state {
+            "missing" => {
+                if dd < 0 {
+                    return "Digital released · watch for 4K".to_string();
+                } else if dd == 0 {
+                    return "Digital drop today".to_string();
+                } else if dd == 1 {
+                    return "Digital drop tomorrow".to_string();
+                } else {
+                    return format!("Digital drop in {dd}d");
+                }
+            }
+            "cam" => {
+                if dd < 0 {
+                    return "CAM only · digital out — watch for clean HD/4K".to_string();
+                } else if dd == 0 {
+                    return "CAM only · digital drops today".to_string();
+                } else if dd == 1 {
+                    return "CAM only · digital drops tomorrow".to_string();
+                } else {
+                    return format!("CAM only · digital in {dd}d");
+                }
+            }
+            _ => {}
+        }
+    }
+    movie_radar_status(library_state, days)
+}
+
+/// Extract earliest TMDB Digital (type 4) or Physical (type 5) release date (`YYYY-MM-DD`),
+/// preferring Digital (type 4) and major regions (AU/US/GB/CA).
+fn extract_digital_release_date(v: &Value) -> Option<String> {
+    let results = v["results"]
+        .as_array()
+        .or_else(|| v["release_dates"]["results"].as_array())?;
+    let mut best_dig_major: Option<String> = None;
+    let mut best_dig_any: Option<String> = None;
+    let mut best_phys_major: Option<String> = None;
+    let mut best_phys_any: Option<String> = None;
+    for region in results {
+        let cc = region["iso_3166_1"].as_str().unwrap_or("");
+        let major = matches!(cc, "AU" | "US" | "GB" | "CA");
+        for rd in region["release_dates"].as_array().into_iter().flatten() {
+            let ty = rd["type"].as_i64().unwrap_or(0);
+            if ty != 4 && ty != 5 {
+                continue;
+            }
+            let raw = rd["release_date"].as_str().unwrap_or("");
+            let Some(day) = raw.get(0..10) else { continue };
+            if parse_iso_date(day).is_none() {
+                continue;
+            }
+            let slot = match (ty, major) {
+                (4, true) => &mut best_dig_major,
+                (4, false) => &mut best_dig_any,
+                (_, true) => &mut best_phys_major,
+                (_, false) => &mut best_phys_any,
+            };
+            if slot.as_deref().map_or(true, |cur| day < cur) {
+                *slot = Some(day.to_string());
+            }
+        }
+    }
+    best_dig_major
+        .or(best_dig_any)
+        .or(best_phys_major)
+        .or(best_phys_any)
+}
+
 #[derive(Clone, Debug)]
 struct MovieCandidate {
     tmdb: String,
     title: String,
     release_date: String,
     days_until: Option<i64>,
+    digital_date: Option<String>,
+    digital_days_until: Option<i64>,
     poster: String,
     backdrop: String,
     rating: f64,
@@ -499,7 +591,7 @@ fn build_movie_json(c: &MovieCandidate) -> Value {
         .release_date
         .get(0..4)
         .and_then(|y| y.parse::<i32>().ok());
-    let status = movie_radar_status(c.library_state, c.days_until);
+    let status = movie_radar_status_with_digital(c.library_state, c.days_until, c.digital_days_until);
     json!({
         "k": "m",
         "id": c.lib_id,
@@ -508,6 +600,8 @@ fn build_movie_json(c: &MovieCandidate) -> Value {
         "year": year,
         "releaseDate": c.release_date,
         "daysUntil": c.days_until,
+        "digitalDate": c.digital_date,
+        "digitalDaysUntil": c.digital_days_until,
         "status": status,
         "libraryState": c.library_state,
         "inLibrary": c.lib_id.is_some(),
@@ -521,11 +615,11 @@ fn build_movie_json(c: &MovieCandidate) -> Value {
 
 /// Upcoming movies, Wanted watchlist, in-cinema digital drops, CAM-only watch, and HD-awaiting-4K.
 pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
-    let today = sydney_today();
+    let today = local_today();
     let hide = hidden_ratings(&app);
 
-    // Snapshot Wanted movie entries from state.json
-    let wanted_raw: Vec<(String, String, String, Option<i32>)> = app.state.read(|st| {
+    // Snapshot Wanted movie entries from state.json, sorted deterministically (newest added first).
+    let mut wanted_raw: Vec<(String, String, String, Option<i32>, i64)> = app.state.read(|st| {
         st["wanted"]
             .as_object()
             .into_iter()
@@ -539,10 +633,12 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                     .as_i64()
                     .map(|y| y as i32)
                     .or_else(|| s(&v["year"]).parse().ok());
-                Some((tmdb, s(&v["title"]), s(&v["poster"]), yr))
+                let added_t = v["t"].as_i64().unwrap_or(0);
+                Some((tmdb, s(&v["title"]), s(&v["poster"]), yr, added_t))
             })
             .collect()
     });
+    wanted_raw.sort_by(|a, b| b.4.cmp(&a.4).then_with(|| a.0.cmp(&b.0)));
     let wanted_set: HashSet<String> = wanted_raw.iter().map(|x| x.0.clone()).collect();
 
     // Fetch TMDB upcoming (AU region) + trending week concurrently (12h cache)
@@ -623,6 +719,12 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
         let overview = s(&m["overview"]);
         let popularity = m["popularity"].as_f64().unwrap_or(0.0);
 
+        let local_dd = app
+            .meta_get("movie", &tmdb)
+            .filter(|m| !m.missing && !m.dd.is_empty())
+            .map(|m| m.dd);
+        let digital_days = local_dd.as_deref().and_then(|d| days_until(d, today));
+
         by_tmdb
             .entry(tmdb.clone())
             .and_modify(|e| {
@@ -633,6 +735,10 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                 if e.release_date.is_empty() && !release_date.is_empty() {
                     e.release_date = release_date.clone();
                     e.days_until = days;
+                }
+                if e.digital_date.is_none() && local_dd.is_some() {
+                    e.digital_date = local_dd.clone();
+                    e.digital_days_until = digital_days;
                 }
                 if e.backdrop.is_empty() && !backdrop.is_empty() {
                     e.backdrop = backdrop.clone();
@@ -649,6 +755,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                 title,
                 release_date,
                 days_until: days,
+                digital_date: local_dd,
+                digital_days_until: digital_days,
                 poster,
                 backdrop,
                 rating,
@@ -668,8 +776,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
     }
 
     // Ensure every Wanted movie is included; enrich missing details via local meta or TMDB /movie/{id}.
-    let mut need_detail: Vec<(String, String, String, Option<i32>)> = Vec::new();
-    for (tmdb, title, poster, yr) in wanted_raw {
+    let mut need_detail: Vec<(String, String, String, Option<i32>, i64)> = Vec::new();
+    for (tmdb, title, poster, yr, added_t) in wanted_raw {
         if let Some(existing) = by_tmdb.get_mut(&tmdb) {
             existing.wanted = true;
             continue;
@@ -679,6 +787,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
         let meta = app.meta_get("movie", &tmdb).filter(|m| !m.missing);
         if let Some(m) = meta.filter(|m| !m.d.is_empty()) {
             let days = days_until(&m.d, today);
+            let dd = (!m.dd.is_empty()).then_some(m.dd);
+            let dd_days = dd.as_deref().and_then(|d| days_until(d, today));
             let p_url = if !m.pp.is_empty() {
                 tmdb_img(&m.pp, "w342")
             } else if !poster.is_empty() {
@@ -704,6 +814,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                     },
                     release_date: m.d,
                     days_until: days,
+                    digital_date: dd,
+                    digital_days_until: dd_days,
                     poster: p_url,
                     backdrop: b_url,
                     rating: m.va,
@@ -715,21 +827,27 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                 },
             );
         } else {
-            need_detail.push((tmdb, title, poster, yr));
+            need_detail.push((tmdb, title, poster, yr, added_t));
         }
     }
 
     if !need_detail.is_empty() {
+        // Deterministic ordering: newest-added wanted entries first, tie-broken by TMDB id.
+        need_detail.sort_by(|a, b| b.4.cmp(&a.4).then_with(|| a.0.cmp(&b.0)));
         let fetched_wanted: Vec<MovieCandidate> = stream::iter(
             need_detail
                 .into_iter()
                 .take(MAX_WANTED_ENRICH)
-                .map(|(tmdb, title, poster, yr)| {
+                .map(|(tmdb, title, poster, yr, _)| {
                     let app = app.clone();
                     async move {
                         let d = if app.tmdb.enabled() {
                             app.tmdb
-                                .get(format!("/movie/{tmdb}"), NO, 12 * TTL_H)
+                                .get(
+                                    format!("/movie/{tmdb}"),
+                                    [sp("append_to_response", "release_dates")],
+                                    12 * TTL_H,
+                                )
                                 .await
                         } else {
                             None
@@ -746,6 +864,9 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                                 yr.map(|y| format!("{y:04}-01-01")).unwrap_or_default()
                             });
                         let days = days_until(&release_date, today);
+                        let digital_date = d.as_deref().and_then(extract_digital_release_date);
+                        let digital_days_until =
+                            digital_date.as_deref().and_then(|dd| days_until(dd, today));
                         let eff_title = d
                             .as_ref()
                             .map(|v| s(&v["title"]))
@@ -787,6 +908,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                             title: eff_title,
                             release_date,
                             days_until: days,
+                            digital_date,
+                            digital_days_until,
                             poster: eff_poster,
                             backdrop: eff_backdrop,
                             rating,
@@ -833,6 +956,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
             if !recent_enough {
                 continue;
             }
+            let dd = m.filter(|m| !m.dd.is_empty()).map(|m| m.dd.clone());
+            let dd_days = dd.as_deref().and_then(|d| days_until(d, today));
             let poster = m
                 .filter(|m| !m.pp.is_empty())
                 .map(|m| tmdb_img(&m.pp, "w342"))
@@ -846,6 +971,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
                 title: it.title.clone(),
                 release_date,
                 days_until: days,
+                digital_date: dd,
+                digital_days_until: dd_days,
                 poster,
                 backdrop,
                 rating: m.map(|m| m.va).filter(|&v| v > 0.0).unwrap_or(it.rating),
@@ -888,8 +1015,8 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
         }
         match ba {
             0 => {
-                let da = a.days_until.unwrap_or(i64::MAX);
-                let db = b.days_until.unwrap_or(i64::MAX);
+                let da = a.digital_days_until.or(a.days_until).unwrap_or(i64::MAX);
+                let db = b.digital_days_until.or(b.days_until).unwrap_or(i64::MAX);
                 da.cmp(&db).then(b.popularity.total_cmp(&a.popularity))
             }
             1 => b.popularity.total_cmp(&a.popularity),
@@ -908,17 +1035,60 @@ pub async fn upcoming_movies(app: Arc<App>) -> Vec<Value> {
 
     // Always keep every wanted & CAM movie, cap total non-wanted at 48.
     let mut non_wanted_kept = 0usize;
-    let mut out: Vec<Value> = Vec::new();
-    for c in &list {
+    let mut kept: Vec<MovieCandidate> = Vec::new();
+    for c in list {
         if !c.wanted && c.library_state != "cam" {
             if non_wanted_kept >= 48 {
                 continue;
             }
             non_wanted_kept += 1;
         }
-        out.push(build_movie_json(c));
+        kept.push(c);
     }
-    out
+
+    // Backfill real TMDB Digital/Physical release dates via `/movie/{id}/release_dates` (24h cached)
+    // for top wanted / CAM / recent in-cinema candidates not yet populated in `meta.dd`.
+    if app.tmdb.enabled() {
+        let dd_targets: Vec<(usize, String)> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.digital_date.is_none()
+                    && c.library_state != "4k"
+                    && (c.wanted
+                        || c.library_state == "cam"
+                        || c.days_until.map_or(false, |d| (-120..=90).contains(&d)))
+            })
+            .take(24)
+            .map(|(ix, c)| (ix, c.tmdb.clone()))
+            .collect();
+        if !dd_targets.is_empty() {
+            let fetched_dd: Vec<(usize, Option<String>)> = stream::iter(dd_targets.into_iter().map(
+                |(ix, tmdb)| {
+                    let app = app.clone();
+                    async move {
+                        let res = app
+                            .tmdb
+                            .get(format!("/movie/{tmdb}/release_dates"), NO, 24 * TTL_H)
+                            .await;
+                        (ix, res.as_deref().and_then(extract_digital_release_date))
+                    }
+                },
+            ))
+            .buffer_unordered(TMDB_CONCURRENCY)
+            .collect()
+            .await;
+
+            for (ix, dd_opt) in fetched_dd {
+                if let Some(dd) = dd_opt {
+                    kept[ix].digital_days_until = days_until(&dd, today);
+                    kept[ix].digital_date = Some(dd);
+                }
+            }
+        }
+    }
+
+    kept.iter().map(build_movie_json).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1290,23 @@ fn format_venue(ev: &Value, comps: &[Value]) -> String {
     }
 }
 
+fn bout_explicitly_non_title(comp: &Value) -> bool {
+    let re = crate::re!(r"(?i)\bnon[- ]title\b");
+    if re.is_match(&s(&comp["type"]["text"])) || re.is_match(&s(&comp["type"]["abbreviation"])) {
+        return true;
+    }
+    for note in comp["notes"].as_array().into_iter().flatten() {
+        if re.is_match(&s(&note["headline"])) || re.is_match(&s(&note["text"])) {
+            return true;
+        }
+    }
+    false
+}
+
 fn bout_mentions_title(comp: &Value) -> bool {
+    if bout_explicitly_non_title(comp) {
+        return false;
+    }
     let re = crate::re!(r"(?i)\b(title|championship|belt|interim\s+title)\b");
     if re.is_match(&s(&comp["type"]["text"])) || re.is_match(&s(&comp["type"]["abbreviation"])) {
         return true;
@@ -1166,6 +1352,7 @@ pub(crate) fn parse_espn_ufc_event(ev: &Value) -> Option<SpoilerFreeUfcEvent> {
         sched_rounds: u8,
         explicit_card: Option<&'static str>,
         explicit_title: bool,
+        explicit_non_title: bool,
     }
 
     let mut raw_bouts: Vec<RawBout> = Vec::new();
@@ -1245,6 +1432,7 @@ pub(crate) fn parse_espn_ufc_event(ev: &Value) -> Option<SpoilerFreeUfcEvent> {
             sched_rounds,
             explicit_card,
             explicit_title: bout_mentions_title(comp),
+            explicit_non_title: bout_explicitly_non_title(comp),
         });
     }
 
@@ -1336,7 +1524,13 @@ pub(crate) fn parse_espn_ufc_event(ev: &Value) -> Option<SpoilerFreeUfcEvent> {
                 3
             };
 
-            let is_title = rb.explicit_title || (is_ppv && rounds == 5 && order <= 2);
+            // Only badge a PPV fight as a title bout when ESPN explicitly tags it as a championship
+            // fight OR it is a 5-round PPV main event (not a 5-round non-title co-main / explicit non-title).
+            let is_title = if rb.explicit_non_title {
+                false
+            } else {
+                rb.explicit_title || (is_ppv && is_main_event && rounds == 5)
+            };
 
             SpoilerFreeBout {
                 order,
@@ -1627,6 +1821,41 @@ fn write_ufc_cards_cache(path: &Path, cache: &UfcCardsCache) {
     }
 }
 
+fn merge_write_ufc_cards_cache(
+    path: &Path,
+    new_events: Vec<SpoilerFreeUfcEvent>,
+    new_windows: Vec<(String, i64)>,
+    new_years: Vec<(String, i64)>,
+    ts: i64,
+) {
+    let _g = io_lock().lock().unwrap();
+    // Re-read the latest on-disk cache inside the lock so concurrent fight_card fetches never clobber each other!
+    let mut cache: UfcCardsCache = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    for ev in new_events {
+        if !ev.id.is_empty() {
+            cache.events.insert(
+                ev.id.clone(),
+                CachedCardEvent {
+                    fetched_at: ts,
+                    event: ev,
+                },
+            );
+        }
+    }
+    for (w, t) in new_windows {
+        cache.windows.insert(w, t);
+    }
+    for (y, t) in new_years {
+        cache.years.insert(y, t);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let _ = atomic_write_json(path, &bytes);
+    }
+}
+
 fn upcoming_ufc_event_json(
     ev: &SpoilerFreeUfcEvent,
     today: NaiveDate,
@@ -1635,9 +1864,13 @@ fn upcoming_ufc_event_json(
 ) -> Value {
     let dt_utc = parse_espn_utc(&ev.date_iso).unwrap_or(now_utc);
     let (syd_date, syd_date_iso, syd_time, syd_naive) = format_sydney_date_time(dt_utc);
+    let (loc_date, loc_date_iso, loc_time, _) = format_local_date_time(dt_utc);
     let main_card_syd_time = parse_espn_utc(&ev.main_card_iso)
         .map(|mdt| format_sydney_date_time(mdt).2)
         .unwrap_or_else(|| syd_time.clone());
+    let main_card_loc_time = parse_espn_utc(&ev.main_card_iso)
+        .map(|mdt| format_local_date_time(mdt).2)
+        .unwrap_or_else(|| loc_time.clone());
     let days = syd_naive.signed_duration_since(today).num_days();
 
     let status = match ev.state.as_str() {
@@ -1665,6 +1898,10 @@ fn upcoming_ufc_event_json(
         "sydneyDateIso": syd_date_iso,
         "sydneyTime": syd_time,
         "mainCardSydneyTime": main_card_syd_time,
+        "localDate": loc_date,
+        "localDateIso": loc_date_iso,
+        "localTime": loc_time,
+        "mainCardLocalTime": main_card_loc_time,
         "daysUntil": days,
         "venue": ev.venue,
         "mainEvent": ev.main_event,
@@ -1677,30 +1914,33 @@ fn upcoming_ufc_event_json(
     })
 }
 
-/// Upcoming & recent (last 3 days -> next 75 days) spoiler-free UFC schedule in Sydney time.
+/// Upcoming & recent (last 3 days -> next 75 days) spoiler-free UFC schedule.
 pub async fn upcoming_ufc(app: Arc<App>) -> Vec<Value> {
-    let today = sydney_today();
+    let today = local_today();
     let start = today.checked_sub_days(Days::new(3)).unwrap_or(today);
     let end = today.checked_add_days(Days::new(75)).unwrap_or(today);
     let range = format!("{}-{}", start.format("%Y%m%d"), end.format("%Y%m%d"));
-    let cache_path = app.data.join("radar-ufc-cache.json");
+    let cache_path: PathBuf = app.data.join("radar-ufc-cache.json");
     let now = now_ms();
 
-    let cached = read_radar_ufc_cache(&cache_path);
+    let p_rd = cache_path.clone();
+    let cached = tokio::task::spawn_blocking(move || read_radar_ufc_cache(&p_rd))
+        .await
+        .ok()
+        .flatten();
     let events = if let Some(ref c) = cached {
         if c.range == range && now - c.fetched_at < RADAR_UFC_TTL_MS {
             c.events.clone()
         } else {
             match fetch_espn_ufc_range(&app.http, &range).await {
                 Some(fresh) => {
-                    write_radar_ufc_cache(
-                        &cache_path,
-                        &RadarUfcCache {
-                            fetched_at: now,
-                            range: range.clone(),
-                            events: fresh.clone(),
-                        },
-                    );
+                    let p_wr = cache_path.clone();
+                    let payload = RadarUfcCache {
+                        fetched_at: now,
+                        range: range.clone(),
+                        events: fresh.clone(),
+                    };
+                    let _ = tokio::task::spawn_blocking(move || write_radar_ufc_cache(&p_wr, &payload)).await;
                     fresh
                 }
                 None => c.events.clone(),
@@ -1709,14 +1949,13 @@ pub async fn upcoming_ufc(app: Arc<App>) -> Vec<Value> {
     } else {
         match fetch_espn_ufc_range(&app.http, &range).await {
             Some(fresh) => {
-                write_radar_ufc_cache(
-                    &cache_path,
-                    &RadarUfcCache {
-                        fetched_at: now,
-                        range: range.clone(),
-                        events: fresh.clone(),
-                    },
-                );
+                let p_wr = cache_path.clone();
+                let payload = RadarUfcCache {
+                    fetched_at: now,
+                    range: range.clone(),
+                    events: fresh.clone(),
+                };
+                let _ = tokio::task::spawn_blocking(move || write_radar_ufc_cache(&p_wr, &payload)).await;
                 fresh
             }
             None => vec![],
@@ -1727,13 +1966,10 @@ pub async fn upcoming_ufc(app: Arc<App>) -> Vec<Value> {
         return vec![];
     }
 
-    let replays: Vec<CanonicalFight> = {
+    let replays_arc = {
         let cat = app.catalog();
         let meta = app.meta.read().unwrap();
-        collect_fights(&cat, Some(&meta))
-            .into_iter()
-            .filter(|cf| cf.entry.sport_key == "ufc")
-            .collect()
+        collect_fights_cached(&cat, Some(&meta))
     };
 
     let now_utc = Utc::now();
@@ -1747,7 +1983,7 @@ pub async fn upcoming_ufc(app: Arc<App>) -> Vec<Value> {
     sorted
         .iter()
         .map(|ev| {
-            let replay = match_espn_to_replay(ev, &replays);
+            let replay = match_espn_to_replay(ev, &replays_arc);
             upcoming_ufc_event_json(ev, today, now_utc, replay)
         })
         .collect()
@@ -1759,10 +1995,11 @@ fn fight_card_found_json(ev: &SpoilerFreeUfcEvent) -> Value {
         .get(0..10)
         .unwrap_or(&ev.date_iso)
         .to_string();
-    let (syd_date, syd_time) = parse_espn_utc(&ev.date_iso)
+    let (syd_date, syd_time, loc_date, loc_time) = parse_espn_utc(&ev.date_iso)
         .map(|dt| {
             let (sd, _, st, _) = format_sydney_date_time(dt);
-            (sd, st)
+            let (ld, _, lt, _) = format_local_date_time(dt);
+            (sd, st, ld, lt)
         })
         .unwrap_or_default();
     let bouts: Vec<Value> = ev.bouts.iter().map(bout_to_json).collect();
@@ -1776,6 +2013,8 @@ fn fight_card_found_json(ev: &SpoilerFreeUfcEvent) -> Value {
         "dateIso": ev.date_iso,
         "sydneyDate": syd_date,
         "sydneyTime": syd_time,
+        "localDate": loc_date,
+        "localTime": loc_time,
         "venue": ev.venue,
         "spoilerFree": true,
         "bouts": bouts
@@ -1807,7 +2046,13 @@ pub async fn fight_card_for_meta(
     let cards_path = app.data.join("ufc-cards-cache.json");
     let radar_path = app.data.join("radar-ufc-cache.json");
     let now = now_ms();
-    let mut cache = read_ufc_cards_cache(&cards_path);
+    let cp_rd = cards_path.clone();
+    let rp_rd = radar_path.clone();
+    let (cache, radar_cache) = tokio::task::spawn_blocking(move || {
+        (read_ufc_cards_cache(&cp_rd), read_radar_ufc_cache(&rp_rd))
+    })
+    .await
+    .unwrap_or_default();
 
     // 1. Check fresh entries already in ufc-cards-cache.json (14-day TTL)
     let fresh_events: Vec<SpoilerFreeUfcEvent> = cache
@@ -1821,7 +2066,7 @@ pub async fn fight_card_for_meta(
     }
 
     // 2. Also check radar-ufc-cache.json for zero-latency hits on recent/upcoming events
-    if let Some(rc) = read_radar_ufc_cache(&radar_path) {
+    if let Some(rc) = radar_cache {
         if now - rc.fetched_at < FIGHT_CARD_TTL_MS {
             if let Some(ev) = match_ufc_event(&rc.events, &query) {
                 return fight_card_found_json(ev);
@@ -1829,20 +2074,10 @@ pub async fn fight_card_for_meta(
         }
     }
 
-    let mut cache_dirty = false;
-    let ingest = |cache: &mut UfcCardsCache, fetched: Vec<SpoilerFreeUfcEvent>, ts: i64| {
-        for ev in fetched {
-            if !ev.id.is_empty() {
-                cache.events.insert(
-                    ev.id.clone(),
-                    CachedCardEvent {
-                        fetched_at: ts,
-                        event: ev,
-                    },
-                );
-            }
-        }
-    };
+    let mut delta_events: Vec<SpoilerFreeUfcEvent> = Vec::new();
+    let mut delta_windows: Vec<(String, i64)> = Vec::new();
+    let mut delta_years: Vec<(String, i64)> = Vec::new();
+    let mut matched_result: Option<SpoilerFreeUfcEvent> = None;
 
     // 3. If exact YYYY-MM-DD is known, query a ±2 day window around that date.
     if let Some(d) = query.full_date {
@@ -1855,54 +2090,57 @@ pub async fn fight_card_for_meta(
             .map_or(false, |&t| now - t < FIGHT_CARD_TTL_MS);
         if !win_fresh {
             if let Some(fetched) = fetch_espn_ufc_range(&app.http, &win).await {
-                let matched = match_ufc_event(&fetched, &query).cloned();
-                ingest(&mut cache, fetched, now);
-                cache.windows.insert(win, now);
-                cache_dirty = true;
-                if let Some(ev) = matched {
-                    write_ufc_cards_cache(&cards_path, &cache);
-                    return fight_card_found_json(&ev);
-                }
+                matched_result = match_ufc_event(&fetched, &query).cloned();
+                delta_events.extend(fetched);
+                delta_windows.push((win, now));
             }
         }
     }
 
     // 4. Otherwise (or if ±2d missed due to provider date skew), query the full year in ONE call
-    //    and cache all UFC events for that year in ufc-cards-cache.json.
-    if let Some(yr) = query.year.filter(|&y| (1993..=2040).contains(&y)) {
-        let current_yr = sydney_today().year();
-        let years_to_try: Vec<i32> = if query.full_date.is_none() && yr >= 2015 {
-            vec![yr, yr - 1]
-        } else {
-            vec![yr]
-        };
-
-        for target_yr in years_to_try {
-            let ykey = target_yr.to_string();
-            let ttl = if target_yr >= current_yr {
-                CURRENT_YEAR_REFRESH_MS
+    //    and merge-cache all UFC events for that year into ufc-cards-cache.json.
+    if matched_result.is_none() {
+        if let Some(yr) = query.year.filter(|&y| (1993..=2040).contains(&y)) {
+            let current_yr = local_today().year();
+            let years_to_try: Vec<i32> = if query.full_date.is_none() && yr >= 2015 {
+                vec![yr, yr - 1]
             } else {
-                FIGHT_CARD_TTL_MS
+                vec![yr]
             };
-            let yr_fresh = cache.years.get(&ykey).map_or(false, |&t| now - t < ttl);
-            if !yr_fresh {
-                let range = format!("{target_yr}0101-{target_yr}1231");
-                if let Some(fetched) = fetch_espn_ufc_range(&app.http, &range).await {
-                    let matched = match_ufc_event(&fetched, &query).cloned();
-                    ingest(&mut cache, fetched, now);
-                    cache.years.insert(ykey, now);
-                    cache_dirty = true;
-                    if let Some(ev) = matched {
-                        write_ufc_cards_cache(&cards_path, &cache);
-                        return fight_card_found_json(&ev);
+
+            for target_yr in years_to_try {
+                let ykey = target_yr.to_string();
+                let ttl = if target_yr >= current_yr {
+                    CURRENT_YEAR_REFRESH_MS
+                } else {
+                    FIGHT_CARD_TTL_MS
+                };
+                let yr_fresh = cache.years.get(&ykey).map_or(false, |&t| now - t < ttl);
+                if !yr_fresh {
+                    let range = format!("{target_yr}0101-{target_yr}1231");
+                    if let Some(fetched) = fetch_espn_ufc_range(&app.http, &range).await {
+                        matched_result = match_ufc_event(&fetched, &query).cloned();
+                        delta_events.extend(fetched);
+                        delta_years.push((ykey, now));
+                        if matched_result.is_some() {
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
-    if cache_dirty {
-        write_ufc_cards_cache(&cards_path, &cache);
+    if !delta_events.is_empty() || !delta_windows.is_empty() || !delta_years.is_empty() {
+        let cp_wr = cards_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            merge_write_ufc_cards_cache(&cp_wr, delta_events, delta_windows, delta_years, now)
+        })
+        .await;
+    }
+
+    if let Some(ev) = matched_result {
+        return fight_card_found_json(&ev);
     }
 
     // Final fallback: check stale cached events if network was unavailable
@@ -1918,14 +2156,14 @@ pub async fn fight_card_for_meta(
     fight_card_not_found_json()
 }
 
-/// Fetch a 100% spoiler-free UFC fight card lineup for a provider fight replay stream `id`.
+/// Fetch a 100% spoiler-free UFC fight card lineup for a IPTV fight replay stream `id`.
 pub async fn fight_card(app: Arc<App>, id: i64) -> Value {
     let lookup: Option<(String, Option<u32>, Option<String>, Vec<String>)> = {
         let cat = app.catalog();
         let meta = app.meta.read().unwrap();
-        let fights_pool = collect_fights(&cat, Some(&meta));
+        let fights_pool = collect_fights_cached(&cat, Some(&meta));
         if let Some(cf) = fights_pool
-            .into_iter()
+            .iter()
             .find(|cf| cf.id == id || cf.all_ids.contains(&id))
         {
             if cf.entry.sport_key == "ufc" {
@@ -1935,10 +2173,10 @@ pub async fn fight_card(app: Arc<App>, id: i64) -> Value {
                     None
                 };
                 Some((
-                    cf.entry.clean_title,
+                    cf.entry.clean_title.clone(),
                     ppv,
-                    cf.entry.date_str,
-                    cf.entry.fighters,
+                    cf.entry.date_str.clone(),
+                    cf.entry.fighters.clone(),
                 ))
             } else {
                 None

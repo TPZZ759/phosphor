@@ -1,5 +1,5 @@
 // Personal streaming front-end for an Xtream Codes subscription — Rust server.
-mod subsync; mod fmp4; mod intro; mod skipdb; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
+mod slot; mod subsync; mod fmp4; mod intro; mod skipdb; mod remote; mod guide; mod sync; mod cast; mod epgx; mod display; mod mpv; mod spool; mod livebuf; mod anime; mod docs; mod extsubs; mod filler; mod fights; mod showcase; mod radar; mod dna; mod marathons; mod app; mod catalog; mod discover; mod extras; mod fixtures; mod meta; mod rec; mod sports; mod store; mod stream; mod tmdb; mod util; mod xc;
 pub use extras::notify;
 
 pub fn notify_all(app: &App, kind: &str, title: &str, body: &str, link: &str, action: Value) {
@@ -9,20 +9,71 @@ pub fn notify_all(app: &App, kind: &str, title: &str, body: &str, link: &str, ac
 
 use app::App;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rec::sp;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tmdb::TTL_D;
+use tokio::sync::Notify;
 use util::{now_ms, s, tmdb_img};
 
 type A = State<Arc<App>>;
 type Q = Query<HashMap<String, String>>;
+
+static SHUTDOWN: OnceLock<Arc<Notify>> = OnceLock::new();
+fn shutdown_notify() -> Arc<Notify> {
+    SHUTDOWN.get_or_init(|| Arc::new(Notify::new())).clone()
+}
+
+fn is_allowed_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    if h.is_empty() { return true; }
+    let bare = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.split(':').next().unwrap_or("")
+    };
+    matches!(bare, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    let o = origin.trim().to_ascii_lowercase();
+    if o.is_empty() { return true; }
+    let Some(rest) = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")) else {
+        return false;
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    is_allowed_host(host_port)
+}
+
+async fn localhost_guard(req: Request, next: Next) -> Response {
+    if let Some(host) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) {
+        if !is_allowed_host(host) {
+            return err(403, "forbidden host");
+        }
+    }
+    let mutating = matches!(*req.method(), Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
+    if mutating {
+        if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            if !is_allowed_origin(origin) {
+                return err(403, "cross-origin mutation blocked");
+            }
+        }
+        if let Some(sfs) = req.headers().get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+            let low = sfs.trim().to_ascii_lowercase();
+            if !low.is_empty() && low != "same-origin" && low != "none" {
+                return err(403, "cross-site mutation blocked");
+            }
+        }
+    }
+    next.run(req).await
+}
 
 fn j(v: Value) -> Response { ([(header::CACHE_CONTROL, "no-store")], Json(v)).into_response() }
 fn ja(v: Arc<Value>) -> Response { ([(header::CACHE_CONTROL, "no-store"), (header::CONTENT_TYPE, "application/json; charset=utf-8")], serde_json::to_vec(&*v).unwrap()).into_response() }
@@ -72,6 +123,7 @@ async fn main() {
 
     let api = Router::new()
         .route("/api/status", get(status)).route("/api/account", get(account)).route("/api/preflight", get(preflight))
+        .route("/api/shutdown", post(shutdown_route)).route("/api/backup", post(backup_route))
         .route("/api/settings", get(settings_get).post(settings_post)).route("/api/sync", post(sync_now))
         .route("/api/hero", get(hero)).route("/api/home", get(home)).route("/api/movies", get(movies_page)).route("/api/series", get(series_page))
         .route("/api/anime", get(anime_page)).route("/api/anime/browse", get(anime_browse)).route("/api/anime/check-dub", post(anime_check_dub)).route("/api/anime/check-series/{id}", post(anime_check_series)).route("/api/anime/dub-watch", get(anime_dub_watch_get).post(anime_dub_watch_post))
@@ -80,8 +132,14 @@ async fn main() {
         .route("/api/showcase", get(showcase_page)).route("/api/showcase/browse", get(showcase_browse)).route("/api/showcase/upgrades", get(showcase_upgrades))
         .route("/api/radar", get(radar_page))
         .route("/api/dna", get(dna_page)).route("/api/specials", get(specials_page)).route("/api/specials/browse", get(specials_browse))
-        .route("/api/marathons", get(marathons_page)).route("/api/marathons/{slug}", get(marathons_detail))
+        .route("/api/marathons", get(marathons_page)).route("/api/marathons/{slug}", get(marathons_detail)).route("/api/marathons/{slug}/order", post(marathons_set_order))
         .route("/api/extsubs/search", get(extsubs_search)).route("/api/extsubs/fetch", post(extsubs_fetch)).route("/api/extsubs/file/{name}", get(extsubs_file)).route("/api/extsubs/sync/{key}", get(extsubs_sync))
+        .route("/api/extsubs/sync-mpv", post(extsubs_sync_mpv))
+        .route("/api/extsubs/whisper", get(extsubs_whisper_get).post(extsubs_whisper_post))
+        .route("/api/extsubs/whisper/status", get(extsubs_whisper_status))
+        .route("/api/extsubs/whisper/job/{key}", get(extsubs_whisper_job))
+        .route("/api/dvr/start", post(dvr_start)).route("/api/dvr/stop", post(dvr_stop)).route("/api/dvr/status", get(dvr_status)).route("/api/dvr/list", get(dvr_list))
+        .route("/api/prespool", post(prespool_route))
         .route("/api/concierge", post(concierge_route))
         .route("/api/browse", get(browse)).route("/api/genres", get(genres)).route("/api/collection/{id}", get(collection)).route("/api/person/{id}", get(person))
         .route("/api/peek/{k}/{id}", get(peek)).route("/api/surprise", get(surprise)).route("/api/external/{mt}/{id}", get(external))
@@ -95,19 +153,57 @@ async fn main() {
         .route("/api/continue", get(continue_get)).route("/api/continue/remove", post(continue_remove)).route("/api/continue/restore", post(continue_restore)).route("/api/continue/pin", post(continue_pin)).route("/api/continue/done", post(continue_done))
         .route("/api/list", post(list)).route("/api/fav", post(fav))
         .route("/api/reminders", get(reminders_get).post(reminders_post))
-        .route("/api/probe/{kind}/{id}", get(probe)).route("/api/skips/stats", get(skips_stats)).route("/api/skips/resolve", get(skips_resolve)).route("/api/health", post(health)).route("/api/health/reset", post(health_reset)).route("/api/syshealth", get(sys_health)).route("/api/pick", post(pick)).route("/api/guide", get(guide::guide)).route("/api/tonight", get(guide::tonight)).route("/api/import/letterboxd", post(sync::letterboxd)).route("/api/import/status", get(sync::import_status)).route("/api/trakt", get(sync::trakt_info)).route("/api/trakt/connect", post(sync::trakt_connect)).route("/api/trakt/disconnect", post(sync::trakt_disconnect)).route("/api/trakt/sync", post(sync::trakt_sync)).route("/api/cast/devices", get(cast::devices)).route("/api/cast/start", post(cast::start)).route("/api/cast/control", post(cast::control)).route("/api/cast/status", get(cast::status)).route("/api/remote", get(remote::info).post(remote::set)).route("/api/remote/events", get(remote::events)).route("/api/remote/state", post(remote::tv_state)).route("/api/remote/send", post(remote::send_local)).route("/api/ep-alts/{sid}/{season}/{n}", get(ep_alts)).route("/api/display", get(display::info)).route("/api/display/match", post(display::matcher)).route("/api/display/restore", post(display::restore_route)).route("/api/mpv", get(mpv::info)).route("/api/mpv/play", post(mpv::play)).route("/api/mpv/stop", post(mpv::stop)).route("/api/mpv/control", post(mpv::control_route)).route("/api/mpv/install", post(mpv::install)).route("/stream/{kind}/{id}", get(stream_route)).route("/spool/{gen}", get(spool::serve)).route("/livebuf/{gen}", get(livebuf::serve)).route("/api/stop", post(stop)).route("/api/streamstats", get(stream_stats))
+        .route("/api/probe/{kind}/{id}", get(probe)).route("/api/skips/stats", get(skips_stats)).route("/api/skips/resolve", get(skips_resolve)).route("/api/health", post(health)).route("/api/health/reset", post(health_reset)).route("/api/syshealth", get(sys_health)).route("/api/pick", post(pick)).route("/api/guide", get(guide::guide)).route("/api/tonight", get(guide::tonight)).route("/api/import/letterboxd", post(sync::letterboxd)).route("/api/import/status", get(sync::import_status)).route("/api/trakt", get(sync::trakt_info)).route("/api/trakt/connect", post(sync::trakt_connect)).route("/api/trakt/disconnect", post(sync::trakt_disconnect)).route("/api/trakt/sync", post(sync::trakt_sync)).route("/api/cast/devices", get(cast::devices)).route("/api/cast/start", post(cast::start)).route("/api/cast/control", post(cast::control)).route("/api/cast/status", get(cast::status)).route("/api/remote", get(remote::info).post(remote::set)).route("/api/remote/device/{id}", delete(remote::revoke)).route("/api/remote/events", get(remote::events)).route("/api/remote/state", post(remote::tv_state)).route("/api/remote/send", post(remote::send_local)).route("/api/ep-alts/{sid}/{season}/{n}", get(ep_alts)).route("/api/display", get(display::info)).route("/api/display/match", post(display::matcher)).route("/api/display/restore", post(display::restore_route)).route("/api/mpv", get(mpv::info)).route("/api/mpv/play", post(mpv::play)).route("/api/mpv/stop", post(mpv::stop)).route("/api/mpv/control", post(mpv::control_route)).route("/api/mpv/install", post(mpv::install)).route("/stream/{kind}/{id}", get(stream_route)).route("/spool/{gen}", get(spool::serve)).route("/livebuf/{gen}", get(livebuf::serve)).route("/api/stop", post(stop)).route("/api/streamstats", get(stream_stats))
+        .layer(middleware::from_fn(localhost_guard))
         .with_state(app.clone());
     let static_files = tower_http::services::ServeDir::new(&app.public).fallback(tower_http::services::ServeFile::new(app.public.join("index.html")));
     // no-cache: the browser revalidates (cheap 304s), so front-end updates always load.
     let router = api.fallback_service(static_files).layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache")));
-    let port = app.cfg.get("port").as_u64().unwrap_or(7878);
-    let addr = std::env::var("TV_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(port as u16);
+    let addr = app.port();
     spool::set_port(addr);
     livebuf::set_port(addr);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", addr)).await.expect("port in use");
-    if let Ok(l6) = tokio::net::TcpListener::bind(("::1", addr)).await { let r6 = router.clone(); tokio::spawn(async move { let _ = axum::serve(l6, r6).await; }); }
+    let sd_v4 = shutdown_notify();
+    if let Ok(l6) = tokio::net::TcpListener::bind(("::1", addr)).await {
+        let r6 = router.clone();
+        let sd_v6 = shutdown_notify();
+        tokio::spawn(async move {
+            let _ = axum::serve(l6, r6).with_graceful_shutdown(async move { sd_v6.notified().await; }).await;
+        });
+    }
     println!("TV running at http://localhost:{addr}");
-    axum::serve(listener, router).await.unwrap();
+    axum::serve(listener, router).with_graceful_shutdown(async move { sd_v4.notified().await; }).await.unwrap();
+}
+
+async fn shutdown_route(State(app): A) -> Response {
+    println!("[server] graceful shutdown requested");
+    app.stream.stop("shutdown");
+    if mpv::running(&app) { let _ = mpv::stop(State(app.clone())).await; }
+    if livebuf::is_recording() { let _ = livebuf::stop_record(); }
+    spool::detach();
+    livebuf::detach();
+    slot::cancel_current();
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        a.state.flush();
+        a.tmdb.flush();
+        a.skipdb.save_if_dirty(true);
+        display::restore(&a);
+    }).await;
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        shutdown_notify().notify_waiters();
+    });
+    j(json!({ "ok": true, "shuttingDown": true }))
+}
+
+async fn backup_route(State(app): A) -> Response {
+    let a = app.clone();
+    let path = tokio::task::spawn_blocking(move || a.state.backup_now()).await.unwrap_or(None);
+    match path {
+        Some(p) => j(json!({ "ok": true, "path": p.to_string_lossy().to_string() })),
+        None => err(500, "backup failed"),
+    }
 }
 
 // ---------------------------------------------------------------- background
@@ -123,18 +219,19 @@ async fn startup(app: Arc<App>) {
 async fn after_catalog(app: Arc<App>) {
     { let a = app.clone(); tokio::task::spawn_blocking(move || sports::load_epg(&a)).await.ok(); }
     tokio::spawn(extra_guide(app.clone()));
-    *app.tri.write().unwrap() = None; app.net_idx.lock().unwrap().clear(); app.memo.expire();
+    *app.tri.write().unwrap() = None; app.net_idx.lock().unwrap().clear(); app.clear_sports_cache(); app.memo.expire();
+    let port = app.port();
     discover::check_wanted(&app);
     for ev in fights::check_new_ufc(&app) {
         let title = s(&ev["title"]);
         let body = if !s(&ev["matchup"]).is_empty() { s(&ev["matchup"]) } else { "New UFC replay available".into() };
-        notify_all(&app, "ufc", &format!("New UFC Replay: {title}"), &body, "http://localhost:7878/#/fights",
+        notify_all(&app, "ufc", &format!("New UFC Replay: {title}"), &body, &format!("http://localhost:{port}/#/fights"),
             json!({ "k": "m", "id": ev["id"], "title": title, "label": "Watch replay" }));
     }
     for u in showcase::check_upgrades(&app) {
         let title = s(&u["alertTitle"]);
         let body = s(&u["alertBody"]);
-        notify_all(&app, "upgrade", &title, &body, "http://localhost:7878/#/4k",
+        notify_all(&app, "upgrade", &title, &body, &format!("http://localhost:{port}/#/4k"),
             json!({ "k": u["k"], "id": u["id"], "title": u["title"], "label": "View title" }));
     }
     tokio::spawn(meta::build(app.clone()));
@@ -168,14 +265,14 @@ async fn prewarm(app: Arc<App>) {
 fn spawn_loops(app: Arc<App>) {
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(1)).await; let b = a.clone(); let _ = tokio::task::spawn_blocking(move || b.state.flush()).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(10)).await; let b = a.clone(); let _ = tokio::task::spawn_blocking(move || { b.tmdb.flush(); b.skipdb.save_if_dirty(false); }).await; } });
-    let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(600)).await; if !a.stream.is_active() && !mpv::running(&a) && !livebuf::is_active() { prewarm(a.clone()).await; } } });
+    let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(600)).await; if !a.stream.is_active() && !mpv::running(&a) && !livebuf::is_active() && !spool::is_connected() { prewarm(a.clone()).await; } } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(60)).await; if a.ready() { fixtures::alerts(&a).await; } } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; reminders_tick(&a); } });
     let a = app.clone(); tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_secs(20)).await; loop { if a.ready() { extras::check_episodes(a.clone()).await; } tokio::time::sleep(std::time::Duration::from_secs(7200)).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(3 * 3600)).await; let b = a.clone(); let _ = tokio::task::spawn_blocking(move || sports::load_epg(&b)).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(12 * 3600)).await; extra_guide(a.clone()).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(a.cfg.get("catalogRefreshHours").as_u64().unwrap_or(12) * 3600)).await;
-        for _ in 0..240 { if !a.stream.is_active() && !mpv::running(&a) && !livebuf::is_active() { break; } tokio::time::sleep(std::time::Duration::from_secs(60)).await; } // not mid-film
+        for _ in 0..240 { if !a.stream.is_active() && !mpv::running(&a) && !livebuf::is_active() && !spool::is_connected() && !livebuf::is_recording() { break; } tokio::time::sleep(std::time::Duration::from_secs(60)).await; } // not mid-film
         sync(a.clone()).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(12 * 3600)).await; meta::build(a.clone()).await; } });
     let a = app.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; expiry_reminder(&a).await; } });
@@ -188,7 +285,7 @@ async fn expiry_reminder(app: &App) {
     let days = ((a.exp - now_ms()) as f64 / 86_400_000.0).ceil() as i64; let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     if a.exp > 0 && days <= 7 && app.state.read(|st| s(&st["prefs"]["expiryNotified"])) != today {
         app.state.with(|st| st["prefs"]["expiryNotified"] = json!(today)); app.state.save();
-        notify_all(app, "expiry", "IPTV subscription ending soon", &if days > 0 { format!("{days} day{} left", if days == 1 { "" } else { "s" }) } else { "It has expired".into() }, "http://localhost:7878/", json!({}));
+        notify_all(app, "expiry", "IPTV subscription ending soon", &if days > 0 { format!("{days} day{} left", if days == 1 { "" } else { "s" }) } else { "It has expired".into() }, &format!("http://localhost:{}/", app.port()), json!({}));
     }
 }
 
@@ -216,13 +313,14 @@ fn reminders_tick(app: &App) {
         if arr.len() != before { changed = true; }
     });
     if changed { app.state.save(); }
+    let port = app.port();
     for r in to_fire {
         let title = s(&r["title"]);
         let ch = s(&r["chTitle"]);
         let start = r["start"].as_i64().unwrap_or(0);
         let mins = ((start - now) as f64 / 60_000.0).round() as i64;
         let when = if mins > 1 { format!("starts in {mins} min") } else { "starting now".into() };
-        notify_all(app, "reminder", &format!("{title} ({when})"), &ch, "http://localhost:7878/#/live",
+        notify_all(app, "reminder", &format!("{title} ({when})"), &ch, &format!("http://localhost:{port}/#/live"),
             json!({ "k": "l", "id": r["chId"], "title": ch, "epg": r["epg"], "label": "Tune in" }));
     }
 }
@@ -262,7 +360,7 @@ async fn status(State(app): A) -> Response {
         "counts": if app.ready() { json!({ "movies": c.movies.len(), "series": c.series.len(), "live": c.live.len() }) } else { Value::Null },
         "tmdb": app.tmdb.enabled(), "tmdbError": *app.tmdb.last_error.lock().unwrap(),
         "meta": { "done": p.0, "total": p.1, "running": app.meta_running.load(std::sync::atomic::Ordering::Relaxed), "indexed": app.meta.read().unwrap().len() },
-        "epgChannels": app.epg.read().unwrap().len(), "streaming": app.stream.is_active() || mpv::running(&app) || livebuf::is_active(), "proPlayer": mpv::running(&app), "engine": "rust" }))
+        "epgChannels": app.epg.read().unwrap().len(), "streaming": app.stream.is_active() || mpv::running(&app) || livebuf::is_active() || livebuf::is_recording(), "recording": livebuf::is_recording(), "slot": slot::status(), "proPlayer": mpv::running(&app), "engine": "rust" }))
 }
 async fn account(State(app): A, Query(q): Q) -> Response {
     match app.account(q.get("fresh").map_or(false, |x| x == "1")).await {
@@ -464,23 +562,30 @@ async fn marathons_page(State(app): A) -> Response {
 }
 async fn marathons_detail(State(app): A, Path(slug): Path<String>, Query(q): Q) -> Response {
     if let Some(r) = not_ready(&app) { return r; }
-    let order = q.get("order").cloned().unwrap_or_else(|| "chrono".into());
+    let order = q.get("order").cloned().unwrap_or_default();
     let a = app.clone();
     let v = tokio::task::spawn_blocking(move || marathons::detail(&a, &slug, &order)).await.unwrap_or(None);
     match v { Some(x) => j(x), None => err(404, "marathon not found") }
 }
+async fn marathons_set_order(State(app): A, Path(slug): Path<String>, Json(b): Json<Value>) -> Response {
+    let order = s(&b["order"]);
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || marathons::set_order(&a, &slug, &order)).await.unwrap_or_else(|_| json!({ "ok": false }));
+    j(v)
+}
 async fn anime_check_dub(State(app): A, Json(b): Json<Value>) -> Response {
-    if app.stream.is_active() || mpv::running(&app) || livebuf::is_active() {
+    if app.stream.is_active() || mpv::running(&app) || livebuf::is_active() || spool::is_connected() || slot::is_busy() {
         return err(409, "Cannot check dub while streaming");
     }
     let kind = s(&b["kind"]);
     let id = b["id"].as_i64().unwrap_or(0);
     if id <= 0 { return err(400, "missing id"); }
+    let sid = b["sid"].as_i64().filter(|&x| x > 0);
     let ext = b["ext"].as_str().map(String::from);
     let url = upstream(&app, if kind == "movie" { "movie" } else { "series" }, &id.to_string(), ext.as_ref(), false);
     let p = app.stream.probe(&url, &app.cfg.str("userAgent")).await;
     let audio = p.as_ref().and_then(|x| x["audio"].as_array()).cloned().unwrap_or_default();
-    let has_en = anime::record_probe(&app, if kind == "movie" { "movie" } else { "series" }, id, &audio);
+    let has_en = anime::record_probe_for(&app, if kind == "movie" { "movie" } else { "series" }, id, sid, &audio);
     app.memo.remove_prefix("anime");
     j(json!({ "ok": true, "hasEnAudio": has_en, "dub": match has_en { Some(true) => "yes", Some(false) => "no", None => "unknown" }, "audio": audio }))
 }
@@ -500,13 +605,21 @@ async fn extsubs_search(State(app): A, Query(q): Q) -> Response {
     let title = q.get("title").map(|x| x.as_str()).unwrap_or("");
     let season = q.get("s").and_then(|x| x.parse::<i64>().ok());
     let ep = q.get("e").and_then(|x| x.parse::<i64>().ok());
-    j(extsubs::search(&app, mt, tmdb, imdb, season, ep, title).await)
+    let fps = q.get("fps").and_then(|x| x.parse::<f64>().ok()).filter(|x| *x > 10.0 && *x < 120.0);
+    j(extsubs::search_with_fps(&app, mt, tmdb, imdb, season, ep, title, fps).await)
 }
 async fn extsubs_fetch(State(app): A, Json(b): Json<Value>) -> Response {
     let key = s(&b["key"]);
     let url = s(&b["url"]);
     if key.is_empty() || url.is_empty() { return err(400, "missing key or url"); }
-    match extsubs::fetch(&app, &key, &url).await {
+    let ep_hint = b["s"].as_i64().or_else(|| b["season"].as_i64())
+        .and_then(|sn| b["e"].as_i64().or_else(|| b["ep"].as_i64()).map(|en| (sn, en)));
+    let res = if ep_hint.is_some() {
+        extsubs::fetch_with_hint(&app, &key, &url, ep_hint).await
+    } else {
+        extsubs::fetch(&app, &key, &url).await
+    };
+    match res {
         Ok(v) => j(v),
         Err(e) => err(502, &e),
     }
@@ -519,6 +632,127 @@ async fn extsubs_file(State(app): A, Path(name): Path<String>) -> Response {
 }
 async fn extsubs_sync(State(app): A, Path(key): Path<String>) -> Response {
     j(extsubs::sync_cached(&app, &key).await)
+}
+async fn extsubs_sync_mpv(State(app): A, body: Option<Json<Value>>) -> Response {
+    let b = body.map(|x| x.0).unwrap_or(Value::Null);
+    let key = s(&b["key"]);
+    let mut url = s(&b["url"]);
+    if url.is_empty() {
+        let kind = s(&b["kind"]);
+        let id = s(&b["id"]);
+        if !kind.is_empty() && !id.is_empty() {
+            let ext = b["ext"].as_str().map(String::from);
+            url = upstream(&app, &kind, &id, ext.as_ref(), false);
+        }
+    }
+    let ua = app.cfg.str("userAgent");
+    match extsubs::sync_for_mpv(app.clone(), key, url, ua).await {
+        Ok(v) => j(v),
+        Err(e) => err(400, &e),
+    }
+}
+async fn extsubs_whisper_status() -> Response {
+    let st = tokio::task::spawn_blocking(extsubs::whisper_status).await.unwrap_or_else(|_| json!({ "available": false }));
+    j(st)
+}
+async fn extsubs_whisper_job(Path(key): Path<String>) -> Response {
+    j(extsubs::whisper_job_status(&key))
+}
+async fn extsubs_whisper_get(Query(q): Q) -> Response {
+    if let Some(key) = q.get("key").filter(|x| !x.trim().is_empty()) {
+        return j(extsubs::whisper_job_status(key));
+    }
+    extsubs_whisper_status().await
+}
+async fn extsubs_whisper_post(State(app): A, Json(b): Json<Value>) -> Response {
+    let key = s(&b["key"]);
+    if key.is_empty() { return err(400, "missing key"); }
+    let status = tokio::task::spawn_blocking(extsubs::whisper_status).await.unwrap_or_else(|_| json!({ "available": false }));
+    if status["available"].as_bool() != Some(true) {
+        return err(503, status["installHint"].as_str().unwrap_or("Local Whisper GPU backend not installed"));
+    }
+    let mut url = s(&b["url"]);
+    if url.is_empty() {
+        let kind = s(&b["kind"]);
+        let id = s(&b["id"]);
+        if !kind.is_empty() && !id.is_empty() {
+            let ext = b["ext"].as_str().map(String::from);
+            url = upstream(&app, &kind, &id, ext.as_ref(), false);
+        }
+    }
+    if url.is_empty() { return err(400, "missing stream source"); }
+    let lang = { let l = s(&b["lang"]); if l.is_empty() { "en".to_string() } else { l } };
+    let ua = app.cfg.str("userAgent");
+    let a = app.clone();
+    let k2 = key.clone();
+    tokio::spawn(async move {
+        let _ = extsubs::generate_whisper(a, k2, url, ua, lang).await;
+    });
+    j(json!({
+        "ok": true,
+        "running": true,
+        "jobId": key,
+        "statusUrl": format!("/api/extsubs/whisper?key={}", util::enc(&key)),
+        "backend": status["backend"],
+    }))
+}
+async fn dvr_start(State(app): A, Json(b): Json<Value>) -> Response {
+    let title = { let t = s(&b["title"]); if t.is_empty() { "Live TV".to_string() } else { t } };
+    let retro = b["retroSecs"].as_f64().or_else(|| b["retroactiveSecs"].as_f64()).unwrap_or(0.0).max(0.0);
+    match livebuf::start_record(&app.data, &title, retro) {
+        Ok(mut v) => {
+            if let Some(r) = v.get("retroactiveSecs").cloned() { v["retroSecs"] = r; }
+            j(v)
+        }
+        Err(e) => err(409, &e),
+    }
+}
+async fn dvr_stop() -> Response { j(livebuf::stop_record()) }
+async fn dvr_status() -> Response { j(livebuf::record_status()) }
+async fn dvr_list(State(app): A) -> Response {
+    let dir = app.data.join("recordings");
+    let list = tokio::task::spawn_blocking(move || {
+        let mut items: Vec<Value> = Vec::new();
+        let Ok(rd) = std::fs::read_dir(&dir) else { return items };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext != "mkv" && ext != "ts" { continue; }
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()).map(String::from) else { continue };
+            let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+            if ext == "ts" && dir.join(format!("{stem}.mkv")).is_file() { continue; }
+            let meta_bytes = ent.metadata().map(|m| m.len()).unwrap_or(0);
+            let mtime = ent.metadata().and_then(|m| m.modified()).ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64).unwrap_or(0);
+            let sidecar: Value = std::fs::read_to_string(dir.join(format!("{stem}.json")))
+                .ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+            items.push(json!({
+                "id": stem,
+                "file": fname,
+                "ext": ext,
+                "title": sidecar["title"].as_str().unwrap_or(stem),
+                "bytes": meta_bytes,
+                "mb": meta_bytes >> 20,
+                "durationSecs": sidecar["durationSecs"],
+                "startedAt": sidecar["startedAt"].as_i64().unwrap_or(mtime),
+                "remuxing": ext == "ts",
+            }));
+        }
+        items.sort_by(|a, b| b["startedAt"].as_i64().unwrap_or(0).cmp(&a["startedAt"].as_i64().unwrap_or(0)));
+        items
+    }).await.unwrap_or_default();
+    j(json!({ "recordings": list, "active": livebuf::record_status() }))
+}
+async fn prespool_route(State(app): A, Json(b): Json<Value>) -> Response {
+    let kind = { let k = s(&b["kind"]); if k.is_empty() { "series".to_string() } else { k } };
+    let id = s(&b["id"]);
+    if id.is_empty() || id == "0" { return err(400, "missing id"); }
+    let ext = b["ext"].as_str().map(String::from);
+    let url = upstream(&app, &kind, &id, ext.as_ref(), false);
+    let ua = app.cfg.str("userAgent");
+    let ok = spool::pre_spool_next(&url, &ua).await;
+    j(json!({ "ok": ok }))
 }
 async fn concierge_route(State(app): A, Json(b): Json<Value>) -> Response {
     if let Some(r) = not_ready(&app) { return r; }
@@ -556,16 +790,20 @@ async fn external(State(app): A, Path((mt, id)): Path<(String, String)>) -> Resp
 }
 async fn wanted(State(app): A, Json(b): Json<Value>) -> Response {
     let k = format!("{}:{}", s(&b["mt"]), s(&b["tmdb"]));
-    app.state.with(|st| if b["on"].as_bool().unwrap_or(false) { st["wanted"][&k] = json!({ "title": b["title"], "poster": b["poster"], "year": b["year"], "t": now_ms() }); } else if let Some(m) = st["wanted"].as_object_mut() { m.remove(&k); });
+    let target = {
+        let raw = s(&b["target"]).trim().to_ascii_lowercase();
+        if matches!(raw.as_str(), "clean" | "4k" | "dub") { raw } else { "clean".to_string() }
+    };
+    app.state.with(|st| if b["on"].as_bool().unwrap_or(false) { st["wanted"][&k] = json!({ "title": b["title"], "poster": b["poster"], "year": b["year"], "target": target, "t": now_ms() }); } else if let Some(m) = st["wanted"].as_object_mut() { m.remove(&k); });
     sync::push(&app, if b["on"].as_bool().unwrap_or(false) { "watchlist" } else { "unwatchlist" }, sync::ids_body(&s(&b["mt"]), &s(&b["tmdb"])));
-    app.state.save(); j(json!({ "ok": true }))
+    app.state.save(); app.memo.remove_prefix("radar"); app.memo.remove_prefix("showcase"); j(json!({ "ok": true }))
 }
 async fn watched(State(app): A, Json(b): Json<Value>) -> Response {
     if s(&b["tmdb"]).is_empty() { return err(400, "missing tmdb"); }
     let k = format!("{}:{}", s(&b["mt"]), s(&b["tmdb"]));
     app.state.with(|st| if b["on"].as_bool().unwrap_or(false) { st["watched"][&k] = json!({ "t": now_ms(), "title": b["title"] }); } else if let Some(m) = st["watched"].as_object_mut() { m.remove(&k); });
     sync::push(&app, if b["on"].as_bool().unwrap_or(false) { "history" } else { "unhistory" }, sync::ids_body(&s(&b["mt"]), &s(&b["tmdb"])));
-    app.state.save(); app.memo.remove_prefix("curated"); app.memo.remove_prefix("foryou"); j(json!({ "ok": true }))
+    app.state.save(); app.memo.remove_prefix("curated"); app.memo.remove_prefix("foryou"); app.memo.remove_prefix("dna"); app.memo.remove_prefix("showcase"); app.memo.remove_prefix("specials"); j(json!({ "ok": true }))
 }
 async fn episodes_watched(State(app): A, Json(b): Json<Value>) -> Response {
     let on = b["on"].as_bool().unwrap_or(false);
@@ -590,12 +828,12 @@ async fn episodes_watched(State(app): A, Json(b): Json<Value>) -> Response {
             sync::push(&app, if on { "history" } else { "unhistory" }, body);
         }
     }
-    app.state.save(); j(json!({ "ok": true }))
+    app.state.save(); app.memo.remove_prefix("dna"); app.memo.remove_prefix("radar"); app.memo.remove_prefix("foryou"); j(json!({ "ok": true }))
 }
 async fn prefs_get(State(app): A) -> Response { j(app.state.read(|st| st["prefs"].clone())) }
 async fn prefs_post(State(app): A, Json(b): Json<Value>) -> Response {
     if let Some(h) = b["hide"].as_array() { let h: Vec<Value> = h.iter().filter(|x| x.is_string()).cloned().collect(); app.state.with(|st| st["prefs"]["hide"] = json!(h)); }
-    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "skipFiller", "hideCams", "ufcSpoilerFree", "autoplay", "autoskip", "autoSkipRecap", "autoSkipCredits"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
+    for k in ["prefer4k", "matchRate", "autoHdr", "sdrOffHdr", "preferHdr", "mse", "mpvVsr", "mpvAnimeSharp", "mpvIccAuto", "mpvSmoothCadence", "skipFiller", "hideCams", "ufcSpoilerFree", "autoplay", "autoskip", "autoSkipRecap", "autoSkipCredits"] { if let Some(v) = b[k].as_bool() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     for k in ["display", "pro", "oledPeak", "mpvShaders"] { if let Some(v) = b[k].as_str() { app.state.with(|st| st["prefs"][k] = json!(v)); } }
     app.state.save(); app.memo.clear(); tokio::spawn(prewarm(app.clone()));
     j(json!({ "ok": true, "prefs": app.state.read(|st| st["prefs"].clone()) }))
@@ -704,15 +942,19 @@ async fn sys_health(State(app): A) -> Response {
     });
     let total_health = app.state.read(|st| st["health"].as_object().map(|m| m.len()).unwrap_or(0));
     let mpv_path = mpv::find(&app).map(|p| p.to_string_lossy().to_string());
+    let whisper = tokio::task::spawn_blocking(extsubs::whisper_status).await.unwrap_or_else(|_| json!({ "available": false }));
     j(json!({
         "net": net,
         "hdrCal": hdr_cal,
-        "display": cur_disp.map(|d| json!({ "name": d.name, "gdi": d.gdi, "hz": d.hz, "hdrOn": d.hdr_on, "hdrSupported": d.hdr_supported })),
+        "display": cur_disp.map(|d| json!({ "name": d.name, "gdi": d.gdi, "hz": d.hz, "hzExact": d.hz_exact, "hdrOn": d.hdr_on, "hdrSupported": d.hdr_supported })),
         "displayChanged": app.display.changed.lock().unwrap().is_some(),
         "mpv": { "available": mpv_path.is_some(), "path": mpv_path, "playing": mpv::running(&app) },
         "streaming": app.stream.is_active(),
+        "slot": slot::status(),
         "spool": spool::stats(),
         "livebuf": livebuf::stats(),
+        "dvr": livebuf::record_status(),
+        "whisper": whisper,
         "dubs": anime::dub_stats(&app),
         "probes": app.stream.probe_count(),
         "health": { "tracked": total_health, "penalised": bad_streams }
@@ -753,15 +995,15 @@ async fn sports_page(State(app): A) -> Response {
     let (on, off): (Vec<Value>, Vec<Value>) = nets.into_iter().partition(|n| !n["now"].is_null() || favset.contains(&format!("l:{}", n["id"])));
     v["networks"] = json!(on.into_iter().take(80).chain(off.into_iter().take(120)).collect::<Vec<_>>());
     v["teams"] = app.state.read(|st| st["teams"].clone());
-    // re-flag favourites (teams may have changed since the memo)
-    let favs: std::collections::HashSet<String> = app.state.read(|st| st["teams"].as_array().into_iter().flatten().map(|t| format!("{}:{}", s(&t["league"]), s(&t["id"]))).collect());
+    // re-flag favourites (teams and solo sports like UFC/F1 may have changed since the memo)
+    let fav_teams: Vec<Value> = app.state.read(|st| st["teams"].as_array().cloned().unwrap_or_default());
+    let favs: std::collections::HashSet<String> = fav_teams.iter().map(|t| format!("{}:{}", s(&t["league"]), s(&t["id"]))).collect();
     for f in v["fixtures"].as_array_mut().into_iter().flatten() {
-        let lg = s(&f["league"]);
-        f["fav"] = json!(!f["home"].is_null() && (favs.contains(&format!("{lg}:{}", s(&f["home"]["id"]))) || favs.contains(&format!("{lg}:{}", s(&f["away"]["id"])))));
+        f["fav"] = json!(fixtures::is_fav_fixture(f, &favs, &fav_teams));
     }
     j(v)
 }
-async fn leagues() -> Response { j(Value::Array(fixtures::LEAGUES.iter().filter(|l| !l.solo).map(|l| json!({ "id": l.id, "name": l.name })).collect())) }
+async fn leagues() -> Response { j(Value::Array(fixtures::LEAGUES.iter().map(|l| json!({ "id": l.id, "name": l.name, "solo": l.solo })).collect())) }
 async fn teams_get(State(app): A, Path(league): Path<String>) -> Response {
     let favs: std::collections::HashSet<String> = app.state.read(|st| st["teams"].as_array().into_iter().flatten().map(|t| format!("{}:{}", s(&t["league"]), s(&t["id"]))).collect());
     let list = fixtures::teams(&app, &league).await;
@@ -785,7 +1027,7 @@ async fn rate(State(app): A, Json(b): Json<Value>) -> Response {
     { let mut body = sync::ids_body(&s(&b["mt"]), &s(&b["tmdb"])); if v != 0 { for k in ["movies", "shows"] { if let Some(x) = body[k].get_mut(0) { x["rating"] = json!(if v > 0 { 8 } else { 3 }); } } } sync::push(&app, if v == 0 { "unrate" } else { "rate" }, body); }
     app.state.save(); app.memo.clear(); tokio::spawn(prewarm(app.clone())); j(json!({ "ok": true }))
 }
-async fn follow(State(app): A, Json(b): Json<Value>) -> Response { extras::follow(&app, &s(&b["sid"]), b["on"].as_bool().unwrap_or(false), &b["item"]); j(json!({ "ok": true })) }
+async fn follow(State(app): A, Json(b): Json<Value>) -> Response { extras::follow(&app, &s(&b["sid"]), b["on"].as_bool().unwrap_or(false), &b["item"]); app.memo.remove_prefix("radar"); j(json!({ "ok": true })) }
 fn trailer_of(d: Option<&Value>, fallback: &str) -> String {
     let vids = d.map(|d| if d["videos"]["results"].is_array() { d["videos"]["results"].clone() } else { d["results"].clone() }).unwrap_or(Value::Null);
     let list = vids.as_array().cloned().unwrap_or_default();
@@ -948,7 +1190,7 @@ async fn movie_detail(State(app): A, Path(id): Path<i64>) -> Response {
             "id": id, "ext": ext, "cat": c, "catId": cid,
             "uhd": uhd, "hdr": hdr, "cam": cam, "dv": dv, "bluray": bluray, "dolbyAudio": dolby_audio,
             "subMarket": sub_mkt, "nonEn": non_en, "label": label,
-            "health": source_health(&app, id), "q": app.stream.quality_of(id)
+            "health": source_health(&app, id), "q": app.stream.quality_of_kind("movie", id)
         })
     }).collect();
     rank_sources(&app, &mut variants); apply_pick(&app, &format!("m:{}", it.id), &mut variants);
@@ -1323,11 +1565,11 @@ async fn series_detail(State(app): A, Path(id): Path<i64>) -> Response {
 
 // ---------------------------------------------------------------- viewer state
 async fn mylist(State(app): A) -> Response {
-    let (list, favs) = app.state.read(|st| {
-        let mut l: Vec<&Value> = st["list"].as_object().map(|m| m.values().collect()).unwrap_or_default(); l.sort_by(|a, b| b["t"].as_i64().cmp(&a["t"].as_i64()));
-        (l.into_iter().map(|x| x["item"].clone()).collect::<Vec<_>>(), st["favs"].as_object().map(|m| m.values().map(|f| f["item"].clone()).collect::<Vec<_>>()).unwrap_or_default())
+    let list = rec::my_list_cards(&app);
+    let favs_raw: Vec<Value> = app.state.read(|st| {
+        st["favs"].as_object().map(|m| m.values().map(|f| f["item"].clone()).collect()).unwrap_or_default()
     });
-    let favs: Vec<Value> = favs.into_iter().map(|f| { let e = s(&f["epg"]); sports::merge(f, sports::now_next(&app, &e)) }).collect();
+    let favs: Vec<Value> = favs_raw.into_iter().map(|f| { let e = s(&f["epg"]); sports::merge(f, sports::now_next(&app, &e)) }).collect();
     j(json!({ "continue": rec::continue_watching(&app).await, "list": list, "favs": favs }))
 }
 async fn continue_get(State(app): A) -> Response {
@@ -1392,6 +1634,9 @@ async fn continue_done(State(app): A, Json(b): Json<Value>) -> Response {
     app.state.save();
     app.memo.remove_prefix("curated");
     app.memo.remove_prefix("foryou");
+    app.memo.remove_prefix("dna");
+    app.memo.remove_prefix("radar");
+    app.memo.remove_prefix("showcase");
     j(json!({ "ok": true, "items": rec::continue_watching(&app).await }))
 }
 pub(crate) async fn progress(State(app): A, Json(b): Json<Value>) -> Response {
@@ -1407,8 +1652,8 @@ pub(crate) async fn progress(State(app): A, Json(b): Json<Value>) -> Response {
             st["history"] = json!(h);
         }
     });
-    if b["historyKind"].is_string() { app.memo.remove_prefix("foryou"); }
-    if d > 0.0 && p / d > 0.9 { sync::finished(&app, &key, &b["item"], &b["tmdb"]); }
+    if b["historyKind"].is_string() { app.memo.remove_prefix("foryou"); app.memo.remove_prefix("dna"); }
+    if d > 0.0 && p / d > 0.9 { sync::finished(&app, &key, &b["item"], &b["tmdb"]); app.memo.remove_prefix("dna"); app.memo.remove_prefix("radar"); }
     app.state.save(); j(json!({ "ok": true }))
 }
 async fn list(State(app): A, Json(b): Json<Value>) -> Response {
@@ -1515,8 +1760,9 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     // so resolving crowd-sourced intro/recap/credits adds 0ms to playback startup!
     let probe_fut = async {
         if kind == "movie" || kind == "series" {
-            if !spool::attached(&url) && !app.stream.is_active() { let since = now_ms() - app.stream.last_stop(); if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; } }
-            if !app.stream.is_active() || spool::attached(&url) { spool::attach(&url, &app.cfg.str("userAgent")).await; }
+            if !app.stream.is_active() || spool::attached(&url) {
+                spool::attach(&url, &app.cfg.str("userAgent")).await;
+            }
         }
         match app.stream.probe(&url, &app.cfg.str("userAgent")).await { Some(mut p) => { p["subs"] = stream::pick_subs(&p["subs"]); p } None => json!({}) }
     };
@@ -1530,7 +1776,7 @@ async fn probe(State(app): A, Path((kind, id)): Path<(String, String)>, Query(q)
     let (mut p, mut remote_skips) = tokio::join!(probe_fut, skip_fut);
 
     if let (Ok(nid), Some(aud)) = (id.parse::<i64>(), p["audio"].as_array()) {
-        let has_en = anime::record_probe(&app, &kind, nid, aud);
+        let has_en = anime::record_probe_for(&app, &kind, nid, (sid > 0).then_some(sid), aud);
         p["hasEnAudio"] = json!(has_en);
     }
     if kind == "series" {
@@ -1592,15 +1838,10 @@ pub(crate) async fn stream_route(State(app): A, Path((kind, id)): Path<(String, 
     app.stream.stop("replaced");
     if mpv::running(&app) { let _ = mpv::stop(State(app.clone())).await; }
     yield_background(&app).await;
-    // films/episodes play through the read-ahead spool; live channels play through the live TS ring buffer
-    let spooled_before = (!live && spool::attached(&url)) || (is_live_ch && livebuf::attached(&url));
+    // films/episodes play through the read-ahead spool; live channels play through the live TS ring buffer.
+    // Detach any conflicting holder first so the single-slot arbiter enforces one exact cooldown (no double sleeps!).
     if live { spool::detach(); }
     if !is_live_ch { livebuf::detach(); }
-    if !spooled_before {
-        let last_end = app.stream.last_stop().max(livebuf::last_close());
-        let since = now_ms() - last_end;
-        if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; }
-    }
     if is_live_ch {
         if let Ok(cid) = id.parse::<i64>() { record_recent_live(&app, cid, ""); }
     }
@@ -1608,18 +1849,19 @@ pub(crate) async fn stream_route(State(app): A, Path((kind, id)): Path<(String, 
     let spooled = !live && !ts_cast_only(&q) && spool::attach(&url, &ua).await.is_some();
     let mut info = if live { None } else { app.stream.probe(&url, &ua).await };
     // the provider sometimes still holds the previous connection (e.g. straight after an episode ends): retry once
-    if !live && info.is_none() { tokio::time::sleep(std::time::Duration::from_millis(2500)).await; info = app.stream.probe(&url, &ua).await; }
-    // a fresh direct probe just used (and closed) the connection: give the provider its release time again
+    if !live && info.is_none() { tokio::time::sleep(std::time::Duration::from_millis(2000)).await; info = app.stream.probe(&url, &ua).await; }
+    // Direct upstream fallback (no spool/livebuf): honour remaining single-slot cooldown once.
     if !spooled && live_local.is_none() {
-        let since = now_ms() - app.stream.last_stop();
-        if since < 1500 { tokio::time::sleep(std::time::Duration::from_millis((1500 - since) as u64)).await; }
+        let wait_ms = slot::cooldown_remaining_ms(Some(&url));
+        if wait_ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await; }
     }
     if let Some(d) = info.as_ref().and_then(|i| i["duration"].as_f64()) { spool::set_duration(&url, d); }
     if app.stream_gen.load(std::sync::atomic::Ordering::SeqCst) != gen { return err(409, "superseded"); }
     *app.stream.owner.lock().unwrap() = page;
     let night = q.get("nd").map_or(false, |x| x == "1");
     let deint = q.get("di").map_or(false, |x| x == "1");
-    let Some((seq, out)) = app.stream.start(&url, &ua, &format!("{kind}:{id}"), live, if catchup { 0.0 } else { num("t") }, num("a") as i64, q.get("tx").map_or(false, |x| x == "1"), info.as_ref(), num("ad") as i64, ts, q.get("sc").map_or(false, |x| x == "1"), live_local.as_deref(), night, deint) else { return err(500, "ffmpeg failed to start") };
+    let req_start = if catchup { 0.0 } else { num("t") };
+    let Some((seq, out)) = app.stream.start(&url, &ua, &format!("{kind}:{id}"), live, req_start, num("a") as i64, q.get("tx").map_or(false, |x| x == "1"), info.as_ref(), num("ad") as i64, ts, q.get("sc").map_or(false, |x| x == "1"), live_local.as_deref(), night, deint) else { return err(500, "ffmpeg failed to start") };
     let guard = Guard { app: app.clone(), seq };
     if kind == "series" { if let (Ok(ep), Some(sid)) = (id.parse::<i64>(), q.get("sid").and_then(|x| x.parse::<i64>().ok())) {
         let (a2, start, dur) = (app.clone(), num("t"), info.as_ref().and_then(|i| i["duration"].as_f64()).unwrap_or(0.0));
@@ -1631,21 +1873,21 @@ pub(crate) async fn stream_route(State(app): A, Path((kind, id)): Path<(String, 
     } else {
         // VOD: re-align audio/video start times on the way out (see fmp4.rs)
         let a2 = app.clone();
-        let rx = fmp4::rewrite(out, move || a2.stream.starts(), mse);
+        let rx = fmp4::rewrite_with_fallback(out, move || a2.stream.starts_for(seq), mse, req_start);
         let a3 = app.clone();
         Body::from_stream(end_checked(app.clone(), seq, futures_util::StreamExt::map(tokio_stream_rx(rx), move |r| { let _g = &guard; if let Ok(b) = &r { a3.stream.count(b.len()); } r })))
     };
-    Response::builder().header(header::CONTENT_TYPE, if ts { "video/mpeg" } else { "video/mp4" }).header(header::CACHE_CONTROL, "no-store").header("transferMode.dlna.org", "Streaming").body(body).unwrap()
+    Response::builder().header(header::CONTENT_TYPE, if ts { "video/MP2T" } else { "video/mp4" }).header(header::CACHE_CONTROL, "no-store").header("transferMode.dlna.org", "Streaming").body(body).unwrap()
 }
 /// Bytes sent for the current session (the player's stats overlay turns this into a bitrate).
-async fn stream_stats(State(app): A) -> Response { livebuf::touch(); j(json!({ "bytes": app.stream.sent(), "active": app.stream.is_active(), "spool": spool::stats(), "livebuf": livebuf::stats() })) }
+async fn stream_stats(State(app): A) -> Response { livebuf::touch(); j(json!({ "bytes": app.stream.sent(), "active": app.stream.is_active(), "slot": slot::status(), "spool": spool::stats(), "livebuf": livebuf::stats(), "dvr": livebuf::record_status() })) }
 /// Casting to a TV uses the same path (TS output) — it benefits from the cache too.
 fn ts_cast_only(_q: &HashMap<String, String>) -> bool { false }
 /// Stop: only this page's own session (another app window may be the one playing).
 async fn stop(State(app): A, body: Option<Json<Value>>) -> Response {
     let pg = body.as_ref().and_then(|b| b["pg"].as_str()).unwrap_or("").to_string();
     let owner = app.stream.owner.lock().unwrap().clone();
-    if pg.is_empty() || owner.is_empty() || owner == pg { app.stream.stop("user"); spool::detach(); livebuf::detach(); }
+    if pg.is_empty() || owner.is_empty() || owner == pg { app.stream.stop("user"); spool::detach(); livebuf::detach(); slot::cancel_current(); }
     j(json!({ "ok": true }))
 }
 /// After the stream's last byte: if the session was cut or ffmpeg failed, end the response with an
@@ -1678,7 +1920,7 @@ fn tokio_stream_rx<T>(mut rx: tokio::sync::mpsc::Receiver<T>) -> impl futures_ut
 /// known before they get there. Yields instantly if playback starts (see stream_route).
 async fn intro_worker(app: &Arc<App>) {
     use std::sync::atomic::Ordering::SeqCst;
-    let idle = |app: &Arc<App>| !app.stream.is_active() && !mpv::running(app) && !livebuf::is_active() && now_ms() - app.stream.last_stop() > 120_000;
+    let idle = |app: &Arc<App>| !app.stream.is_active() && !mpv::running(app) && !livebuf::is_active() && !spool::is_connected() && !slot::is_busy() && now_ms() - app.stream.last_stop() > 120_000;
     if !idle(app) { return; }
     quality_worker(app).await;
     if !idle(app) { return; }
@@ -1774,7 +2016,7 @@ pub(crate) fn source_health(app: &App, id: i64) -> f64 {
 }
 /// Picture score from what a stream really is (probed), or its category/tag quality tier when not probed yet:
 /// resolution first, then HDR/Dolby Vision, Blu-Ray/Dolby Audio/Platform HD, then bitrate & 5.1 audio.
-fn quality_score(v: &Value, pro: bool, hdr_pref: bool) -> f64 {
+fn quality_score(v: &Value, pref4k: bool, pro: bool, hdr_pref: bool) -> f64 {
     let q = &v["q"];
     let cat = v["cat"].as_str().unwrap_or("").to_uppercase();
     let is_uhd = v["uhd"].as_bool().unwrap_or(false);
@@ -1784,7 +2026,12 @@ fn quality_score(v: &Value, pro: bool, hdr_pref: bool) -> f64 {
     let is_br = v["bluray"].as_bool().unwrap_or(false) || cat.contains("BLURAY") || cat.contains("BLU-RAY") || cat.contains("REMUX");
     let is_sub_mkt = v["subMarket"].as_bool().unwrap_or(false);
     let h = q["h"].as_f64().map(|h| h.max(q["w"].as_f64().unwrap_or(0.0) * 9.0 / 16.0)).unwrap_or(if is_uhd { 2160.0 } else { 1080.0 });
-    let tier = if h >= 2000.0 { 3.0 } else if h >= 1000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 };
+    // When prefer4k is OFF, prefer 1080p > 4K > 720p > SD (never invert SD/720p above 1080p Blu-Ray!).
+    let tier = if pref4k {
+        if h >= 2000.0 { 3.0 } else if h >= 1000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 }
+    } else {
+        if h >= 1000.0 && h < 2000.0 { 3.5 } else if h >= 2000.0 { 2.0 } else if h >= 700.0 { 1.0 } else { 0.0 }
+    };
     // HDR in the browser can look greyer than a good SDR copy on an OLED: only prefer HDR where it's shown
     // properly (pro player installed, or the viewer asked for it); otherwise an SDR copy of the same size wins.
     let hdr = match q["hdr"].as_str().unwrap_or("") {
@@ -1816,14 +2063,14 @@ fn quality_score(v: &Value, pro: bool, hdr_pref: bool) -> f64 {
     let audio_bonus = if q["ch"].as_i64().unwrap_or(0) >= 6 { 1.2 } else { 0.0 };
     tier * 10.0 + hdr * 3.0 + cat_boost + native_bonus + codec_bonus + audio_bonus + (q["kbps"].as_f64().unwrap_or(0.0) / 8_000.0).min(5.0)
 }
-/// Best first: healthiest, then best picture (default; gigabit) or HD first if the viewer turned 4K off.
+/// Best first: healthiest, then best picture (default; gigabit) or 1080p HD first if the viewer turned 4K off.
 fn rank_sources(app: &App, v: &mut Vec<Value>) {
     let pref4k = app.state.read(|st| st["prefs"]["prefer4k"].as_bool().unwrap_or(true));
     let pro = mpv::find(app).is_some(); let hdr_pref = app.state.read(|st| st["prefs"]["preferHdr"].as_bool().unwrap_or(false));
     rank_sources_with(v, pref4k, pro, hdr_pref);
 }
 fn rank_sources_with(v: &mut Vec<Value>, pref4k: bool, pro: bool, hdr_pref: bool) {
-    for x in v.iter_mut() { let qs = quality_score(x, pro, hdr_pref); x["qs"] = json!(qs); let q = x["q"].clone(); if let Some(lab) = quality_label(&q) { x["label"] = json!(lab); } }
+    for x in v.iter_mut() { let qs = quality_score(x, pref4k, pro, hdr_pref); x["qs"] = json!(qs); let q = x["q"].clone(); if let Some(lab) = quality_label(&q) { x["label"] = json!(lab); } }
     // one score: picture quality minus a penalty for real trouble (failures, frequent stalls, slow
     // starts). CAM rips & confirmed non-English cross-market copies drop to the bottom when clean copies exist.
     let score = |x: &Value| {
@@ -1831,7 +2078,7 @@ fn rank_sources_with(v: &mut Vec<Value>, pref4k: bool, pro: bool, hdr_pref: bool
         if x["nonEn"].as_bool().unwrap_or(false) { return -4000.0; }
         let q = x["qs"].as_f64().unwrap_or(0.0);
         let h = x["health"].as_f64().unwrap_or(0.0);
-        (if pref4k { q } else { -q }) - 3.0 * h
+        q - 3.0 * h
     };
     v.sort_by(|a, b| score(b).total_cmp(&score(a)));
 }
@@ -1881,7 +2128,7 @@ async fn quality_worker(app: &Arc<App>) {
     });
     let mut todo: Vec<(&'static str, i64, String)> = vec![];
     let push_todo = |todo: &mut Vec<(&'static str, i64, String)>, kind: &'static str, vid: i64, ext: String| {
-        if vid > 0 && app.stream.quality_of(vid).is_none() && !todo.iter().any(|x| x.1 == vid) {
+        if vid > 0 && app.stream.quality_of_kind(kind, vid).is_none() && !todo.iter().any(|x| x.0 == kind && x.1 == vid) {
             todo.push((kind, vid, ext));
         }
     };
@@ -1941,7 +2188,7 @@ async fn quality_worker(app: &Arc<App>) {
             .filter_map(|m| {
                 let best_vid = if m.dv { m.id } else if let Some(v) = m.variants.iter().find(|v| !v.cam && v.dv) { v.id }
                     else if m.uhd { m.id } else if let Some(v) = m.variants.iter().find(|v| !v.cam && v.uhd) { v.id } else { m.id };
-                if app.stream.quality_of(best_vid).is_some() { return None; }
+                if app.stream.quality_of_kind("movie", best_vid).is_some() { return None; }
                 let pop = app.meta_of(m).map(|mm| mm.p + mm.va * 8.0).unwrap_or(m.rating * 5.0);
                 let ext = cat.movie_raw.get(&best_vid).map(|x| x.ext.clone()).unwrap_or_else(|| "mp4".into());
                 Some((pop, best_vid, ext))
@@ -1955,15 +2202,15 @@ async fn quality_worker(app: &Arc<App>) {
     }
     // Priority 4: Latest 3 unprobed UFC PPV replays so opening a fight is instant!
     if todo.len() < 10 {
-        let fight_list = fights::collect_fights(&cat, None);
-        for f in fight_list.into_iter().filter(|f| f.entry.sport_key == "ufc" && f.entry.event_kind == "ppv").take(3) {
-            push_todo(&mut todo, "movie", f.id, f.ext);
+        let fight_list = fights::collect_fights_cached(&cat, None);
+        for f in fight_list.iter().filter(|f| f.entry.sport_key == "ufc" && f.entry.event_kind == "ppv").take(3) {
+            push_todo(&mut todo, "movie", f.id, f.ext.clone());
             if todo.len() >= 10 { break; }
         }
     }
     let ua = app.cfg.str("userAgent");
     for (kind, vid, ext) in todo.into_iter().take(10) {
-        if app.stream.is_active() || mpv::running(app) || livebuf::is_active() || now_ms() - app.stream.last_stop() < 120_000 { return; }
+        if app.stream.is_active() || mpv::running(app) || livebuf::is_active() || spool::is_connected() || slot::is_busy() || now_ms() - app.stream.last_stop() < 120_000 { return; }
         match app.account(true).await { Ok(a) if a.active == 0 => {} _ => return }
         let url = app.xc.stream_url(kind, &vid.to_string(), &ext, false);
         use std::sync::atomic::Ordering::SeqCst;
@@ -2086,7 +2333,7 @@ async fn ep_alts(State(app): A, Path((sid, season, n)): Path<(i64, i64, i64)>) -
         out.push(json!({
             "id": eid, "ext": ext, "uhd": uhd, "dv": dv, "bluray": bluray, "dolbyAudio": da, "cam": cam,
             "subMarket": sub_mkt, "nonEn": non_en, "catId": cid, "cat": cname,
-            "label": label, "health": source_health(&app, eid), "q": app.stream.quality_of(eid),
+            "label": label, "health": source_health(&app, eid), "q": app.stream.quality_of_kind("series", eid),
         }));
     }
     rank_sources(&app, &mut out); apply_pick(&app, &format!("s:{sid}"), &mut out); j(json!(out))
@@ -2170,5 +2417,37 @@ mod quality_tests {
         rank_sources_with(&mut v, true, true, false);
         let ids: Vec<i64> = v.iter().map(|x| x["id"].as_i64().unwrap()).collect();
         assert_eq!(ids, vec![6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn prefer4k_off_ranks_1080p_above_4k_above_720p_above_sd() {
+        let mut v = vec![
+            json!({ "id": 1, "uhd": false, "cam": false, "cat": "EN - ACTION", "health": 0.0, "q": { "w": 720, "h": 480, "kbps": 1200 } }),
+            json!({ "id": 2, "uhd": false, "cam": false, "cat": "EN - ACTION", "health": 0.0, "q": { "w": 1280, "h": 720, "kbps": 3500 } }),
+            json!({ "id": 3, "uhd": true,  "dv": true, "cam": false, "cat": "APPLE+ 4K", "health": 0.0, "q": { "w": 3840, "h": 2160, "hdr": "DV", "codec": "hevc", "ch": 6, "kbps": 32000 } }),
+            json!({ "id": 4, "uhd": false, "cam": false, "cat": "EN - ACTION", "health": 0.0, "q": { "w": 1920, "h": 1080, "kbps": 6000 } }),
+            json!({ "id": 5, "uhd": false, "bluray": true, "cam": false, "cat": "TOP MOVIES BLURAY", "health": 0.0, "q": { "w": 1920, "h": 1080, "ch": 6, "kbps": 14000 } }),
+        ];
+        rank_sources_with(&mut v, false, true, false);
+        let ids: Vec<i64> = v.iter().map(|x| x["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn localhost_guard_blocks_dns_rebinding_and_cross_origin() {
+        assert!(is_allowed_host("localhost:7878"));
+        assert!(is_allowed_host("127.0.0.1:7878"));
+        assert!(is_allowed_host("[::1]:7878"));
+        assert!(is_allowed_host("localhost"));
+        assert!(!is_allowed_host("evil.example:7878"));
+        assert!(!is_allowed_host("localhost.evil.example"));
+        assert!(!is_allowed_host("127.0.0.1.nip.io"));
+
+        assert!(is_allowed_origin("http://localhost:7878"));
+        assert!(is_allowed_origin("http://127.0.0.1:7896"));
+        assert!(is_allowed_origin("http://[::1]:7878"));
+        assert!(!is_allowed_origin("https://evil.example"));
+        assert!(!is_allowed_origin("http://localhost.evil.example:7878"));
+        assert!(!is_allowed_origin("null"));
     }
 }

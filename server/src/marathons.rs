@@ -378,7 +378,10 @@ struct WatchState {
     in_list: HashSet<String>,
     movie_prog: HashMap<i64, ProgInfo>,
     series_prog: HashMap<i64, ProgInfo>,
+    series_watched_secs: HashMap<i64, f64>,
     watched_at: HashMap<String, i64>,
+    saved_orders: HashMap<String, String>,
+    default_order: Option<String>,
 }
 
 fn round3(v: f64) -> f64 {
@@ -401,6 +404,32 @@ fn load_watch_state(app: &App, cat: &Catalog) -> WatchState {
         }
         if let Some(m) = st["list"].as_object() {
             ws.in_list.extend(m.keys().cloned());
+        }
+        // Honor user's saved marathon order (supports per-slug maps or a global preference).
+        if let Some(m) = st["prefs"]["marathonOrders"].as_object() {
+            for (k, v) in m {
+                if let Some(ord) = v.as_str() {
+                    ws.saved_orders.insert(k.to_ascii_lowercase(), ord.to_string());
+                }
+            }
+        }
+        if let Some(m) = st["marathonOrder"].as_object() {
+            for (k, v) in m {
+                if let Some(ord) = v.as_str() {
+                    ws.saved_orders.entry(k.to_ascii_lowercase()).or_insert_with(|| ord.to_string());
+                }
+            }
+        }
+        if let Some(m) = st["prefs"]["marathonOrder"].as_object() {
+            for (k, v) in m {
+                if let Some(ord) = v.as_str() {
+                    ws.saved_orders.entry(k.to_ascii_lowercase()).or_insert_with(|| ord.to_string());
+                }
+            }
+        } else if let Some(ord) = st["prefs"]["marathonOrder"].as_str() {
+            if !ord.trim().is_empty() {
+                ws.default_order = Some(ord.to_string());
+            }
         }
         if let Some(m) = st["watched"].as_object() {
             for (k, v) in m {
@@ -467,6 +496,18 @@ fn load_watch_state(app: &App, cat: &Catalog) -> WatchState {
                                 *entry = info;
                             }
                         }
+                        if key.starts_with("e:") {
+                            let ep_secs = if dur > 60.0 {
+                                pos.min(18_000.0)
+                            } else if pct >= 0.88 {
+                                45.0 * 60.0
+                            } else {
+                                0.0
+                            };
+                            if ep_secs > 0.0 {
+                                *ws.series_watched_secs.entry(canon).or_insert(0.0) += ep_secs;
+                            }
+                        }
                     }
                 }
             }
@@ -494,6 +535,34 @@ impl WatchState {
         }
         best
     }
+
+    fn series_watched_secs_for(&self, it: &Item) -> f64 {
+        let mut secs = self.series_watched_secs.get(&it.id).copied().unwrap_or(0.0);
+        if secs <= 0.0 {
+            for v in &it.variants {
+                secs += self.series_watched_secs.get(&v.id).copied().unwrap_or(0.0);
+            }
+        }
+        secs
+    }
+
+    fn is_in_list(&self, it: &Item) -> bool {
+        self.in_list.contains(&format!("{}:{}", it.k, it.id))
+            || it
+                .variants
+                .iter()
+                .any(|v| self.in_list.contains(&format!("{}:{}", it.k, v.id)))
+    }
+
+    fn order_for(&self, slug: &str) -> &'static str {
+        if let Some(ord) = self.saved_orders.get(&slug.to_ascii_lowercase()) {
+            return normalize_order(ord);
+        }
+        if let Some(ref ord) = self.default_order {
+            return normalize_order(ord);
+        }
+        "chrono"
+    }
 }
 
 struct ResolvedEntry {
@@ -506,6 +575,7 @@ struct ResolvedEntry {
     runtime_mins: i64,
     remaining_mins: i64,
     progress: f64,
+    resume_secs: f64,
     last_activity_ts: i64,
     art_score: f64,
     pop: f64,
@@ -565,12 +635,35 @@ where
                 .filter(|&rt| rt > 0)
                 .unwrap_or(entry.runtime_mins as i64)
         };
-        let remaining_mins: i64 = if watched {
-            0
-        } else if prog.progress > 0.0 && prog.progress < 1.0 {
-            ((1.0 - prog.progress) * runtime_mins as f64).round().max(1.0) as i64
+        // For TV series, never treat 50% of Episode 1 as 50% of an entire season:
+        // scale progress and remaining runtime by actual accumulated episode watch time.
+        let (eff_progress, eff_resume_secs, remaining_mins): (f64, f64, i64) = if entry.mt == "tv" {
+            let watched_secs = ws.series_watched_secs_for(it).max(prog.resume);
+            let watched_mins = watched_secs / 60.0;
+            let series_pct = if watched {
+                1.0
+            } else if runtime_mins > 0 && watched_mins > 0.0 {
+                round3((watched_mins / runtime_mins as f64).clamp(0.0, 0.99))
+            } else {
+                0.0
+            };
+            let rem = if watched {
+                0
+            } else if watched_mins > 0.0 {
+                (runtime_mins as f64 - watched_mins).round().max(1.0) as i64
+            } else {
+                runtime_mins
+            };
+            (series_pct, watched_secs, rem)
         } else {
-            runtime_mins
+            let rem = if watched {
+                0
+            } else if prog.progress > 0.0 && prog.progress < 1.0 {
+                ((1.0 - prog.progress) * runtime_mins as f64).round().max(1.0) as i64
+            } else {
+                runtime_mins
+            };
+            (prog.progress, prog.resume, rem)
         };
 
         let mut c = make_card(it);
@@ -616,9 +709,9 @@ where
         c["qualityTier"] = json!(tier.as_u8());
         c["camOnly"] = json!(cam_only);
         c["watched"] = json!(watched);
-        c["progress"] = json!(prog.progress);
+        c["progress"] = json!(eff_progress);
         c["resume"] = json!(prog.resume);
-        c["inList"] = json!(ws.in_list.contains(&format!("{}:{}", it.k, it.id)));
+        c["inList"] = json!(ws.is_in_list(it));
 
         let bayes = meta
             .filter(|m| m.va > 0.0)
@@ -648,7 +741,8 @@ where
             cam_only,
             runtime_mins,
             remaining_mins,
-            progress: prog.progress,
+            progress: eff_progress,
+            resume_secs: eff_resume_secs,
             last_activity_ts: last_ts,
             art_score,
             pop,
@@ -707,6 +801,7 @@ where
             runtime_mins,
             remaining_mins,
             progress: 0.0,
+            resume_secs: 0.0,
             last_activity_ts: last_ts,
             art_score: rating - 5.0,
             pop: meta.map(|m| m.p.max(0.0)).unwrap_or(0.0),
@@ -732,9 +827,11 @@ fn assemble_marathon(
     let total = resolved.len();
     let mut available_count = 0usize;
     let mut watched_count = 0usize;
+    let mut watched_available_count = 0usize;
     let mut uhd_count = 0usize;
     let mut dv_count = 0usize;
     let mut total_runtime_mins = 0i64;
+    let mut available_runtime_mins = 0i64;
     let mut remaining_runtime_mins = 0i64;
     let mut last_activity_ts = 0i64;
     let mut has_active_resume = false;
@@ -744,7 +841,6 @@ fn assemble_marathon(
 
     for r in &resolved {
         total_runtime_mins += r.runtime_mins;
-        remaining_runtime_mins += r.remaining_mins;
         if r.watched {
             watched_count += 1;
         }
@@ -753,13 +849,19 @@ fn assemble_marathon(
         }
         if r.available {
             available_count += 1;
+            available_runtime_mins += r.runtime_mins;
+            remaining_runtime_mins += r.remaining_mins;
+            if r.watched {
+                watched_available_count += 1;
+            }
             if r.uhd {
                 uhd_count += 1;
             }
             if r.dv {
                 dv_count += 1;
             }
-            if !r.watched && r.progress > 0.0 {
+            // Require >= 30s AND >= 3% progress before treating an accidental click as in-progress
+            if !r.watched && r.resume_secs >= 30.0 && r.progress >= 0.03 {
                 has_active_resume = true;
             }
             if !r.watched && next_up.is_none() {
@@ -772,16 +874,17 @@ fn assemble_marathon(
         }
     }
 
-    let pct_complete: u32 = if total == 0 {
+    let unavailable_count = total.saturating_sub(available_count);
+    let pct_complete: u32 = if available_count == 0 {
         0
     } else {
-        ((watched_count as f64 / total as f64) * 100.0)
+        ((watched_available_count as f64 / available_count as f64) * 100.0)
             .round()
             .clamp(0.0, 100.0) as u32
     };
     let in_progress =
-        (watched_count > 0 && available_count > 0 && next_up.is_some()) || has_active_resume;
-    let completed = available_count > 0 && next_up.is_none() && watched_count > 0;
+        (watched_available_count > 0 && available_count > 0 && next_up.is_some()) || has_active_resume;
+    let completed = available_count > 0 && next_up.is_none() && watched_available_count > 0;
 
     // Pick OLED hero backdrop & up to 4 mini-posters from highest-rated available entries.
     let mut art_order: Vec<usize> = (0..resolved.len()).collect();
@@ -832,10 +935,12 @@ fn assemble_marathon(
         "hasDistinctOrder": distinct_order,
         "total": total,
         "availableCount": available_count,
+        "unavailableCount": unavailable_count,
         "watchedCount": watched_count,
         "uhdCount": uhd_count,
         "dvCount": dv_count,
         "totalRuntimeMins": total_runtime_mins,
+        "availableRuntimeMins": available_runtime_mins,
         "remainingRuntimeMins": remaining_runtime_mins,
         "pctComplete": pct_complete,
         "inProgress": in_progress,
@@ -1064,7 +1169,7 @@ where
             c["watched"] = json!(watched);
             c["progress"] = json!(prog.progress);
             c["resume"] = json!(prog.resume);
-            c["inList"] = json!(ws.in_list.contains(&format!("m:{}", it.id)));
+            c["inList"] = json!(ws.is_in_list(it));
 
             let bayes = if ent.meta.va > 0.0 {
                 ent.meta.bayes()
@@ -1084,6 +1189,7 @@ where
                 runtime_mins,
                 remaining_mins,
                 progress: prog.progress,
+                resume_secs: prog.resume,
                 last_activity_ts: last_ts,
                 art_score: bayes + votes_bonus + quality_bonus,
                 pop: ent.meta.p.max(0.0),
@@ -1231,10 +1337,11 @@ pub fn list(app: &App) -> Value {
         .iter()
         .enumerate()
         .map(|(rank, def)| {
+            let ord = ws.order_for(def.slug);
             resolve_curated_with(
                 def,
                 rank,
-                "chrono",
+                ord,
                 &cat,
                 &meta_map,
                 &ws,
@@ -1254,10 +1361,24 @@ pub fn list(app: &App) -> Value {
     })
 }
 
+/// Persist the user's preferred watch order (`"chrono"` or `"release"`) for a marathon slug.
+pub fn set_order(app: &App, slug: &str, order: &str) -> Value {
+    let key = slug.trim().to_ascii_lowercase();
+    let ord = normalize_order(order);
+    app.state.with(|st| {
+        if !st["prefs"].is_object() { st["prefs"] = json!({}); }
+        if !st["prefs"]["marathonOrders"].is_object() { st["prefs"]["marathonOrders"] = json!({}); }
+        st["prefs"]["marathonOrders"][&key] = json!(ord);
+    });
+    app.state.save();
+    json!({ "ok": true, "slug": key, "order": ord })
+}
+
 /// Full marathon watch-order detail for any curated slug (e.g. `"mcu"`, `"star-wars"`)
 /// or dynamic TMDB collection slug (`"col-<id>"`).
 ///
-/// `order`: `"chrono"` (default, in-universe chronological order) or `"release"` (original release order).
+/// `order`: `"chrono"` (in-universe chronological order), `"release"` (original release order),
+/// or `""` to honor the user's saved preference for that marathon.
 pub fn detail(app: &App, slug: &str, order: &str) -> Option<Value> {
     let key = slug.trim().to_ascii_lowercase();
     if let Some((rank, def)) = MARATHONS
@@ -1267,6 +1388,11 @@ pub fn detail(app: &App, slug: &str, order: &str) -> Option<Value> {
     {
         let cat = app.catalog();
         let ws = load_watch_state(app, &cat);
+        let eff_order = if order.trim().is_empty() {
+            ws.order_for(def.slug)
+        } else {
+            normalize_order(order)
+        };
         let meta_map = snapshot_curated_meta(app, std::slice::from_ref(def));
         let make_card = |it: &Item| app.card_meta(it);
         let tier_of = |it: &Item| best_tier(app, it);
@@ -1275,7 +1401,7 @@ pub fn detail(app: &App, slug: &str, order: &str) -> Option<Value> {
         let resolved = resolve_curated_with(
             def,
             rank,
-            order,
+            eff_order,
             &cat,
             &meta_map,
             &ws,
@@ -1588,10 +1714,12 @@ mod tests {
         );
         assert_eq!(mm.summary["total"], 5);
         assert_eq!(mm.summary["availableCount"], 3);
+        assert_eq!(mm.summary["unavailableCount"], 2);
         assert_eq!(mm.summary["watchedCount"], 1);
         assert_eq!(mm.summary["uhdCount"], 2);
         assert_eq!(mm.summary["dvCount"], 1);
-        assert_eq!(mm.summary["pctComplete"], 20);
+        // 1 watched out of 3 available titles = 33%
+        assert_eq!(mm.summary["pctComplete"], 33);
         assert_eq!(mm.summary["inProgress"], true);
         // Next up is Mad Max 2 (first available & unwatched in chrono order).
         assert_eq!(mm.summary["nextUp"]["tmdb"], "8810");
@@ -1604,10 +1732,11 @@ mod tests {
         let furiosa = mm.items.iter().find(|x| x["tmdb"] == "786892").unwrap();
         assert_eq!(furiosa["available"], false);
         assert_eq!(furiosa["wanted"], true);
-        // Remaining runtime excludes watched Mad Max 1 (91m) and half of Mad Max 2 (48m remaining).
-        // Total: 91 + 96 + 107 + 149 + 120 = 563; Remaining: 0 + 48 + 107 + 149 + 120 = 424.
+        // Remaining runtime is computed over AVAILABLE titles only:
+        // Available: Mad Max 1 (watched -> 0) + Mad Max 2 (48m left) + Fury Road (120m) = 168m.
         assert_eq!(mm.summary["totalRuntimeMins"], 563);
-        assert_eq!(mm.summary["remainingRuntimeMins"], 424);
+        assert_eq!(mm.summary["availableRuntimeMins"], 307);
+        assert_eq!(mm.summary["remainingRuntimeMins"], 168);
 
         // In-progress Mad Max must sort ahead of higher-popularity unstarted John Wick.
         let jw = resolve_curated_with(
@@ -1786,7 +1915,8 @@ mod tests {
         );
         assert_eq!(dune_c.summary["nextUp"]["k"], "s");
         assert_eq!(dune_c.summary["nextUp"]["tmdb"], "90228");
-        assert_eq!(dune_c.summary["nextUp"]["progress"], 0.25);
+        // 900s (15 min) out of 360 min season = 0.042 (NOT 0.25 of entire season!)
+        assert_eq!(dune_c.summary["nextUp"]["progress"], 0.042);
         assert_eq!(dune_c.summary["inProgress"], true);
         assert_eq!(dune_r.summary["nextUp"]["k"], "m");
         assert_eq!(dune_r.summary["nextUp"]["tmdb"], "438631");
